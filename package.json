@@ -10,5 +10,8 @@
     "start": "node src/server.js",
     "dev": "node src/server.js",
     "health": "curl -s http://127.0.0.1:${PORT:-5177}/api/health"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
   }
 }

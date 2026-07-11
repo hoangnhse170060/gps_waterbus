@@ -1,10 +1,12 @@
-import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -18,6 +20,7 @@ if (parseBool(env.TARGET_GPS_ALLOW_SELF_SIGNED)) {
 const port = Number(env.PORT || 5177);
 const sequenceState = await loadSequenceState();
 let sequenceSaveTimer = null;
+const dbPool = createDbPool(env);
 
 const clients = new Set();
 const state = {
@@ -466,6 +469,8 @@ function tickCollector() {
 }
 
 async function publishGpsPositions() {
+  // Mặc định không POST tàu live — chỉ survey collector (tránh 400 spam trên Azure).
+  if (!parseBool(env.PUBLISH_LIVE_BOATS || 'false')) return;
   // Khi đang survey GPS, không POST tàu live — tránh đụng sequence/deviceId với collector.
   if (state.collector) {
     return;
@@ -1368,34 +1373,45 @@ function startCollector(body) {
   };
 }
 
-function queryJson(sql) {
-  return new Promise((resolve, reject) => {
-    const args = env.DATABASE_URL
-      ? [env.DATABASE_URL, '-t', '-A', '-c', sql]
-      : [
-          '-h', env.DB_HOST || 'localhost',
-          '-p', env.DB_PORT || '5432',
-          '-U', env.DB_USER || 'postgres',
-          '-d', env.DB_NAME || 'waterbusdb',
-          '-t',
-          '-A',
-          '-c',
-          sql,
-        ];
-    const childEnv = env.DATABASE_URL
-      ? { ...process.env }
-      : { ...process.env, PGPASSWORD: env.DB_PASSWORD || '12345' };
-    execFile('psql', args, { env: childEnv, timeout: 10000 }, (error, stdout, stderr) => {
-      if (error) return reject(new Error((stderr || error.message).trim()));
-      const text = stdout.trim();
-      if (!text) return resolve([]);
-      try {
-        resolve(JSON.parse(text));
-      } catch (parseError) {
-        reject(new Error(`Cannot parse psql JSON: ${parseError.message}`));
-      }
+function createDbPool(envValues) {
+  if (envValues.DATABASE_URL) {
+    return new Pool({
+      connectionString: envValues.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30_000,
     });
+  }
+  if (!envValues.DB_HOST || String(envValues.DB_HOST).startsWith('http')) {
+    return null;
+  }
+  return new Pool({
+    host: envValues.DB_HOST,
+    port: Number(envValues.DB_PORT || 5432),
+    database: envValues.DB_NAME || 'waterbusdb',
+    user: envValues.DB_USER || 'postgres',
+    password: envValues.DB_PASSWORD || '',
+    max: 5,
+    idleTimeoutMillis: 30_000,
   });
+}
+
+async function queryJson(sql) {
+  if (!dbPool) {
+    throw new Error('Chua cau hinh DATABASE_URL (Neon). Tren Railway khong dung psql CLI.');
+  }
+  const result = await dbPool.query(sql);
+  if (!result.rows?.length) return [];
+  const value = result.rows[0][result.fields[0].name];
+  if (value == null) return [];
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch (parseError) {
+      throw new Error(`Cannot parse SQL JSON: ${parseError.message}`);
+    }
+  }
+  return value;
 }
 
 function cleanRouteText(value, label) {
