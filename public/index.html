@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Waterbus · Thu tuyến GPS</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app">
+      <section class="map-shell">
+        <div id="map"></div>
+        <div class="topbar">
+          <div class="brand-card">
+            <p class="eyebrow">Saigon Waterbus</p>
+            <h1>Thu tuyến GPS</h1>
+            <p id="dbStatus">Đang nạp dữ liệu...</p>
+          </div>
+          <div class="sender">
+            <span id="targetText">Local only</span>
+            <button id="refreshRoutes" type="button" class="secondary">Làm mới</button>
+            <button id="toggleSender" type="button">POST off</button>
+          </div>
+        </div>
+
+        <div class="map-toolbar" id="drawToolbar">
+          <button id="toolPan" type="button" class="tool-btn is-active" title="Di chuyển bản đồ">
+            <span>✋</span><small>Chọn</small>
+          </button>
+          <button id="toolDraw" type="button" class="tool-btn" title="Vẽ điểm trên bản đồ">
+            <span>✎</span><small>Vẽ</small>
+          </button>
+          <div class="tool-divider"></div>
+          <button id="toolUndo" type="button" class="tool-btn" title="Hoàn tác" disabled>
+            <span>↶</span><small>Undo</small>
+          </button>
+          <button id="toolClear" type="button" class="tool-btn danger" title="Xóa đường vẽ" disabled>
+            <span>×</span><small>Xóa</small>
+          </button>
+          <button id="finishDraw" type="button" class="tool-btn accent" title="Hoàn thành — tự tạo nét cong" disabled>
+            <span>✓</span><small>Xong</small>
+          </button>
+        </div>
+
+        <div class="draw-stats" id="drawStats">
+          <span id="drawDistance">0 m</span>
+          <span id="drawDuration">~0 phút</span>
+          <span id="drawPoints">0 điểm</span>
+        </div>
+
+        <div class="map-legend">
+          <div class="legend-title">Tuyến trên bản đồ</div>
+          <div id="mapLegend"></div>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="panel-hero">
+          <div>
+            <p class="eyebrow">Route Survey</p>
+            <h2>Thu thập tuyến đường</h2>
+          </div>
+          <span id="senderBadge">Idle</span>
+        </div>
+
+        <div class="workflow-steps" id="workflowSteps">
+          <div class="step is-active" data-step="draw"><span>1</span> Vẽ tuyến</div>
+          <div class="step" data-step="run"><span>2</span> Ghi GPS</div>
+          <div class="step" data-step="done"><span>3</span> Kết quả</div>
+        </div>
+
+        <div class="overview-grid compact">
+          <div class="overview-card">
+            <span>Bến DB</span>
+            <b id="stationCount">0</b>
+          </div>
+          <div class="overview-card">
+            <span>Gửi BE</span>
+            <b id="sendMode">Idle</b>
+          </div>
+        </div>
+
+        <div class="gps-live">
+          <div class="gps-dot"></div>
+          <div>
+            <strong id="gpsStatus">Chưa ghi GPS</strong>
+            <p id="sendLog">Chọn bến → vẽ đường → bắt đầu ghi.</p>
+          </div>
+        </div>
+
+        <section class="capture-section">
+          <div class="section-header">
+            <h2>Thiết lập tuyến</h2>
+            <span id="captureCount">0 điểm</span>
+          </div>
+
+          <div class="capture-fields">
+            <label>
+              <span>Bến xuất phát</span>
+              <select id="startStation">
+                <option value="">Chọn bến...</option>
+              </select>
+            </label>
+            <label>
+              <span>Bến kết thúc</span>
+              <select id="endStation">
+                <option value="">Chọn bến đích...</option>
+              </select>
+            </label>
+
+            <div class="station-actions">
+              <button id="seedFromStation" type="button" class="secondary">Gắn bến đầu</button>
+              <button id="seedToEndStation" type="button" class="secondary">Gắn bến cuối</button>
+            </div>
+
+            <div class="route-estimate" id="routeEstimate">
+              <div><span>Quãng đường (thực đo)</span><strong id="estimateKm">0 km</strong></div>
+              <div><span>Vận tốc đặt</span><strong id="estimateSpeed">16 km/h</strong></div>
+              <div><span>Thời gian = km÷v×60</span><strong id="estimateMin">0 phút</strong></div>
+            </div>
+            <p class="meta estimate-note">Đặt điểm dọc lòng sông thật. Đường cong đi qua từng điểm khảo sát; km/phút đo trên đúng đường tàu chạy.</p>
+
+            <label>
+              <span>Mã tuyến (routeCode)</span>
+              <input id="captureRouteCode" type="text" placeholder="VD: BD-TT" autocomplete="off">
+              <small id="routeCodeHint" class="field-hint">Mã sẽ được kiểm tra trùng trên hệ thống.</small>
+            </label>
+            <label>
+              <span>Tên tuyến</span>
+              <input id="captureRouteName" type="text" placeholder="VD: Bạch Đằng - Thủ Thiêm">
+            </label>
+            <label>
+              <span>Tàu GPS (boatCode)</span>
+              <input id="collectorBoatCode" type="text" value="WB_001">
+            </label>
+            <div class="field-row">
+              <label>
+                <span>Gửi GPS mỗi (giây)</span>
+                <input id="sendIntervalSec" type="number" min="3" max="10" step="1" value="5">
+              </label>
+              <label>
+                <span>Tốc độ (km/h)</span>
+                <input id="collectorSpeed" type="number" min="1" max="80" step="1" value="16">
+              </label>
+            </div>
+          </div>
+
+          <div class="recording-actions">
+            <button id="startCollector" type="button">Bắt đầu ghi GPS</button>
+            <button id="pauseCollector" class="secondary" type="button" disabled>Tạm dừng</button>
+            <button id="stopCollector" class="secondary" type="button" disabled>Kết thúc &amp; lưu</button>
+          </div>
+
+          <p id="captureStatus" class="meta">1) Chọn bến · 2) Vẽ đường · 3) Bấm Xong để tạo nét cong · 4) Ghi GPS (tự lưu khi xong).</p>
+          <p id="collectorStatus" class="meta">Chưa ghi GPS.</p>
+          <div class="route-result-card hidden" id="routeResult"></div>
+        </section>
+
+        <!-- Hidden legacy hooks kept for JS compatibility -->
+        <div class="hidden-legacy" hidden>
+          <span id="boatCount">0</span>
+          <button id="saveRouteGeometry" type="button">Lưu</button>
+          <button id="toggleCapture" type="button">Bat dau</button>
+          <button id="undoCapturePoint" type="button">Undo</button>
+          <button id="clearCapture" type="button">Clear</button>
+          <button id="saveCapturedRoute" type="button">Luu DB</button>
+          <input id="captureTripId" type="text" value="">
+          <button id="modeStraight" type="button"></button>
+          <button id="modeCurve" type="button" class="is-active"></button>
+          <pre id="payloadLog">{}</pre>
+          <div id="boats"></div>
+        </div>
+      </aside>
+    </div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

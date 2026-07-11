@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ve tuyen & Thu GPS - Waterbus</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/points.css">
+  </head>
+  <body>
+    <main class="points-app">
+      <section class="map-panel">
+        <div id="map"></div>
+
+        <header class="map-header">
+          <div class="brand-block">
+            <p class="eyebrow">Route Survey</p>
+            <h1>Ve tuyen & thu GPS</h1>
+            <p id="dbStatus">Dang nap...</p>
+          </div>
+        </header>
+
+        <div class="workflow-steps">
+          <div class="step is-active" data-step="draw"><span>1</span> Ve tuyen</div>
+          <div class="step" data-step="run"><span>2</span> Tau chay</div>
+          <div class="step" data-step="done"><span>3</span> Gui BE</div>
+        </div>
+
+        <div class="map-toolbar" id="drawToolbar">
+          <button id="toolSelect" type="button" class="tool-btn is-active" title="Chon doan"><span>◎</span><small>Chon</small></button>
+          <button id="toolDraw" type="button" class="tool-btn" title="Them diem"><span>✎</span><small>Ve</small></button>
+          <div class="tool-divider"></div>
+          <button id="modeStraight" type="button" class="tool-btn" title="Net thang"><span>╱</span><small>Thang</small></button>
+          <button id="modeCurve" type="button" class="tool-btn is-active" title="Net cong"><span>⌒</span><small>Cong</small></button>
+        </div>
+
+        <div class="map-status" id="mapStatus">Buoc 1: Chon ben dau, ve duong, chon ben cuoi.</div>
+      </section>
+
+      <aside class="side-panel">
+        <section class="panel-block phase-draw" id="phaseDraw">
+          <div class="block-head">
+            <h2>Buoc 1 · Ve tuyen</h2>
+            <span id="drawCount">0 diem</span>
+          </div>
+
+          <div class="distance-card">
+            <div>
+              <span class="distance-label">Do dai</span>
+              <strong id="routeDistance">0 m</strong>
+            </div>
+            <div>
+              <span class="distance-label">Trang thai</span>
+              <strong id="drawReadyLabel">Chua du</strong>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Ben xuat phat</span>
+            <select id="startStation"><option value="">Chon ben...</option></select>
+          </label>
+
+          <label class="field">
+            <span>Ma tuyen</span>
+            <input id="routeCode" type="text" placeholder="VD: BA-TT">
+          </label>
+          <label class="field">
+            <span>Ten tuyen</span>
+            <input id="routeName" type="text" placeholder="VD: Binh An - Thao Dien">
+          </label>
+
+          <div class="actions actions-3">
+            <button id="seedStart" type="button" class="ghost">Ben dau</button>
+            <button id="undoPoint" type="button" class="ghost" disabled>Undo</button>
+            <button id="clearDraw" type="button" class="ghost danger" disabled>Xoa</button>
+          </div>
+
+          <p id="segmentInfo" class="meta">Click duong de chinh doan. Keo handle vang de uon cong.</p>
+          <div class="segment-list compact-list" id="pointList">
+            <p class="empty">Chua ve tuyen.</p>
+          </div>
+
+          <button id="finishDraw" type="button" class="cta" disabled>Hoan thanh ve →</button>
+        </section>
+
+        <section class="panel-block phase-run hidden" id="phaseRun">
+          <div class="block-head">
+            <h2>Buoc 2 · Cho tau chay</h2>
+            <span id="runBadge">San sang</span>
+          </div>
+
+          <p class="run-summary" id="runSummary">Tau se chay doc duong vua ve va tu dong POST GPS len API BE moi vai giay.</p>
+
+          <label class="field">
+            <span>API BE nhan GPS (POST)</span>
+            <input id="gpsApiEndpoint" type="url" placeholder="https://sgwaterbus-....azurewebsites.net/api/tracking/locations">
+          </label>
+          <label class="field">
+            <span>API Key (hiem khi can)</span>
+            <input id="gpsApiKey" type="password" placeholder="De trong — BE dung X-Device-Id">
+          </label>
+          <p class="meta" id="gpsApiHint">Nhap URL API BE. Tau se tu dong gui GPS khi chay.</p>
+
+          <label class="field">
+            <span>Tau (boatCode)</span>
+            <select id="boatSelect"></select>
+          </label>
+          <p class="meta" id="boatDeviceHint">deviceId: gps-wb-001</p>
+          <label class="field">
+            <span>Toc do (km/h)</span>
+            <input id="boatSpeed" type="number" min="1" max="40" value="16">
+          </label>
+          <label class="field">
+            <span>Gui GPS moi (giay)</span>
+            <input id="sendInterval" type="number" min="3" max="10" value="5">
+          </label>
+
+          <button id="backToDrawFromRun" type="button" class="ghost">← Sua lai tuyen</button>
+          <button id="startBoat" type="button" class="cta cta-run">▶ Cho tau chay</button>
+          <div class="actions hidden" id="runControls">
+            <button id="pauseBoat" type="button" class="ghost">Pause</button>
+            <button id="stopBoat" type="button" class="ghost danger">Dung</button>
+          </div>
+
+          <div class="gps-live-card">
+            <div class="gps-dot"></div>
+            <div>
+              <strong id="gpsLiveStatus">Chua chay</strong>
+              <p id="gpsLiveDetail">0 diem da gui BE</p>
+            </div>
+          </div>
+          <pre id="lastGpsPayload" class="payload-preview">{}</pre>
+        </section>
+
+        <section class="panel-block phase-done hidden" id="phaseDone">
+          <div class="block-head">
+            <h2>Buoc 3 · Ket qua</h2>
+          </div>
+          <p class="done-summary" id="doneSummary">Tau da chay xong va gui GPS len BE.</p>
+          <div class="route-result-card hidden" id="doneRouteResult"></div>
+          <div class="actions">
+            <button id="saveRoute" type="button" class="cta">Luu route len BE</button>
+            <button id="backToDraw" type="button" class="ghost">Ve lai</button>
+          </div>
+          <div class="actions">
+            <button id="copyPoints" type="button" class="ghost">Copy JSON</button>
+            <button id="downloadPoints" type="button" class="ghost">Tai JSON</button>
+          </div>
+        </section>
+      </aside>
+    </main>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/points.js"></script>
+  </body>
+</html>
