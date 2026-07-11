@@ -11,6 +11,7 @@ const dbStatusEl = document.querySelector('#dbStatus');
 const targetTextEl = document.querySelector('#targetText');
 const refreshRoutesEl = document.querySelector('#refreshRoutes');
 const toggleSenderEl = document.querySelector('#toggleSender');
+const sendTargetSelectEl = document.querySelector('#sendTargetSelect');
 const boatCountEl = document.querySelector('#boatCount');
 const sendModeEl = document.querySelector('#sendMode');
 const senderBadgeEl = document.querySelector('#senderBadge');
@@ -18,7 +19,8 @@ const gpsStatusEl = document.querySelector('#gpsStatus');
 const sendLogEl = document.querySelector('#sendLog');
 const boatsEl = document.querySelector('#boats');
 const payloadLogEl = document.querySelector('#payloadLog');
-const mapLegendEl = document.querySelector('#mapLegend');
+const mapLegendSelectEl = document.querySelector('#mapLegendSelect');
+const mapLegendSwatchEl = document.querySelector('#mapLegendSwatch');
 const captureCountEl = document.querySelector('#captureCount');
 const captureStatusEl = document.querySelector('#captureStatus');
 const collectorStatusEl = document.querySelector('#collectorStatus');
@@ -26,10 +28,9 @@ const captureRouteCodeEl = document.querySelector('#captureRouteCode');
 const captureRouteNameEl = document.querySelector('#captureRouteName');
 const startStationEl = document.querySelector('#startStation');
 const endStationEl = document.querySelector('#endStation');
-const seedFromStationEl = document.querySelector('#seedFromStation');
-const seedToEndStationEl = document.querySelector('#seedToEndStation');
 const collectorBoatCodeEl = document.querySelector('#collectorBoatCode');
 const collectorSpeedEl = document.querySelector('#collectorSpeed');
+const boatSpeedHintEl = document.querySelector('#boatSpeedHint');
 const captureTripIdEl = document.querySelector('#captureTripId');
 const sendIntervalSecEl = document.querySelector('#sendIntervalSec');
 const startCollectorEl = document.querySelector('#startCollector');
@@ -71,6 +72,7 @@ let hasFitInitialRoutes = false;
 let lastStationsFingerprint = '';
 let lastRoutesFingerprint = '';
 let lastBoatIds = '';
+let lastLiveBoatIds = '';
 let renderFrame = null;
 let recordingSession = null;
 let autoSaveInFlight = false;
@@ -79,6 +81,9 @@ let lastHandledAutoSaveAt = '';
 let recordingActive = false;
 let recordingStartedAt = 0;
 let routeCodeOk = true;
+let selectedStartStationId = '';
+let selectedEndStationId = '';
+let selectedCollectorBoatCode = localStorage.getItem('surveyBoatCode') || '';
 
 const captureState = {
   enabled: false,
@@ -88,28 +93,215 @@ const captureState = {
   points: [],
 };
 
-const routeColors = ['#0f766e', '#2563eb', '#d97706', '#7c3aed', '#dc2626', '#0891b2'];
+const SAVED_ROUTE_STYLE = {
+  color: '#0f766e',
+  weight: 4,
+  opacity: 0.78,
+  dashArray: null,
+};
+const DRAFT_ROUTE_STYLE = {
+  color: '#ea580c',
+  weight: 5,
+  opacity: 0.95,
+  dashArray: '10 8',
+};
+const SURVEY_ROUTE_STYLE = {
+  color: '#c2410c',
+  weight: 6,
+  opacity: 0.98,
+  dashArray: '14 10',
+};
 
 refreshRoutesEl.addEventListener('click', () => fetch('/api/refresh', { method: 'POST' }));
-toggleSenderEl.addEventListener('click', async () => {
+toggleSenderEl?.addEventListener('click', async () => {
   const enabled = !(latest?.config?.senderEnabled);
+  await setSenderEnabled(enabled);
+});
+sendTargetSelectEl?.addEventListener('change', async () => {
+  await setSenderEnabled(sendTargetSelectEl.value === 'on');
+});
+
+async function setSenderEnabled(enabled) {
   await fetch('/api/sender', {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify({ enabled: Boolean(enabled) }),
   });
-});
+}
 
 startStationEl.addEventListener('change', () => {
-  onStartStationChange();
-  if (latest?.stations) renderStations(latest.stations);
+  selectedStartStationId = startStationEl.value;
+  if (startStationEl.value) seedFromStation();
+  else if (latest?.stations) renderStations(latest.stations);
 });
 endStationEl.addEventListener('change', () => {
-  seedToEndStationEl.disabled = !endStationEl.value;
-  if (latest?.stations) renderStations(latest.stations);
+  selectedEndStationId = endStationEl.value;
+  syncEndStationDisplay();
+  if (endStationEl.value) seedToEndStation();
+  else if (latest?.stations) renderStations(latest.stations);
 });
-seedFromStationEl.addEventListener('click', seedFromStation);
-seedToEndStationEl.addEventListener('click', seedToEndStation);
+
+const endStationDisplayEl = document.querySelector('#endStationDisplay');
+
+const stationCombos = {
+  start: {
+    root: document.querySelector('[data-combo="start"]'),
+    input: startStationEl,
+    trigger: document.querySelector('#startStationTrigger'),
+    label: document.querySelector('#startStationTrigger .combo-label'),
+    panel: document.querySelector('[data-combo="start"] .combo-panel'),
+    search: document.querySelector('[data-combo="start"] .combo-search'),
+    list: document.querySelector('[data-combo="start"] .combo-list'),
+    placeholder: 'Chọn bến...',
+  },
+};
+
+let stationCatalog = [];
+
+function closeStationCombo(exceptKey = null) {
+  for (const [key, combo] of Object.entries(stationCombos)) {
+    if (key === exceptKey) continue;
+    if (combo.panel) combo.panel.hidden = true;
+  }
+}
+
+function stationLabel(station) {
+  if (!station) return '';
+  const code = station.stationCode ? ` (${station.stationCode})` : '';
+  return `${station.stationName || 'Bến'}${code}`;
+}
+
+function findStationInCatalog(stationId) {
+  return stationCatalog.find((s) => String(s.stationId) === String(stationId)) || null;
+}
+
+function syncStationComboLabel(key) {
+  const combo = stationCombos[key];
+  if (!combo?.label) return;
+  const station = findStationInCatalog(combo.input?.value);
+  combo.label.textContent = station ? stationLabel(station) : combo.placeholder;
+}
+
+function syncEndStationDisplay() {
+  if (!endStationDisplayEl) return;
+  const textEl = endStationDisplayEl.querySelector('.station-map-pick-text') || endStationDisplayEl;
+  const station = findStationInCatalog(endStationEl?.value)
+    || (latest?.stations || []).find((s) => String(s.stationId) === String(endStationEl?.value));
+  if (station) {
+    textEl.textContent = stationLabel(station);
+    endStationDisplayEl.classList.remove('is-empty');
+  } else {
+    textEl.textContent = 'Nhấn bến trên map để chọn';
+    endStationDisplayEl.classList.add('is-empty');
+  }
+}
+
+function setStationComboValue(key, stationId, { emitChange = true } = {}) {
+  if (key === 'end') {
+    const next = stationId ? String(stationId) : '';
+    const prev = endStationEl?.value || '';
+    if (endStationEl) endStationEl.value = next;
+    selectedEndStationId = next;
+    syncEndStationDisplay();
+    if (emitChange && prev !== next) {
+      endStationEl?.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return;
+  }
+  const combo = stationCombos[key];
+  if (!combo?.input) return;
+  const next = stationId ? String(stationId) : '';
+  const prev = combo.input.value;
+  combo.input.value = next;
+  if (key === 'start') selectedStartStationId = next;
+  syncStationComboLabel(key);
+  if (emitChange && prev !== next) {
+    combo.input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+function paintStationComboList(key, query = '') {
+  const combo = stationCombos[key];
+  if (!combo?.list) return;
+  const q = String(query || '').trim().toLowerCase();
+  const items = stationCatalog.filter((station) => {
+    if (!q) return true;
+    const hay = `${station.stationName || ''} ${station.stationCode || ''}`.toLowerCase();
+    return hay.includes(q);
+  });
+  if (!items.length) {
+    combo.list.innerHTML = '<div class="combo-empty">Không tìm thấy bến.</div>';
+    return;
+  }
+  const selected = combo.input?.value || '';
+  combo.list.innerHTML = items.map((station) => {
+    const id = String(station.stationId);
+    const active = id === String(selected) ? ' is-selected' : '';
+    return `<button type="button" class="combo-option${active}" data-station-id="${escapeHtml(id)}">${escapeHtml(stationLabel(station))}</button>`;
+  }).join('');
+}
+
+function positionStationComboPanel(key) {
+  const combo = stationCombos[key];
+  if (!combo?.panel || !combo.trigger) return;
+  const rect = combo.trigger.getBoundingClientRect();
+  const width = Math.max(rect.width, 220);
+  const left = Math.min(rect.left, window.innerWidth - width - 8);
+  const maxH = Math.min(240, window.innerHeight * 0.36);
+  let top = rect.bottom + 4;
+  if (top + maxH > window.innerHeight - 8) {
+    top = Math.max(8, rect.top - maxH - 4);
+  }
+  combo.panel.style.position = 'fixed';
+  combo.panel.style.top = `${top}px`;
+  combo.panel.style.left = `${left}px`;
+  combo.panel.style.right = 'auto';
+  combo.panel.style.width = `${width}px`;
+  combo.panel.style.zIndex = '1200';
+}
+
+function openStationCombo(key) {
+  const combo = stationCombos[key];
+  if (!combo?.panel) return;
+  closeStationCombo(key);
+  paintStationComboList(key, combo.search?.value || '');
+  combo.panel.hidden = false;
+  positionStationComboPanel(key);
+  combo.search?.focus();
+  combo.search?.select();
+}
+
+function bindStationCombos() {
+  for (const [key, combo] of Object.entries(stationCombos)) {
+    combo.trigger?.addEventListener('click', (event) => {
+      event.preventDefault();
+      if (combo.panel?.hidden === false) {
+        combo.panel.hidden = true;
+        return;
+      }
+      openStationCombo(key);
+    });
+    combo.search?.addEventListener('input', () => {
+      paintStationComboList(key, combo.search.value);
+    });
+    combo.list?.addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-station-id]');
+      if (!btn) return;
+      setStationComboValue(key, btn.dataset.stationId);
+      closeStationCombo();
+    });
+  }
+  document.addEventListener('click', (event) => {
+    if (event.target.closest('.combo')) return;
+    closeStationCombo();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeStationCombo();
+  });
+}
+
+bindStationCombos();
+
 startCollectorEl.addEventListener('click', startRecording);
 pauseCollectorEl.addEventListener('click', pauseCollector);
 stopCollectorEl.addEventListener('click', stopRecording);
@@ -160,7 +352,16 @@ toolClearEl?.addEventListener('click', () => {
 });
 finishDrawEl?.addEventListener('click', finishDraw);
 captureRouteCodeEl?.addEventListener('input', checkRouteCodeDuplicate);
-collectorSpeedEl?.addEventListener('input', updateDrawStats);
+collectorBoatCodeEl?.addEventListener('change', () => {
+  selectedCollectorBoatCode = collectorBoatCodeEl.value.trim();
+  if (selectedCollectorBoatCode) localStorage.setItem('surveyBoatCode', selectedCollectorBoatCode);
+  applyBoatSpeedLimits();
+  updateDrawStats();
+});
+collectorSpeedEl?.addEventListener('input', () => {
+  applyBoatSpeedLimits();
+  updateDrawStats();
+});
 
 function setDrawTool(tool) {
   captureState.enabled = tool === 'draw';
@@ -277,8 +478,9 @@ function uniqueStations(stations) {
 }
 
 function stationsFingerprint(stations) {
+  // Chỉ theo id + tên — tránh lat/lng float làm rebuild select liên tục.
   return uniqueStations(stations)
-    .map((s) => `${s.stationId}:${s.stationName}:${s.lat}:${s.lng}`)
+    .map((s) => `${s.stationId}:${s.stationName}:${s.stationCode}`)
     .sort()
     .join('|');
 }
@@ -293,10 +495,10 @@ function render(data) {
   if (stationsFp !== lastStationsFingerprint) {
     lastStationsFingerprint = stationsFp;
     renderStations(data.stations);
-    renderStationOptions(startStationEl, data.stations, 'Chon ben co san...');
-    renderStationOptions(endStationEl, data.stations, 'Chon ben dich...');
-    seedFromStationEl.disabled = !startStationEl.value;
-    seedToEndStationEl.disabled = !endStationEl.value;
+    renderStationOptions(data.stations, 'Chọn bến có sẵn...');
+    restoreStationSelections();
+  } else if (latest?.stations) {
+    restoreStationSelections();
   }
   if (routesFp !== lastRoutesFingerprint) {
     lastRoutesFingerprint = routesFp;
@@ -310,25 +512,30 @@ function render(data) {
   if (data.recordingSession) recordingSession = data.recordingSession;
 }
 
-function renderStationOptions(selectEl, stations, placeholder) {
-  if (!selectEl) return;
-  const focused = document.activeElement === selectEl;
-  const selected = selectEl.value;
-  const sorted = uniqueStations(stations).sort((a, b) =>
+function restoreStationSelections() {
+  setStationComboValue('start', selectedStartStationId, { emitChange: false });
+  setStationComboValue('end', selectedEndStationId, { emitChange: false });
+}
+
+function renderStationOptions(stations, placeholder) {
+  const combo = stationCombos.start;
+  if (placeholder && combo) combo.placeholder = placeholder;
+  stationCatalog = uniqueStations(stations).sort((a, b) =>
     String(a.stationName || '').localeCompare(String(b.stationName || ''), 'vi'),
   );
-  if (focused) return;
-  selectEl.innerHTML = [
-    `<option value="">${escapeHtml(placeholder)}</option>`,
-    ...sorted.map((station) => `
-      <option value="${escapeHtml(station.stationId)}">
-        ${escapeHtml(`${station.stationName} (${station.stationCode})`)}
-      </option>
-    `),
-  ].join('');
-  if (selected && sorted.some((station) => station.stationId === selected)) {
-    selectEl.value = selected;
-  }
+  const startSelected = selectedStartStationId || startStationEl?.value || '';
+  const startValid = startSelected && stationCatalog.some((station) => String(station.stationId) === String(startSelected))
+    ? startSelected
+    : '';
+  setStationComboValue('start', startValid, { emitChange: false });
+
+  const endSelected = selectedEndStationId || endStationEl?.value || '';
+  const endValid = endSelected && stationCatalog.some((station) => String(station.stationId) === String(endSelected))
+    ? endSelected
+    : '';
+  setStationComboValue('end', endValid, { emitChange: false });
+
+  if (combo && !combo.panel?.hidden) paintStationComboList('start', combo.search?.value || '');
 }
 
 function getSelectedStation() {
@@ -341,10 +548,6 @@ function getSelectedEndStation() {
   return uniqueStations(latest.stations).find((s) => s.stationId === endStationEl.value) || null;
 }
 
-function onStartStationChange() {
-  seedFromStationEl.disabled = !startStationEl.value;
-}
-
 function seedFromStation() {
   const station = getSelectedStation();
   if (!station) {
@@ -352,6 +555,7 @@ function seedFromStation() {
     return;
   }
   clearCapturePoints();
+  setStationComboValue('end', '', { emitChange: false });
   addCapturePoint({ lat: station.lat, lng: station.lng }, {
     source: 'station',
     label: station.stationName,
@@ -359,7 +563,7 @@ function seedFromStation() {
   });
   captureState.enabled = true;
   map.setView([station.lat, station.lng], Math.max(map.getZoom(), 16), { animate: true });
-  captureStatusEl.textContent = `Diem 1: ${station.stationName}. Them diem hoac chon ben ket thuc.`;
+  captureStatusEl.textContent = `Điểm 1: ${station.stationName}. Vẽ đường rồi click bến cuối trên map.`;
   maybeFillRouteCode();
   renderCaptureState();
 }
@@ -526,13 +730,13 @@ function renderCaptureLine() {
   }
   if (captureState.points.length < 2) return;
   const path = expandPath(captureState.points);
+  // Đường mới / đang chỉnh: nét đứt màu cam — khác tuyến đã lưu (xanh liền).
   captureLine = L.polyline(
     path.map((p) => [p.lat, p.lng]),
     {
-      color: captureState.lineMode === 'curve' ? '#0f766e' : '#334155',
-      weight: captureState.lineMode === 'curve' ? 5 : 3.5,
-      opacity: 0.92,
-      dashArray: captureState.lineMode === 'curve' ? null : '8 6',
+      ...DRAFT_ROUTE_STYLE,
+      weight: captureState.finished ? 5.5 : 4.5,
+      interactive: false,
     },
   ).addTo(map);
 }
@@ -598,13 +802,87 @@ function estimateTravelMinutes(meters, speedKmh) {
   const speed = clampNumber(Number(speedKmh) || 16, 0.1, 80);
   const km = Number(meters) / 1000;
   if (!(km > 0) || !(speed > 0)) return 0;
-  // phút = (km / vận_tốc_kmh) × 60
+  // phút = (km / vận_tốc_đăng_ký_kmh) × 60
   return (km / speed) * 60;
+}
+
+function catalogBoats(data = latest) {
+  return (data?.boats || []).filter((boat) => (
+    boat.boatCode && !String(boat.boatId || '').startsWith('collector-')
+  ));
+}
+
+function findBoatByCode(boatCode, data = latest) {
+  const code = String(boatCode || '').trim();
+  if (!code) return null;
+  return catalogBoats(data).find((boat) => String(boat.boatCode) === code) || null;
+}
+
+function boatMaxSpeedKmh(boat) {
+  const max = Number(boat?.maxSpeedKmh);
+  if (Number.isFinite(max) && max > 0) return max;
+  return 80;
+}
+
+function getSurveySpeedKmh() {
+  const boat = findBoatByCode(collectorBoatCodeEl?.value);
+  const max = boat ? boatMaxSpeedKmh(boat) : 80;
+  return clampNumber(Number(collectorSpeedEl?.value || 16), 0.1, max);
+}
+
+function applyBoatSpeedLimits() {
+  const boat = findBoatByCode(collectorBoatCodeEl?.value);
+  const max = boat ? boatMaxSpeedKmh(boat) : 80;
+  if (collectorSpeedEl) {
+    collectorSpeedEl.readOnly = false;
+    collectorSpeedEl.max = String(max);
+    const current = Number(collectorSpeedEl.value || 16);
+    if (Number.isFinite(current) && current > max) {
+      collectorSpeedEl.value = String(Number(max.toFixed(1)));
+    }
+  }
+  if (boatSpeedHintEl) {
+    boatSpeedHintEl.textContent = boat
+      ? `Max đăng ký ${max} km/h · nhập tốc độ chạy thực tế (≤ ${max})`
+      : 'Chọn tàu để biết mức tối đa đăng ký; tốc độ chạy nhập riêng.';
+  }
+}
+
+function renderCollectorBoatOptions(boats) {
+  if (!collectorBoatCodeEl) return;
+  const list = (boats || []).filter((boat) => (
+    boat.boatCode && !String(boat.boatId || '').startsWith('collector-')
+  ));
+  const previous = selectedCollectorBoatCode || collectorBoatCodeEl.value || localStorage.getItem('surveyBoatCode') || '';
+  const options = list.map((boat) => {
+    const max = boatMaxSpeedKmh(boat);
+    const name = boat.boatName ? ` · ${boat.boatName}` : '';
+    return {
+      code: boat.boatCode,
+      label: `${boat.boatCode}${name} · max ${max} km/h`,
+    };
+  });
+  collectorBoatCodeEl.innerHTML = [
+    '<option value="">Chọn tàu...</option>',
+    ...options.map((item) => (
+      `<option value="${escapeHtml(item.code)}">${escapeHtml(item.label)}</option>`
+    )),
+  ].join('');
+  const preferred = options.some((item) => item.code === previous)
+    ? previous
+    : (options[0]?.code || '');
+  collectorBoatCodeEl.value = preferred;
+  selectedCollectorBoatCode = preferred;
+  if (preferred) localStorage.setItem('surveyBoatCode', preferred);
+  applyBoatSpeedLimits();
+  updateDrawStats();
 }
 
 function updateDrawStats() {
   const meters = pathLengthMeters(captureState.points);
-  const speed = Number(collectorSpeedEl.value || 16);
+  const speed = getSurveySpeedKmh();
+  const boat = findBoatByCode(collectorBoatCodeEl?.value);
+  const max = boat ? boatMaxSpeedKmh(boat) : null;
   const km = meters / 1000;
   const minutesExact = estimateTravelMinutes(meters, speed);
   const kmText = meters < 1000
@@ -622,7 +900,11 @@ function updateDrawStats() {
       ? (meters < 1000 ? `${Math.round(meters)} m` : `${km.toFixed(3)} km`)
       : '0 km';
   }
-  if (estimateSpeedEl) estimateSpeedEl.textContent = `${speed} km/h`;
+  if (estimateSpeedEl) {
+    estimateSpeedEl.textContent = max
+      ? `${speed} km/h (max ${max})`
+      : `${speed} km/h`;
+  }
   if (estimateMinEl) {
     estimateMinEl.textContent = meters > 0
       ? `${minutesExact.toFixed(2)} phút`
@@ -631,8 +913,8 @@ function updateDrawStats() {
   const formulaEl = document.querySelector('#estimateFormula');
   if (formulaEl) {
     formulaEl.textContent = meters > 0
-      ? `(${km.toFixed(3)} km ÷ ${speed} km/h) × 60 = ${minutesExact.toFixed(2)} phút`
-      : 'phút = (km ÷ vận tốc) × 60';
+      ? `(${km.toFixed(3)} km ÷ ${speed} km/h chạy) × 60 = ${minutesExact.toFixed(2)} phút`
+      : 'phút = (km ÷ tốc độ chạy) × 60 · tốc độ ≤ max đăng ký';
   }
 }
 
@@ -655,7 +937,8 @@ async function saveCapturedRoute() {
       body: JSON.stringify({
         routeCode,
         routeName,
-        averageSpeedKmh: Number(collectorSpeedEl.value || 16),
+        boatCode: collectorBoatCodeEl.value.trim() || null,
+        averageSpeedKmh: getSurveySpeedKmh(),
         startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
         endStationId: endStationEl.value || captureState.points.at(-1)?.stationId || null,
         coordinates: getPathCoordinates(),
@@ -683,6 +966,17 @@ async function startRecording() {
   if (!checkRouteCodeDuplicate()) {
     captureStatusEl.textContent = 'Mã tuyến bị trùng — đổi mã trước khi ghi.';
     captureRouteCodeEl.focus();
+    return;
+  }
+  if (!collectorBoatCodeEl?.value?.trim()) {
+    captureStatusEl.textContent = 'Chọn tàu GPS trước khi ghi.';
+    collectorBoatCodeEl?.focus();
+    return;
+  }
+  applyBoatSpeedLimits();
+  if (!(getSurveySpeedKmh() > 0)) {
+    captureStatusEl.textContent = 'Nhập tốc độ chạy hợp lệ (≤ max đăng ký).';
+    collectorSpeedEl?.focus();
     return;
   }
   if (captureState.points.length < 2) {
@@ -727,7 +1021,7 @@ async function startRecording() {
         routeName,
         boatCode: collectorBoatCodeEl.value.trim() || 'WB_001',
         tripId: captureTripIdEl.value.trim() || null,
-        speedKmh: Number(collectorSpeedEl.value || 16),
+        speedKmh: getSurveySpeedKmh(),
         sendIntervalMs,
         sendToTarget: true,
         recording: true,
@@ -819,9 +1113,10 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       body: JSON.stringify({
         routeCode,
         routeName,
+        boatCode: collectorBoatCodeEl.value.trim() || null,
         description: 'Captured from GPS recording session',
         status: 'Active',
-        averageSpeedKmh: Number(collectorSpeedEl.value || 16),
+        averageSpeedKmh: getSurveySpeedKmh(),
         startStationId: startStationEl.value || null,
         endStationId: endStationEl.value || null,
       }),
@@ -891,13 +1186,15 @@ function resetSurveyForm({ keepResult = false } = {}) {
 function showPlannedRoute(coordinates) {
   if (!coordinates || coordinates.length < 2) return;
   const latlngs = coordinates.map((p) => [p.lat, p.lng]);
+  const style = recordingActive || lockedSurveyPath
+    ? SURVEY_ROUTE_STYLE
+    : DRAFT_ROUTE_STYLE;
   if (plannedRouteLine) {
     plannedRouteLine.setLatLngs(latlngs);
+    plannedRouteLine.setStyle(style);
   } else {
     plannedRouteLine = L.polyline(latlngs, {
-      color: '#0f766e',
-      weight: 6,
-      opacity: 0.95,
+      ...style,
       interactive: false,
       pane: 'overlayPane',
     }).addTo(map);
@@ -1089,22 +1386,42 @@ function collectorIcon(heading) {
 function renderPanelLive(data) {
   boatCountEl.textContent = data.boats.length;
   if (stationCountEl) stationCountEl.textContent = String(uniqueStations(data.stations).length);
-  dbStatusEl.textContent = data.dbStatus?.ok
-    ? `${data.dbStatus.message} · ${formatTime(data.dbStatus.loadedAt)}`
-    : `DB lỗi, đang dùng fallback: ${data.dbStatus?.message || ''}`;
+  if (dbStatusEl) {
+    dbStatusEl.textContent = data.dbStatus?.ok
+      ? `${data.dbStatus.message} · ${formatTime(data.dbStatus.loadedAt)}`
+      : `DB lỗi, đang dùng fallback: ${data.dbStatus?.message || ''}`;
+  }
 
-  targetTextEl.textContent = data.config?.targetEndpoint || 'Local only';
-  toggleSenderEl.textContent = data.config?.senderEnabled ? 'POST on' : 'POST off';
-  toggleSenderEl.classList.toggle('secondary', !data.config?.senderEnabled);
+  const endpoint = data.config?.targetEndpoint || '';
+  if (targetTextEl) targetTextEl.textContent = endpoint || 'Local only';
+  if (sendTargetSelectEl) {
+    sendTargetSelectEl.value = data.config?.senderEnabled ? 'on' : 'off';
+    sendTargetSelectEl.title = endpoint
+      ? `Endpoint: ${endpoint}`
+      : 'Chưa cấu hình TARGET_GPS_ENDPOINT';
+  }
+  if (toggleSenderEl) {
+    toggleSenderEl.textContent = data.config?.senderEnabled ? 'POST on' : 'POST off';
+    toggleSenderEl.classList.toggle('secondary', !data.config?.senderEnabled);
+  }
   senderBadgeEl.textContent = data.config?.senderEnabled ? 'Live' : 'Idle';
   senderBadgeEl.classList.toggle('is-live', Boolean(data.config?.senderEnabled));
+
+  const catalogFp = catalogBoats(data)
+    .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.maxSpeedKmh}`)
+    .join('|');
+  if (catalogFp !== lastBoatIds) {
+    lastBoatIds = catalogFp;
+    renderCollectorBoatOptions(catalogBoats(data));
+  } else {
+    applyBoatSpeedLimits();
+  }
 
   const boatIds = SHOW_LIVE_BOATS ? data.boats.map((boat) => boat.boatId).join('|') : '';
   if (!SHOW_LIVE_BOATS) {
     boatsEl.innerHTML = '';
-    lastBoatIds = '';
-  } else if (boatIds !== lastBoatIds) {
-    lastBoatIds = boatIds;
+  } else if (boatIds !== lastLiveBoatIds) {
+    lastLiveBoatIds = boatIds;
     renderBoatCards(data.boats);
   } else {
     updateBoatCards(data.boats);
@@ -1282,41 +1599,75 @@ function boatIcon(heading) {
 function renderRoutes(routes) {
   const seen = new Set();
   const bounds = [];
-  mapLegendEl.innerHTML = '';
-  routes.forEach((route, index) => {
+  const previousValue = mapLegendSelectEl?.value || '';
+  if (mapLegendSelectEl) {
+    mapLegendSelectEl.innerHTML = '<option value="">Chọn tuyến...</option>';
+  }
+
+  routes.forEach((route) => {
     seen.add(route.routeId);
-    const color = routeColors[index % routeColors.length];
+    const color = SAVED_ROUTE_STYLE.color;
     let layer = routeLayers.get(route.routeId);
     const latlngs = (route.coordinates || []).map((p) => [p.lat, p.lng]);
     if (!layer) {
-      layer = L.polyline(latlngs, { color, weight: 4, opacity: 0.7 }).addTo(map);
+      layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE }).addTo(map);
       layer.bindTooltip(`${route.routeCode} · ${route.routeName}`);
       routeLayers.set(route.routeId, layer);
     } else {
       layer.setLatLngs(latlngs);
-      layer.setStyle({ color });
+      layer.setStyle({ ...SAVED_ROUTE_STYLE });
     }
     for (const p of latlngs) bounds.push(p);
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.className = 'legend-item';
-    item.innerHTML = `<span class="legend-line" style="background:${color}"></span><span>${escapeHtml(route.routeCode)}</span>`;
-    item.addEventListener('click', () => {
-      if (latlngs.length) map.fitBounds(latlngs, { padding: [40, 40] });
-    });
-    mapLegendEl.appendChild(item);
+
+    if (mapLegendSelectEl) {
+      const option = document.createElement('option');
+      option.value = route.routeId;
+      option.textContent = route.routeCode || route.routeName || route.routeId;
+      option.dataset.color = color;
+      mapLegendSelectEl.appendChild(option);
+    }
   });
+
   for (const [id, layer] of routeLayers) {
     if (!seen.has(id)) {
       layer.remove();
       routeLayers.delete(id);
     }
   }
+
+  if (mapLegendSelectEl) {
+    const stillExists = [...mapLegendSelectEl.options].some((opt) => opt.value === previousValue);
+    mapLegendSelectEl.value = stillExists ? previousValue : '';
+    updateLegendSwatch();
+  }
+
   if (!hasFitInitialRoutes && bounds.length && !recordingActive && !lockedSurveyPath) {
     hasFitInitialRoutes = true;
     map.fitBounds(bounds, { padding: [48, 48] });
   }
 }
+
+function updateLegendSwatch() {
+  if (!mapLegendSwatchEl || !mapLegendSelectEl) return;
+  const selected = mapLegendSelectEl.selectedOptions?.[0];
+  mapLegendSwatchEl.style.background = selected?.dataset?.color || SAVED_ROUTE_STYLE.color;
+  mapLegendSwatchEl.style.borderTop = selected
+    ? 'none'
+    : `3px solid ${SAVED_ROUTE_STYLE.color}`;
+}
+
+mapLegendSelectEl?.addEventListener('change', () => {
+  updateLegendSwatch();
+  const routeId = mapLegendSelectEl.value;
+  if (!routeId) return;
+  const layer = routeLayers.get(routeId);
+  if (!layer) return;
+  try {
+    map.fitBounds(layer.getBounds(), { padding: [40, 40], maxZoom: 16 });
+  } catch {
+    // ignore
+  }
+});
 
 function renderStations(stations) {
   const seen = new Set();
@@ -1369,12 +1720,10 @@ function stationFlagIcon(station, role = '') {
 
 function handleStationClick(station) {
   if (!captureState.points.length || captureState.points[0]?.source !== 'station') {
-    startStationEl.value = station.stationId;
-    seedFromStation();
+    setStationComboValue('start', station.stationId);
     return;
   }
-  endStationEl.value = station.stationId;
-  seedToEndStation();
+  setStationComboValue('end', station.stationId);
 }
 
 function formatTime(value) {

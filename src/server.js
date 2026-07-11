@@ -363,7 +363,12 @@ async function refreshFromDatabase() {
       if (existing) {
         const routeChanged = existing.routeId !== route.routeId;
         Object.assign(existing, base);
-        if (!existing.manualSpeed) existing.speedKmh = Math.min(existing.speedKmh, maxSpeedKmh || existing.speedKmh);
+        if (!existing.manualSpeed) {
+          existing.speedKmh = Math.min(
+            Number(existing.speedKmh || env.DEFAULT_SPEED_KMH || 16),
+            maxSpeedKmh || Number(env.DEFAULT_SPEED_KMH || 16),
+          );
+        }
         // Spread boats that share a route so many are visible on the map.
         if (!hasOwnRoute && routeChanged) {
           existing.progressMeters = stagger;
@@ -386,7 +391,10 @@ async function refreshFromDatabase() {
           batteryPercent: randomInt(78, 96),
           signalStrength: 4,
           gpsFixQuality: 'good',
-          speedKmh: Math.min(maxSpeedKmh || Number(env.DEFAULT_SPEED_KMH || 16), Number(env.DEFAULT_SPEED_KMH || maxSpeedKmh || 16)),
+          speedKmh: Math.min(
+            Number(env.DEFAULT_SPEED_KMH || 16),
+            maxSpeedKmh || Number(env.DEFAULT_SPEED_KMH || 16),
+          ),
           heading: start.heading,
           lat: start.lat,
           lng: start.lng,
@@ -868,10 +876,11 @@ async function stopTrackingSessionOnTarget(collector, recordedPointCount) {
 }
 
 async function saveRouteFromGpsOnTarget(session, body) {
-  const averageSpeedKmh = clamp(
-    Number(body.averageSpeedKmh || session.averageSpeedKmh || env.DEFAULT_SPEED_KMH || 16),
-    1,
-    80,
+  const boatCode = cleanOptionalText(body.boatCode || session.boatCode);
+  const maxSpeed = maxSpeedForBoatCode(boatCode);
+  const averageSpeedKmh = clampSpeedToBoatMax(
+    Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16),
+    maxSpeed,
   );
   const coordinates = (session.recordedPoints || [])
     .filter((point) => Number.isFinite(Number(point.lat)) && Number.isFinite(Number(point.lng)))
@@ -884,7 +893,6 @@ async function saveRouteFromGpsOnTarget(session, body) {
     }));
 
   const payload = {
-    sessionId: session.sessionId || null,
     routeCode: cleanRouteText(body.routeCode || session.routeCode, 'Route code'),
     routeName: cleanRouteText(body.routeName || session.routeName || body.routeCode || session.routeCode, 'Route name'),
     description: cleanOptionalText(body.description) || 'Captured from GPS recording session',
@@ -892,6 +900,9 @@ async function saveRouteFromGpsOnTarget(session, body) {
     averageSpeedKmh,
     coordinates,
   };
+  if (session.targetSessionStarted && session.sessionId) {
+    payload.sessionId = session.sessionId;
+  }
   // Chi gui station id khi la UUID hop le — tranh 400 validation.
   const startStationId = cleanOptionalText(body.startStationId || session.startStationId);
   const endStationId = cleanOptionalText(body.endStationId || session.endStationId);
@@ -911,8 +922,9 @@ async function persistRecordingSession(body, sessionInput = null) {
   let savedTo = 'local';
   let warning = null;
   const hasCoordinates = (session?.recordedPoints?.length || 0) >= 2;
-  // Co the goi Azure from-gps neu da start session HOAC co coordinates local (swagger cho phep).
-  const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && (session?.targetSessionStarted || session?.sessionId));
+  // Chỉ gọi Azure from-gps khi session đã start thật trên BE.
+  // sessionId local luôn có → nếu cứ gửi sẽ bị "GPS session khong ton tai".
+  const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && session?.targetSessionStarted);
 
   if (canTryAzure) {
     const targetSave = await saveRouteFromGpsOnTarget(session, body);
@@ -1012,6 +1024,7 @@ async function finalizeCollectorRecording() {
     const result = await persistRecordingSession({
       routeCode: stopped.routeCode,
       routeName: stopped.routeName,
+      boatCode: stopped.boatCode,
       description: 'Auto-saved after GPS recording completed',
       status: 'Active',
       averageSpeedKmh: stopped.speedKmh,
@@ -1086,6 +1099,7 @@ async function saveRecordedRoute(body) {
   return createCapturedRouteSafe({
     routeCode: body.routeCode || session.routeCode,
     routeName: body.routeName || session.routeName || session.routeCode,
+    boatCode: body.boatCode || session.boatCode || null,
     description: body.description || 'Captured from GPS recording session',
     status: body.status || 'Active',
     averageSpeedKmh: body.averageSpeedKmh,
@@ -1103,8 +1117,13 @@ async function createCapturedRoute(body) {
   const points = validateRoutePoints(body.coordinates);
   const routeId = randomUUID();
   const lengthMeters = routeLength(points);
-  const averageSpeedKmh = clamp(Number(body.averageSpeedKmh || env.DEFAULT_SPEED_KMH || 16), 1, 80);
-  // Cùng một km cho cả distance + duration: phút = (km / vận_tốc) × 60
+  const boatCode = cleanOptionalText(body.boatCode);
+  const maxSpeed = maxSpeedForBoatCode(boatCode);
+  const averageSpeedKmh = clampSpeedToBoatMax(
+    Number(body.averageSpeedKmh || env.DEFAULT_SPEED_KMH || 16),
+    maxSpeed,
+  );
+  // phút = (km / tốc_độ_chạy) × 60 · tốc độ ≤ max đăng ký
   const baseDistanceKm = round(lengthMeters / 1000, 3);
   const estimatedDurationMin = Math.max(
     1,
@@ -1322,6 +1341,25 @@ limit 1;
   }
 }
 
+function maxSpeedForBoatCode(boatCode) {
+  const code = String(boatCode || '').trim();
+  if (!code) return null;
+  for (const boat of state.boats.values()) {
+    if (String(boat.boatId || '').startsWith('collector-')) continue;
+    if (String(boat.boatCode) !== code) continue;
+    const max = Number(boat.maxSpeedKmh);
+    if (Number.isFinite(max) && max > 0) return max;
+  }
+  return null;
+}
+
+function clampSpeedToBoatMax(speedKmh, maxSpeedKmh) {
+  const max = Number.isFinite(Number(maxSpeedKmh)) && Number(maxSpeedKmh) > 0
+    ? Number(maxSpeedKmh)
+    : 80;
+  return clamp(Number(speedKmh), 1, max);
+}
+
 function startCollector(body) {
   const routeCode = cleanRouteText(body.routeCode, 'Route code');
   const routeName = cleanRouteText(body.routeName || body.routeCode, 'Route name');
@@ -1337,11 +1375,20 @@ function startCollector(body) {
   );
   sequenceState[deviceId] = seedSequence;
   scheduleSequenceSave();
+  const matchedBoat = [...state.boats.values()].find((boat) => (
+    String(boat.boatCode) === boatCode && !String(boat.boatId || '').startsWith('collector-')
+  ));
+  const maxSpeedKmh = Number(matchedBoat?.maxSpeedKmh) || maxSpeedForBoatCode(boatCode) || 80;
+  // max_speed_kmh chỉ là trần; tốc độ chạy lấy từ input / DEFAULT.
+  const speedKmh = clampSpeedToBoatMax(
+    Number(body.speedKmh || env.DEFAULT_SPEED_KMH || 16),
+    maxSpeedKmh,
+  );
   return {
     boatId: `collector-${routeCode}`,
     deviceId,
     boatCode,
-    boatName: body.boatName || 'Route collector boat',
+    boatName: body.boatName || matchedBoat?.boatName || 'Route collector boat',
     tripId: null,
     routeId: `capture-${routeCode}`,
     routeCode,
@@ -1354,8 +1401,8 @@ function startCollector(body) {
     batteryPercent: randomInt(82, 96),
     signalStrength: 4,
     gpsFixQuality: 'good',
-    speedKmh: clamp(Number(body.speedKmh || env.DEFAULT_SPEED_KMH || 16), 1, 80),
-    maxSpeedKmh: 80,
+    speedKmh,
+    maxSpeedKmh,
     heading: start.heading,
     lat: start.lat,
     lng: start.lng,
@@ -1742,6 +1789,7 @@ function contentType(filePath) {
   if (filePath.endsWith('.html')) return 'text/html; charset=utf-8';
   if (filePath.endsWith('.css')) return 'text/css; charset=utf-8';
   if (filePath.endsWith('.js')) return 'text/javascript; charset=utf-8';
+  if (filePath.endsWith('.geojson') || filePath.endsWith('.json')) return 'application/geo+json; charset=utf-8';
   return 'application/octet-stream';
 }
 

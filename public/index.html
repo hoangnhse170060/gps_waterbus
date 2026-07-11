@@ -15,15 +15,17 @@
       <section class="map-shell">
         <div id="map"></div>
         <div class="topbar">
-          <div class="brand-card">
-            <p class="eyebrow">Saigon Waterbus</p>
-            <h1>Thu tuyến GPS</h1>
-            <p id="dbStatus">Đang nạp dữ liệu...</p>
-          </div>
           <div class="sender">
-            <span id="targetText">Local only</span>
+            <label class="sender-field">
+              <span class="sender-label">Gửi GPS</span>
+              <select id="sendTargetSelect" title="">
+                <option value="off">Tắt (local)</option>
+                <option value="on">Azure BE</option>
+              </select>
+            </label>
             <button id="refreshRoutes" type="button" class="secondary">Làm mới</button>
-            <button id="toggleSender" type="button">POST off</button>
+            <button id="toggleSender" type="button" class="hidden-legacy" hidden>POST off</button>
+            <span id="targetText" class="hidden-legacy" hidden>Local only</span>
           </div>
         </div>
 
@@ -53,8 +55,17 @@
         </div>
 
         <div class="map-legend">
-          <div class="legend-title">Tuyến trên bản đồ</div>
-          <div id="mapLegend"></div>
+          <label class="legend-title" for="mapLegendSelect">Tuyến trên bản đồ</label>
+          <div class="legend-select-row">
+            <span class="legend-swatch" id="mapLegendSwatch" aria-hidden="true"></span>
+            <select id="mapLegendSelect">
+              <option value="">Chọn tuyến...</option>
+            </select>
+          </div>
+          <div class="legend-keys">
+            <span class="legend-key is-saved">Đã lưu · nét liền</span>
+            <span class="legend-key is-draft">Đang vẽ/chạy · nét đứt</span>
+          </div>
         </div>
       </section>
 
@@ -99,30 +110,35 @@
           </div>
 
           <div class="capture-fields">
-            <label>
+            <label class="station-field">
               <span>Bến xuất phát</span>
-              <select id="startStation">
-                <option value="">Chọn bến...</option>
-              </select>
+              <div class="combo" data-combo="start">
+                <button type="button" class="combo-trigger" id="startStationTrigger">
+                  <span class="combo-label">Chọn bến...</span>
+                </button>
+                <div class="combo-panel" hidden>
+                  <input type="search" class="combo-search" placeholder="Tìm bến..." autocomplete="off">
+                  <div class="combo-list" role="listbox"></div>
+                </div>
+                <input type="hidden" id="startStation" value="">
+              </div>
             </label>
-            <label>
+            <label class="station-field">
               <span>Bến kết thúc</span>
-              <select id="endStation">
-                <option value="">Chọn bến đích...</option>
-              </select>
+              <div class="station-map-pick is-empty" id="endStationDisplay" role="status">
+                <span class="station-map-pick-icon" aria-hidden="true">◎</span>
+                <span class="station-map-pick-text">Nhấn bến trên map để chọn</span>
+              </div>
+              <input type="hidden" id="endStation" value="">
+              <small class="field-hint">Không chọn trong list — phải nhấn bến đích trên bản đồ.</small>
             </label>
-
-            <div class="station-actions">
-              <button id="seedFromStation" type="button" class="secondary">Gắn bến đầu</button>
-              <button id="seedToEndStation" type="button" class="secondary">Gắn bến cuối</button>
-            </div>
 
             <div class="route-estimate" id="routeEstimate">
               <div><span>Quãng đường (km)</span><strong id="estimateKm">0 km</strong></div>
               <div><span>Vận tốc (km/h)</span><strong id="estimateSpeed">16 km/h</strong></div>
               <div><span>Thời gian (phút)</span><strong id="estimateMin">0 phút</strong></div>
             </div>
-            <p class="meta estimate-note" id="estimateFormula">phút = (km ÷ vận tốc) × 60</p>
+            <p class="meta estimate-note" id="estimateFormula">phút = (km ÷ tốc độ chạy) × 60 · tốc độ ≤ max đăng ký</p>
 
             <label>
               <span>Mã tuyến (routeCode)</span>
@@ -135,7 +151,10 @@
             </label>
             <label>
               <span>Tàu GPS (boatCode)</span>
-              <input id="collectorBoatCode" type="text" value="WB_001">
+              <select id="collectorBoatCode">
+                <option value="">Chọn tàu...</option>
+              </select>
+              <small id="boatSpeedHint" class="field-hint">Vận tốc đăng ký = mức tối đa; nhập tốc độ chạy thực tế (≤ tối đa).</small>
             </label>
             <div class="field-row">
               <label>
@@ -143,8 +162,8 @@
                 <input id="sendIntervalSec" type="number" min="3" max="10" step="1" value="5">
               </label>
               <label>
-                <span>Tốc độ (km/h)</span>
-                <input id="collectorSpeed" type="number" min="1" max="80" step="1" value="16">
+                <span>Tốc độ chạy (km/h)</span>
+                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16" title="Tốc độ mô phỏng / tính thời gian; không vượt max đăng ký">
               </label>
             </div>
           </div>
@@ -155,7 +174,7 @@
             <button id="stopCollector" class="secondary" type="button" disabled>Kết thúc &amp; lưu</button>
           </div>
 
-          <p id="captureStatus" class="meta">1) Chọn bến · 2) Vẽ đường · 3) Bấm Xong để tạo nét cong · 4) Ghi GPS (tự lưu khi xong).</p>
+          <p id="captureStatus" class="meta">1) Chọn bến đầu · 2) Vẽ đường · 3) Click bến cuối trên map · 4) Xong · 5) Ghi GPS.</p>
           <p id="collectorStatus" class="meta">Chưa ghi GPS.</p>
           <div class="route-result-card hidden" id="routeResult"></div>
         </section>
