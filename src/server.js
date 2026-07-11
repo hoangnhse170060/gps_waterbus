@@ -119,6 +119,16 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    if (url.pathname === '/api/health' && req.method === 'GET') {
+      return sendJson(res, {
+        ok: true,
+        service: 'waterbus-gps-simulator',
+        time: new Date().toISOString(),
+        hasDatabase: Boolean(env.DATABASE_URL || env.DB_HOST),
+        senderEnabled: state.senderEnabled,
+        collectorRunning: Boolean(state.collector),
+      });
+    }
     if (url.pathname === '/events') return handleEvents(req, res);
     if (url.pathname === '/api/snapshot') return sendJson(res, snapshot());
     if (url.pathname === '/api/config') return sendJson(res, publicConfig());
@@ -266,7 +276,7 @@ server.on('error', (error) => {
   throw error;
 });
 
-server.listen(port, () => {
+server.listen(port, '0.0.0.0', () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
 });
 
