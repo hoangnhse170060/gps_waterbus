@@ -596,22 +596,24 @@ function haversineMeters(a, b) {
 
 function estimateTravelMinutes(meters, speedKmh) {
   const speed = clampNumber(Number(speedKmh) || 16, 0.1, 80);
-  if (!(meters > 0)) return 0;
-  return (meters / 1000 / speed) * 60;
+  const km = Number(meters) / 1000;
+  if (!(km > 0) || !(speed > 0)) return 0;
+  // phút = (km / vận_tốc_kmh) × 60
+  return (km / speed) * 60;
 }
 
 function updateDrawStats() {
   const meters = pathLengthMeters(captureState.points);
   const speed = Number(collectorSpeedEl.value || 16);
-  const minutesExact = estimateTravelMinutes(meters, speed);
   const km = meters / 1000;
+  const minutesExact = estimateTravelMinutes(meters, speed);
   const kmText = meters < 1000
     ? `${Math.round(meters)} m`
     : `${km.toFixed(3)} km`;
   if (drawDistanceEl) drawDistanceEl.textContent = kmText;
   if (drawDurationEl) {
     drawDurationEl.textContent = meters > 0
-      ? `${minutesExact < 10 ? minutesExact.toFixed(1) : Math.round(minutesExact)} phút`
+      ? `${minutesExact.toFixed(1)} phút`
       : '0 phút';
   }
   if (drawPointsEl) drawPointsEl.textContent = `${captureState.points.length} điểm`;
@@ -625,6 +627,12 @@ function updateDrawStats() {
     estimateMinEl.textContent = meters > 0
       ? `${minutesExact.toFixed(2)} phút`
       : '0 phút';
+  }
+  const formulaEl = document.querySelector('#estimateFormula');
+  if (formulaEl) {
+    formulaEl.textContent = meters > 0
+      ? `(${km.toFixed(3)} km ÷ ${speed} km/h) × 60 = ${minutesExact.toFixed(2)} phút`
+      : 'phút = (km ÷ vận tốc) × 60';
   }
 }
 

@@ -1104,7 +1104,12 @@ async function createCapturedRoute(body) {
   const routeId = randomUUID();
   const lengthMeters = routeLength(points);
   const averageSpeedKmh = clamp(Number(body.averageSpeedKmh || env.DEFAULT_SPEED_KMH || 16), 1, 80);
-  const estimatedDurationMin = Math.max(1, Math.round((lengthMeters / 1000 / averageSpeedKmh) * 60));
+  // Cùng một km cho cả distance + duration: phút = (km / vận_tốc) × 60
+  const baseDistanceKm = round(lengthMeters / 1000, 3);
+  const estimatedDurationMin = Math.max(
+    1,
+    Math.round((baseDistanceKm / averageSpeedKmh) * 60),
+  );
   const startStationId = cleanOptionalText(body.startStationId);
   const endStationId = cleanOptionalText(body.endStationId);
   const pointSql = points
@@ -1117,7 +1122,7 @@ async function createCapturedRoute(body) {
       id: randomUUID(),
       stationId: startStationId,
       stopOrder: 1,
-      travel: estimatedDurationMin,
+      travel: null, // bến đầu: chưa chạy
       pickup: true,
       dropoff: false,
     });
@@ -1127,7 +1132,7 @@ async function createCapturedRoute(body) {
       id: randomUUID(),
       stationId: endStationId,
       stopOrder: stopRows.length + 1,
-      travel: null,
+      travel: estimatedDurationMin, // phút chạy từ bến đầu → bến cuối
       pickup: false,
       dropoff: true,
     });
@@ -1182,6 +1187,7 @@ with route_input as (
     ${sqlLiteral(description)} as description,
     ${sqlLiteral(status)} as status,
     ${estimatedDurationMin}::int as estimated_duration_min,
+    ${baseDistanceKm}::numeric as base_distance_km,
     ST_SetSRID(ST_MakeLine(array[${pointSql}]), 4326)::geography as route_geometry
 ),
 inserted as (
@@ -1202,7 +1208,7 @@ inserted as (
     route_code,
     route_name,
     description,
-    round((ST_Length(route_geometry) / 1000)::numeric, 2),
+    base_distance_km,
     estimated_duration_min,
     status,
     now(),
