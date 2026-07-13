@@ -1026,12 +1026,12 @@ async function saveRouteFromGpsOnTarget(session, body) {
   if (startStationId) payload.startStationId = startStationId;
   if (endStationId) payload.endStationId = endStationId;
 
-  const routeType = resolveRouteType(body, session, startStationId, endStationId);
-  payload.routeType = routeType;
-  payload.isBookable = routeType !== 'CharterReference';
+  // Contract mới: GPS không gửi routeType/isBookable — BE tự phân loại
+  // (start≠end → route nguồn; start=end → sightseeing loop).
+  const inferredLoop = Boolean(startStationId && endStationId && startStationId === endStationId);
 
   const createReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
-    && routeType !== 'SightseeingLoop';
+    && !inferredLoop;
   if (createReverse) {
     payload.createReverseRoute = true;
     const reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
@@ -1097,8 +1097,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
   // Giữ stops đã gửi để UI/BE fallback nếu Azure không trả stops[].
   if (targetResult && typeof targetResult === 'object') {
     targetResult.outboundStops = stops;
-    targetResult.outboundRouteType = routeType;
-    targetResult.outboundIsBookable = payload.isBookable;
+    targetResult.outboundCreateReverse = Boolean(payload.createReverseRoute);
   }
   return targetResult;
 }
@@ -1146,14 +1145,11 @@ async function persistRecordingSession(body, sessionInput = null) {
           });
         }
       }
-      if (!route.routeType && targetSave.outboundRouteType) {
-        route.routeType = targetSave.outboundRouteType;
-      }
-      if (route.isBookable == null && targetSave.outboundIsBookable != null) {
-        route.isBookable = targetSave.outboundIsBookable;
-      }
       if (!route.reverseRoute && targetSave.data?.reverseRoute) {
         route.reverseRoute = targetSave.data.reverseRoute;
+      }
+      if (route.createReverseRoute == null) {
+        route.createReverseRoute = Boolean(targetSave.outboundCreateReverse);
       }
       savedTo = 'target';
       state.lastRecordingSession = null;

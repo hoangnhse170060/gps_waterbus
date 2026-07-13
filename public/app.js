@@ -12,6 +12,10 @@ const targetTextEl = document.querySelector('#targetText');
 const refreshRoutesEl = document.querySelector('#refreshRoutes');
 const toggleSenderEl = document.querySelector('#toggleSender');
 const sendTargetSelectEl = document.querySelector('#sendTargetSelect');
+const senderPanelEl = document.querySelector('#senderPanel');
+const senderToggleEl = document.querySelector('#senderToggle');
+const senderBodyEl = document.querySelector('#senderBody');
+const senderToggleTextEl = document.querySelector('#senderToggleText');
 const boatCountEl = document.querySelector('#boatCount');
 const sendModeEl = document.querySelector('#sendMode');
 const senderBadgeEl = document.querySelector('#senderBadge');
@@ -59,7 +63,6 @@ const estimateMinEl = document.querySelector('#estimateMin');
 const stationCountEl = document.querySelector('#stationCount');
 const routeCodeHintEl = document.querySelector('#routeCodeHint');
 const routeTypeHintEl = document.querySelector('#routeTypeHint');
-const surveyRouteTypeEl = document.querySelector('#surveyRouteType');
 const createReverseRouteEl = document.querySelector('#createReverseRoute');
 const reverseFieldsEl = document.querySelector('#reverseFields');
 const reverseRouteCodeEl = document.querySelector('#reverseRouteCode');
@@ -81,6 +84,7 @@ let lockedSurveyPath = null; // giữ đường vẽ suốt lúc tàu chạy —
 let collectorMarker = null;
 let routeStopMarkersLayer = null;
 let selectedRouteStops = [];
+let selectedRouteId = '';
 let showSavedRoutes = true;
 let latest = null;
 let hasFitInitialRoutes = false;
@@ -116,6 +120,18 @@ const SAVED_ROUTE_STYLE = {
   opacity: 0.78,
   dashArray: null,
 };
+const SELECTED_ROUTE_STYLE = {
+  color: '#f59e0b',
+  weight: 8,
+  opacity: 1,
+  dashArray: null,
+};
+const DIMMED_ROUTE_STYLE = {
+  color: '#0f766e',
+  weight: 3,
+  opacity: 0.28,
+  dashArray: null,
+};
 const DRAFT_ROUTE_STYLE = {
   color: '#ea580c',
   weight: 5,
@@ -136,7 +152,27 @@ toggleSenderEl?.addEventListener('click', async () => {
 });
 sendTargetSelectEl?.addEventListener('change', async () => {
   await setSenderEnabled(sendTargetSelectEl.value === 'on');
+  updateSenderToggleChip();
 });
+
+senderToggleEl?.addEventListener('click', () => {
+  const collapsed = !senderPanelEl?.classList.contains('is-collapsed');
+  senderPanelEl?.classList.toggle('is-collapsed', collapsed);
+  if (senderBodyEl) senderBodyEl.hidden = collapsed;
+  senderToggleEl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+});
+
+function updateSenderToggleChip(data = latest) {
+  const enabled = Boolean(data?.config?.senderEnabled);
+  senderPanelEl?.classList.toggle('is-live', enabled);
+  if (senderToggleTextEl) {
+    senderToggleTextEl.textContent = enabled ? 'Azure BE' : 'Local';
+  }
+  senderToggleEl?.setAttribute(
+    'title',
+    enabled ? 'Đang gửi Azure BE — bấm để mở cài đặt' : 'Local only — bấm để mở cài đặt',
+  );
+}
 
 async function setSenderEnabled(enabled) {
   await fetch('/api/sender', {
@@ -324,11 +360,6 @@ startCollectorEl.addEventListener('click', startRecording);
 pauseCollectorEl.addEventListener('click', pauseCollector);
 stopCollectorEl.addEventListener('click', stopRecording);
 saveRouteGeometryEl.addEventListener('click', saveRouteGeometry);
-surveyRouteTypeEl?.addEventListener('change', () => {
-  updateRouteTypeHint();
-  updateReverseRouteUi();
-  renderCaptureState();
-});
 createReverseRouteEl?.addEventListener('change', () => {
   updateReverseRouteUi({ suggest: true });
 });
@@ -626,10 +657,8 @@ function getSelectedEndStation() {
     || null;
 }
 
+/** Chỉ suy từ bến đầu/cuối cho UI local — BE tự phân loại, không gửi routeType. */
 function getSurveyRouteType() {
-  const picked = surveyRouteTypeEl?.value || 'auto';
-  // Người dùng chọn tay (Thường / Vòng tham quan / Tham chiếu thuê tàu) → ưu tiên.
-  if (picked && picked !== 'auto') return picked;
   const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
   const endPoint = [...captureState.points].reverse().find((p) => p.source === 'station-end');
   const endId = endStationEl?.value || endPoint?.stationId || '';
@@ -819,15 +848,12 @@ function updateRouteTypeHint() {
   const ordered = collectOrderedStopsFromClicks();
   const viaCount = Math.max(0, ordered.length - 2);
   const isLoop = type === 'SightseeingLoop';
-  const isCharter = type === 'CharterReference';
   if (routeTypeHintEl) {
     if (ordered.length >= 2) {
       if (isLoop) {
-        routeTypeHintEl.textContent = `${type} · loop bến đầu = bến cuối · đi lượn quanh sông, không ghé bến giữa.`;
-      } else if (isCharter) {
-        routeTypeHintEl.textContent = `${type} · ${ordered.length} bến đã click · isBookable = false (không đặt vé online).`;
+        routeTypeHintEl.textContent = 'Vòng sightseeing (cùng bến đầu/cuối) — BE tự lưu sightseeing loop · không ghé bến giữa.';
       } else {
-        routeTypeHintEl.textContent = `${type} · ${ordered.length} bến đã click${viaCount ? ` · ${viaCount} bến giữa` : ''}. Nét thẳng — không tự nhận bến đi qua.`;
+        routeTypeHintEl.textContent = `Route nguồn GPS · ${ordered.length} bến đã click${viaCount ? ` · ${viaCount} bến giữa` : ''} · BE tự phân loại.`;
       }
       routeTypeHintEl.classList.add('is-ok');
       routeTypeHintEl.classList.remove('is-error');
@@ -871,13 +897,13 @@ function updateStopChainPreview(orderedInput) {
 function surveySaveFields() {
   ensureEndStationFromPath({ quiet: true });
   const fields = {
-    routeType: getSurveyRouteType(),
     startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
     endStationId: endStationEl.value || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId || null,
     stops: buildSurveyStops(),
   };
+  const inferredType = getSurveyRouteType();
   const wantReverse = Boolean(createReverseRouteEl?.checked)
-    && fields.routeType !== 'SightseeingLoop'
+    && inferredType !== 'SightseeingLoop'
     && (fields.stops?.length || 0) >= 2;
   if (wantReverse) {
     fields.createReverseRoute = true;
@@ -1958,7 +1984,7 @@ function renderRouteResult(body) {
       <span>${escapeHtml(body.routeCode || '')}</span>
     </div>
     <div class="route-result-meta">
-      <span>Loại: <b>${escapeHtml(body.routeType || getSurveyRouteType())}</b></span>
+      <span>BE: <b>${escapeHtml(body.routeType || (getSurveyRouteType() === 'SightseeingLoop' ? 'SightseeingLoop' : 'route nguồn'))}</b></span>
       <span>Quãng đường: <b>${distance != null ? `${distance} km` : '?'}</b></span>
       <span>Thời gian ước tính: <b>${duration != null ? `${duration} phút` : '?'}</b></span>
       <span>Số bến: <b>${stops.length}</b></span>
@@ -1966,13 +1992,16 @@ function renderRouteResult(body) {
     ${stops.length
       ? `<div class="route-result-stops-title">Thứ tự bến đã đẩy lên BE</div><ol class="route-result-stops">${stopLines}</ol>`
       : '<p class="meta">Chưa có station trong route_stops — kiểm tra payload stops[] gửi BE.</p>'}
-    ${body.reverseRoute ? `
-      <div class="route-result-stops-title">Chiếu về (reverseRoute)</div>
+    ${body.reverseRoute
+      ? `<div class="route-result-stops-title">Đã tạo chiều về</div>
       <div class="route-result-meta">
         <span><b>${escapeHtml(body.reverseRoute.routeCode || '')}</b></span>
         <span>${escapeHtml(body.reverseRoute.routeName || '')}</span>
         <span>id: ${escapeHtml(body.reverseRoute.routeId || body.reverseRoute.id || '')}</span>
-      </div>` : ''}
+      </div>`
+      : (body.createReverseRoute
+        ? '<p class="meta">Đã gửi createReverseRoute nhưng BE chưa trả reverseRoute.</p>'
+        : '')}
     <p class="meta"><a href="/api-log.html">Xem log API đẩy BE →</a></p>
   `;
   routeResultEl.classList.remove('hidden');
@@ -2132,8 +2161,11 @@ function renderPanelLive(data) {
     toggleSenderEl.textContent = data.config?.senderEnabled ? 'POST on' : 'POST off';
     toggleSenderEl.classList.toggle('secondary', !data.config?.senderEnabled);
   }
-  senderBadgeEl.textContent = data.config?.senderEnabled ? 'Live' : 'Idle';
-  senderBadgeEl.classList.toggle('is-live', Boolean(data.config?.senderEnabled));
+  if (senderBadgeEl) {
+    senderBadgeEl.textContent = data.config?.senderEnabled ? 'Live' : 'Idle';
+    senderBadgeEl.classList.toggle('is-live', Boolean(data.config?.senderEnabled));
+  }
+  updateSenderToggleChip(data);
 
   const catalogFp = catalogBoats(data)
     .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.maxSpeedKmh}`)
@@ -2164,14 +2196,16 @@ function renderPanelLive(data) {
     if (!data.collector) {
       sendLogEl.textContent = `${formatTime(data.lastSend.at)} · ${mode} · ${summary}`;
     }
-    sendModeEl.textContent = data.lastSend.mode === 'target' ? 'Target' : 'Local';
-    sendModeEl.classList.toggle('is-live', data.lastSend.mode === 'target');
+    sendModeEl?.classList?.toggle?.('is-live', data.lastSend.mode === 'target');
+    if (sendModeEl) sendModeEl.textContent = data.lastSend.mode === 'target' ? 'Target' : 'Local';
   } else if (!data.collector && !autoSaveInFlight) {
     sendLogEl.textContent = data.config?.senderEnabled
       ? 'Đang chờ lần gửi đầu tiên...'
       : 'Chọn bến → vẽ đường → bắt đầu ghi.';
-    sendModeEl.textContent = 'Idle';
-    sendModeEl.classList.remove('is-live');
+    if (sendModeEl) {
+      sendModeEl.textContent = 'Idle';
+      sendModeEl.classList.remove('is-live');
+    }
   }
 
   if (data.lastCollectorSend && data.collector) {
@@ -2184,7 +2218,7 @@ function renderPanelLive(data) {
     } else {
       sendLogEl.textContent = `Lỗi gửi GPS: ${data.lastCollectorSend.error || data.lastCollectorSend.status}`;
     }
-    sendModeEl.textContent = data.lastCollectorSend.mode === 'target' ? 'Target' : 'Local';
+    if (sendModeEl) sendModeEl.textContent = data.lastCollectorSend.mode === 'target' ? 'Target' : 'Local';
   }
 
   checkRouteCodeDuplicate();
@@ -2353,10 +2387,33 @@ toggleSavedRoutesEl?.addEventListener('click', () => {
   applySavedRoutesVisibility();
 });
 
+function applySelectedRouteHighlight(routeId = selectedRouteId) {
+  selectedRouteId = routeId ? String(routeId) : '';
+  const hasSelection = Boolean(selectedRouteId);
+  for (const [id, layer] of routeLayers) {
+    if (!layer) continue;
+    if (hasSelection && String(id) === selectedRouteId) {
+      layer.setStyle({ ...SELECTED_ROUTE_STYLE });
+      if (typeof layer.bringToFront === 'function') layer.bringToFront();
+    } else if (hasSelection) {
+      layer.setStyle({ ...DIMMED_ROUTE_STYLE });
+    } else {
+      layer.setStyle({ ...SAVED_ROUTE_STYLE });
+    }
+  }
+  if (mapLegendSwatchEl) {
+    mapLegendSwatchEl.style.background = hasSelection
+      ? SELECTED_ROUTE_STYLE.color
+      : SAVED_ROUTE_STYLE.color;
+    mapLegendSwatchEl.style.borderTop = 'none';
+    mapLegendSwatchEl.style.height = hasSelection ? '6px' : '3px';
+  }
+}
+
 function renderRoutes(routes) {
   const seen = new Set();
   const bounds = [];
-  const previousValue = mapLegendSelectEl?.value || '';
+  const previousValue = mapLegendSelectEl?.value || selectedRouteId || '';
   if (mapLegendSelectEl) {
     mapLegendSelectEl.innerHTML = '<option value="">Chọn tuyến...</option>';
   }
@@ -2370,10 +2427,15 @@ function renderRoutes(routes) {
       layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE });
       if (showSavedRoutes) layer.addTo(map);
       layer.bindTooltip(`${route.routeCode} · ${route.routeName}`);
+      layer.on('click', () => {
+        if (mapLegendSelectEl) {
+          mapLegendSelectEl.value = String(route.routeId);
+          mapLegendSelectEl.dispatchEvent(new Event('change'));
+        }
+      });
       routeLayers.set(route.routeId, layer);
     } else {
       layer.setLatLngs(latlngs);
-      layer.setStyle({ ...SAVED_ROUTE_STYLE });
       if (showSavedRoutes && !map.hasLayer(layer)) layer.addTo(map);
       if (!showSavedRoutes && map.hasLayer(layer)) map.removeLayer(layer);
     }
@@ -2398,7 +2460,9 @@ function renderRoutes(routes) {
   if (mapLegendSelectEl) {
     const stillExists = [...mapLegendSelectEl.options].some((opt) => opt.value === previousValue);
     mapLegendSelectEl.value = stillExists ? previousValue : '';
+    selectedRouteId = mapLegendSelectEl.value || '';
     updateLegendSwatch();
+    applySelectedRouteHighlight(selectedRouteId);
     if (showSavedRoutes) showSelectedRouteStops(mapLegendSelectEl.value || '');
     else applySavedRoutesVisibility();
   }
@@ -2483,10 +2547,12 @@ function showSelectedRouteStops(routeId) {
 function updateLegendSwatch() {
   if (!mapLegendSwatchEl || !mapLegendSelectEl) return;
   const selected = mapLegendSelectEl.selectedOptions?.[0];
-  mapLegendSwatchEl.style.background = selected?.dataset?.color || SAVED_ROUTE_STYLE.color;
-  mapLegendSwatchEl.style.borderTop = selected
-    ? 'none'
-    : `3px solid ${SAVED_ROUTE_STYLE.color}`;
+  const hasSelection = Boolean(selected?.value);
+  mapLegendSwatchEl.style.background = hasSelection
+    ? SELECTED_ROUTE_STYLE.color
+    : SAVED_ROUTE_STYLE.color;
+  mapLegendSwatchEl.style.borderTop = 'none';
+  mapLegendSwatchEl.style.height = hasSelection ? '6px' : '3px';
 }
 
 mapLegendSelectEl?.addEventListener('change', () => {
@@ -2496,6 +2562,7 @@ mapLegendSelectEl?.addEventListener('change', () => {
     showSavedRoutes = true;
     applySavedRoutesVisibility();
   }
+  applySelectedRouteHighlight(routeId);
   showSelectedRouteStops(routeId);
   if (!routeId) return;
   const layer = routeLayers.get(routeId);

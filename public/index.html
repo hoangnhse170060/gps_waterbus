@@ -17,16 +17,25 @@
       <section class="map-shell">
         <div id="map"></div>
         <div class="topbar">
-          <div class="sender">
-            <label class="sender-field">
-              <span class="sender-label">Gửi GPS</span>
-              <select id="sendTargetSelect" title="">
-                <option value="off">Tắt (local)</option>
-                <option value="on">Azure BE</option>
-              </select>
-            </label>
-            <button id="refreshRoutes" type="button" class="secondary">Làm mới</button>
-            <a class="secondary topbar-link" href="/api-log.html" title="Xem payload / lỗi đẩy lên BE">Log API</a>
+          <div class="sender is-collapsed" id="senderPanel">
+            <button type="button" class="sender-toggle" id="senderToggle" title="Mở/đóng gửi GPS" aria-expanded="false">
+              <span class="sender-toggle-dot" id="senderToggleDot" aria-hidden="true"></span>
+              <span class="sender-toggle-text" id="senderToggleText">Local</span>
+              <span class="sender-toggle-chevron" aria-hidden="true">▾</span>
+            </button>
+            <div class="sender-body" id="senderBody" hidden>
+              <label class="sender-field">
+                <span class="sender-label">Gửi GPS</span>
+                <select id="sendTargetSelect" title="">
+                  <option value="off">Tắt (local)</option>
+                  <option value="on">Azure BE</option>
+                </select>
+              </label>
+              <div class="sender-actions">
+                <button id="refreshRoutes" type="button" class="secondary">Làm mới</button>
+                <a class="secondary topbar-link" href="/api-log.html" title="Xem payload / lỗi đẩy lên BE">Log API</a>
+              </div>
+            </div>
             <button id="toggleSender" type="button" class="hidden-legacy" hidden>POST off</button>
             <span id="targetText" class="hidden-legacy" hidden>Local only</span>
           </div>
@@ -74,6 +83,7 @@
           </div>
           <div class="legend-keys">
             <span class="legend-key is-saved">Đã lưu · nét liền</span>
+            <span class="legend-key is-selected">Đang chọn · nổi bật</span>
             <span class="legend-key is-draft">Đang vẽ/chạy · nét đứt</span>
           </div>
           <button id="toggleSavedRoutes" type="button" class="legend-toggle is-on" title="Ẩn/hiện các tuyến đã lưu trên map">
@@ -94,7 +104,6 @@
             <p class="eyebrow">Route Survey</p>
             <h2>Thu thập tuyến đường</h2>
           </div>
-          <span id="senderBadge">Idle</span>
         </div>
 
         <div class="workflow-steps" id="workflowSteps">
@@ -103,22 +112,17 @@
           <div class="step" data-step="done"><span>3</span> Kết quả</div>
         </div>
 
-        <div class="overview-grid compact">
-          <div class="overview-card">
+        <div class="status-row" id="statusRow">
+          <div class="status-station">
             <span>Bến DB</span>
             <b id="stationCount">0</b>
           </div>
-          <div class="overview-card">
-            <span>Gửi BE</span>
-            <b id="sendMode">Idle</b>
-          </div>
-        </div>
-
-        <div class="gps-live">
-          <div class="gps-dot"></div>
-          <div>
-            <strong id="gpsStatus">Chưa ghi GPS</strong>
-            <p id="sendLog">Chọn bến → vẽ đường → bắt đầu ghi.</p>
+          <div class="gps-live">
+            <div class="gps-dot"></div>
+            <div class="gps-live-text">
+              <strong id="gpsStatus">Chưa ghi GPS</strong>
+              <p id="sendLog">Chọn bến → vẽ đường → bắt đầu ghi.</p>
+            </div>
           </div>
         </div>
 
@@ -151,16 +155,6 @@
               <input type="hidden" id="endStation" value="">
               <div class="stop-chain" id="stopChainPreview">Chưa có chuỗi bến.</div>
               <small class="field-hint" id="routeTypeHint">Click từng bến muốn dừng. Vẽ nét thẳng — không tự nhận bến đi qua.</small>
-            </label>
-
-            <label>
-              <span>Loại tuyến</span>
-              <select id="surveyRouteType">
-                <option value="auto">Tự động (theo bến đầu/cuối)</option>
-                <option value="Regular">Thường</option>
-                <option value="SightseeingLoop">Vòng tham quan</option>
-                <option value="CharterReference">Tham chiếu thuê tàu</option>
-              </select>
             </label>
 
             <div class="route-estimate" id="routeEstimate">
