@@ -26,6 +26,7 @@
               </select>
             </label>
             <button id="refreshRoutes" type="button" class="secondary">Làm mới</button>
+            <a class="secondary topbar-link" href="/api-log.html" title="Xem payload / lỗi đẩy lên BE">Log API</a>
             <button id="toggleSender" type="button" class="hidden-legacy" hidden>POST off</button>
             <span id="targetText" class="hidden-legacy" hidden>Local only</span>
           </div>
@@ -39,13 +40,20 @@
             <span>✎</span><small>Vẽ</small>
           </button>
           <div class="tool-divider"></div>
+          <button id="modeStraight" type="button" class="tool-btn is-active" title="Đoạn thẳng — kéo điểm để chỉnh">
+            <span>╱</span><small>Thẳng</small>
+          </button>
+          <button id="modeCurve" type="button" class="tool-btn" title="Đoạn cong — kéo điểm vàng để uốn">
+            <span>⌒</span><small>Cong</small>
+          </button>
+          <div class="tool-divider"></div>
           <button id="toolUndo" type="button" class="tool-btn" title="Hoàn tác" disabled>
             <span>↶</span><small>Undo</small>
           </button>
           <button id="toolClear" type="button" class="tool-btn danger" title="Xóa đường vẽ" disabled>
             <span>×</span><small>Xóa</small>
           </button>
-          <button id="finishDraw" type="button" class="tool-btn accent" title="Hoàn thành — giữ nét thẳng" disabled>
+          <button id="finishDraw" type="button" class="tool-btn accent" title="Hoàn thành — giữ đúng đường đang vẽ" disabled>
             <span>✓</span><small>Xong</small>
           </button>
         </div>
@@ -145,6 +153,16 @@
               <small class="field-hint" id="routeTypeHint">Click từng bến muốn dừng. Vẽ nét thẳng — không tự nhận bến đi qua.</small>
             </label>
 
+            <label>
+              <span>Loại tuyến</span>
+              <select id="surveyRouteType">
+                <option value="auto">Tự động (theo bến đầu/cuối)</option>
+                <option value="Regular">Thường</option>
+                <option value="SightseeingLoop">Vòng tham quan</option>
+                <option value="CharterReference">Tham chiếu thuê tàu</option>
+              </select>
+            </label>
+
             <div class="route-estimate" id="routeEstimate">
               <div><span>Quãng đường (km)</span><strong id="estimateKm">0 km</strong></div>
               <div><span>Vận tốc (km/h)</span><strong id="estimateSpeed">16 km/h</strong></div>
@@ -161,6 +179,23 @@
               <span>Tên tuyến</span>
               <input id="captureRouteName" type="text" placeholder="VD: Bạch Đằng - Thủ Thiêm">
             </label>
+
+            <label class="checkbox-row" for="createReverseRoute">
+              <input id="createReverseRoute" type="checkbox">
+              <span>Tạo thêm chiều về (createReverseRoute)</span>
+            </label>
+            <div class="reverse-fields" id="reverseFields" hidden>
+              <label>
+                <span>Mã chiều về (reverseRouteCode)</span>
+                <input id="reverseRouteCode" type="text" placeholder="VD: TT-BD" autocomplete="off">
+                <small id="reverseRouteCodeHint" class="field-hint">Khác mã tuyến chính; không trùng DB; không dùng cho vòng tham quan.</small>
+              </label>
+              <label>
+                <span>Tên chiều về (reverseRouteName)</span>
+                <input id="reverseRouteName" type="text" placeholder="VD: Thủ Thiêm - Bạch Đằng">
+              </label>
+            </div>
+
             <label>
               <span>Tàu GPS (boatCode)</span>
               <select id="collectorBoatCode">
@@ -200,8 +235,6 @@
           <button id="clearCapture" type="button">Clear</button>
           <button id="saveCapturedRoute" type="button">Luu DB</button>
           <input id="captureTripId" type="text" value="">
-          <button id="modeStraight" type="button"></button>
-          <button id="modeCurve" type="button" class="is-active"></button>
           <pre id="payloadLog">{}</pre>
           <div id="boats"></div>
         </div>

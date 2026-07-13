@@ -59,6 +59,12 @@ const estimateMinEl = document.querySelector('#estimateMin');
 const stationCountEl = document.querySelector('#stationCount');
 const routeCodeHintEl = document.querySelector('#routeCodeHint');
 const routeTypeHintEl = document.querySelector('#routeTypeHint');
+const surveyRouteTypeEl = document.querySelector('#surveyRouteType');
+const createReverseRouteEl = document.querySelector('#createReverseRoute');
+const reverseFieldsEl = document.querySelector('#reverseFields');
+const reverseRouteCodeEl = document.querySelector('#reverseRouteCode');
+const reverseRouteNameEl = document.querySelector('#reverseRouteName');
+const reverseRouteCodeHintEl = document.querySelector('#reverseRouteCodeHint');
 const stopChainPreviewEl = document.querySelector('#stopChainPreview');
 const workflowStepsEl = document.querySelector('#workflowSteps');
 const routeStopsListEl = document.querySelector('#routeStopsList');
@@ -67,7 +73,9 @@ const markers = new Map();
 const routeLayers = new Map();
 const stationLayers = new Map();
 const captureMarkers = [];
+const controlMarkers = [];
 let captureLine = null;
+let helperCurveLine = null;
 let plannedRouteLine = null;
 let lockedSurveyPath = null; // giữ đường vẽ suốt lúc tàu chạy — không cho auto-save cũ xóa
 let collectorMarker = null;
@@ -95,8 +103,10 @@ let selectedCollectorBoatCode = localStorage.getItem('surveyBoatCode') || '';
 const captureState = {
   enabled: false,
   finished: false,
-  // Khi đang vẽ: thẳng để dễ chỉnh điểm; bấm Xong → bezierSpline
+  // Chế độ mặc định cho đoạn mới: thẳng | cong (kéo điểm vàng để uốn).
   lineMode: 'straight',
+  selectedSegmentIndex: null,
+  selectedWaypointIndex: null,
   points: [],
 };
 
@@ -314,6 +324,22 @@ startCollectorEl.addEventListener('click', startRecording);
 pauseCollectorEl.addEventListener('click', pauseCollector);
 stopCollectorEl.addEventListener('click', stopRecording);
 saveRouteGeometryEl.addEventListener('click', saveRouteGeometry);
+surveyRouteTypeEl?.addEventListener('change', () => {
+  updateRouteTypeHint();
+  updateReverseRouteUi();
+  renderCaptureState();
+});
+createReverseRouteEl?.addEventListener('change', () => {
+  updateReverseRouteUi({ suggest: true });
+});
+captureRouteCodeEl?.addEventListener('input', () => {
+  checkRouteCodeDuplicate();
+  maybeSuggestReverseRoute();
+  validateReverseRouteCode();
+});
+captureRouteNameEl?.addEventListener('input', () => {
+  maybeSuggestReverseRoute();
+});
 toggleCaptureEl.addEventListener('click', () => {
   captureState.enabled = !captureState.enabled;
   setDrawTool(captureState.enabled ? 'draw' : 'pan');
@@ -332,16 +358,14 @@ saveCapturedRouteEl.addEventListener('click', saveCapturedRoute);
 toolPanEl?.addEventListener('click', () => setDrawTool('pan'));
 toolDrawEl?.addEventListener('click', () => {
   captureState.finished = false;
-  captureState.lineMode = 'straight';
   setDrawTool('draw');
-  captureStatusEl.textContent = 'Đang vẽ: click bản đồ thêm điểm, rồi bấm ✓ Xong để tạo nét cong.';
+  captureStatusEl.textContent = 'Đang vẽ: click thêm điểm. Kéo điểm để chỉnh. Thẳng/Cong = đoạn mới (hoặc đoạn đang chọn).';
   updateWorkflow('draw');
 });
 modeStraightEl?.addEventListener('click', () => setLineMode('straight'));
 modeCurveEl?.addEventListener('click', () => setLineMode('curve'));
 toolUndoEl?.addEventListener('click', () => {
   captureState.finished = false;
-  captureState.lineMode = 'straight';
   undoCapturePoint();
 });
 toolClearEl?.addEventListener('click', () => {
@@ -352,14 +376,12 @@ toolClearEl?.addEventListener('click', () => {
   clearCapturePoints();
   clearPlannedRoute();
   captureState.finished = false;
-  captureState.lineMode = 'straight';
   captureStatusEl.textContent = 'Đã xóa đường vẽ.';
   routeResultEl?.classList.add('hidden');
   updateWorkflow('draw');
   renderCaptureState();
 });
 finishDrawEl?.addEventListener('click', finishDraw);
-captureRouteCodeEl?.addEventListener('input', checkRouteCodeDuplicate);
 collectorBoatCodeEl?.addEventListener('change', () => {
   selectedCollectorBoatCode = collectorBoatCodeEl.value.trim();
   if (selectedCollectorBoatCode) localStorage.setItem('surveyBoatCode', selectedCollectorBoatCode);
@@ -383,8 +405,41 @@ function setLineMode(mode) {
   captureState.lineMode = mode === 'straight' ? 'straight' : 'curve';
   modeStraightEl?.classList.toggle('is-active', captureState.lineMode === 'straight');
   modeCurveEl?.classList.toggle('is-active', captureState.lineMode === 'curve');
+
+  // Có đoạn đang chọn → áp thẳng/cong ngay lên đoạn đó (WYSIWYG).
+  const idx = captureState.selectedSegmentIndex;
+  if (idx > 0 && captureState.points[idx]) {
+    applySegmentMode(idx, captureState.lineMode);
+    captureStatusEl.textContent = captureState.lineMode === 'curve'
+      ? `Đoạn #${idx}: cong — kéo điểm vàng để uốn.`
+      : `Đoạn #${idx}: thẳng.`;
+  } else {
+    captureStatusEl.textContent = captureState.lineMode === 'curve'
+      ? 'Chế độ Cong: điểm mới sẽ tạo đoạn cong (kéo chốt vàng để uốn).'
+      : 'Chế độ Thẳng: điểm mới nối thẳng — kéo số để chỉnh.';
+  }
   renderCaptureLine();
+  syncControlMarkers();
   updateDrawStats();
+}
+
+function applySegmentMode(index, mode) {
+  const point = captureState.points[index];
+  const prev = captureState.points[index - 1];
+  if (!point || !prev || index < 1) return;
+  if (mode === 'curve') {
+    point.segmentType = 'curve';
+    if (point.controlLat == null || point.controlLng == null) {
+      const control = defaultCurveControl(prev, point);
+      point.controlLat = control.lat;
+      point.controlLng = control.lng;
+    }
+  } else {
+    point.segmentType = 'straight';
+    point.controlLat = null;
+    point.controlLng = null;
+  }
+  captureState.finished = false;
 }
 
 function finishDraw() {
@@ -394,21 +449,17 @@ function finishDraw() {
   }
   ensureEndStationFromPath();
   if (endStationEl?.value) seedToEndStation();
-  // Chỉ kéo sát đầu/cuối vào bến đã chọn — không ép nét cong / không tự nhận bến giữa.
-  syncCapturePointsToStationCoords();
-  captureState.lineMode = 'straight';
+  // Giữ đúng hình đang vẽ — không kéo điểm, không ép cong/thẳng lại.
   captureState.finished = true;
-  setLineMode('straight');
   setDrawTool('pan');
   const type = getSurveyRouteType();
   const stopCount = buildSurveyStops().length;
-  captureStatusEl.textContent = type === 'SightseeingLoop'
-    ? `Đã xong vòng sightseeing (${stopCount} bến, nét thẳng). Kiểm tra km/phút rồi ghi GPS.`
-    : `Đã xong đường thẳng qua ${stopCount} bến (chỉ bến đã click). Kiểm tra km/phút rồi ghi GPS.`;
+  captureStatusEl.textContent = `Đã xong (${stopCount} bến, loại ${type}). Kéo điểm số / chốt vàng nếu muốn chỉnh lại, rồi ghi GPS.`;
   updateWorkflow('run');
   updateRouteTypeHint();
   checkRouteCodeDuplicate();
   renderCaptureLine();
+  syncControlMarkers();
 }
 
 function updateWorkflow(step) {
@@ -576,6 +627,9 @@ function getSelectedEndStation() {
 }
 
 function getSurveyRouteType() {
+  const picked = surveyRouteTypeEl?.value || 'auto';
+  // Người dùng chọn tay (Thường / Vòng tham quan / Tham chiếu thuê tàu) → ưu tiên.
+  if (picked && picked !== 'auto') return picked;
   const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
   const endPoint = [...captureState.points].reverse().find((p) => p.source === 'station-end');
   const endId = endStationEl?.value || endPoint?.stationId || '';
@@ -765,11 +819,16 @@ function updateRouteTypeHint() {
   const ordered = collectOrderedStopsFromClicks();
   const viaCount = Math.max(0, ordered.length - 2);
   const isLoop = type === 'SightseeingLoop';
+  const isCharter = type === 'CharterReference';
   if (routeTypeHintEl) {
     if (ordered.length >= 2) {
-      routeTypeHintEl.textContent = isLoop
-        ? `${type} · loop bến đầu = bến cuối · đi lượn quanh sông, không ghé bến giữa.`
-        : `${type} · ${ordered.length} bến đã click${viaCount ? ` · ${viaCount} bến giữa` : ''}. Nét thẳng — không tự nhận bến đi qua.`;
+      if (isLoop) {
+        routeTypeHintEl.textContent = `${type} · loop bến đầu = bến cuối · đi lượn quanh sông, không ghé bến giữa.`;
+      } else if (isCharter) {
+        routeTypeHintEl.textContent = `${type} · ${ordered.length} bến đã click · isBookable = false (không đặt vé online).`;
+      } else {
+        routeTypeHintEl.textContent = `${type} · ${ordered.length} bến đã click${viaCount ? ` · ${viaCount} bến giữa` : ''}. Nét thẳng — không tự nhận bến đi qua.`;
+      }
       routeTypeHintEl.classList.add('is-ok');
       routeTypeHintEl.classList.remove('is-error');
     } else {
@@ -778,6 +837,7 @@ function updateRouteTypeHint() {
     }
   }
   updateStopChainPreview(ordered);
+  updateReverseRouteUi();
 }
 
 function updateStopChainPreview(orderedInput) {
@@ -810,13 +870,130 @@ function updateStopChainPreview(orderedInput) {
 
 function surveySaveFields() {
   ensureEndStationFromPath({ quiet: true });
-  return {
+  const fields = {
     routeType: getSurveyRouteType(),
     startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
     endStationId: endStationEl.value || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId || null,
     stops: buildSurveyStops(),
   };
+  const wantReverse = Boolean(createReverseRouteEl?.checked)
+    && fields.routeType !== 'SightseeingLoop'
+    && (fields.stops?.length || 0) >= 2;
+  if (wantReverse) {
+    fields.createReverseRoute = true;
+    const reverseCode = reverseRouteCodeEl?.value.trim() || '';
+    const reverseName = reverseRouteNameEl?.value.trim() || '';
+    if (reverseCode) fields.reverseRouteCode = reverseCode;
+    if (reverseName) fields.reverseRouteName = reverseName;
+  } else {
+    fields.createReverseRoute = false;
+  }
+  return fields;
 }
+
+function suggestReverseFromMain() {
+  const code = captureRouteCodeEl?.value.trim() || '';
+  const name = captureRouteNameEl?.value.trim() || '';
+  let reverseCode = '';
+  let reverseName = '';
+  if (code.includes('-')) {
+    reverseCode = code.split('-').map((s) => s.trim()).filter(Boolean).reverse().join('-');
+  } else if (code.includes(' ')) {
+    reverseCode = code.split(/\s+/).filter(Boolean).reverse().join('-');
+  }
+  // Đảo xong vẫn trùng (vd. BA-BA) → thêm hậu tố -VE.
+  if (reverseCode && reverseCode.toLowerCase() === code.toLowerCase()) {
+    reverseCode = `${code}-VE`;
+  }
+  if (!reverseCode && code) {
+    reverseCode = `${code}-VE`;
+  }
+  if (name.includes(' - ')) {
+    reverseName = name.split(' - ').reverse().join(' - ');
+  } else if (name.includes('-')) {
+    reverseName = name.split('-').map((s) => s.trim()).reverse().join(' - ');
+  }
+  if (reverseName && reverseName.toLowerCase() === name.toLowerCase() && name) {
+    reverseName = `${name} (chiều về)`;
+  }
+  return { reverseCode, reverseName };
+}
+
+function maybeSuggestReverseRoute() {
+  if (!createReverseRouteEl?.checked) return;
+  const { reverseCode, reverseName } = suggestReverseFromMain();
+  if (reverseRouteCodeEl && !reverseRouteCodeEl.dataset.touched && reverseCode) {
+    reverseRouteCodeEl.value = reverseCode;
+  }
+  if (reverseRouteNameEl && !reverseRouteNameEl.dataset.touched && reverseName) {
+    reverseRouteNameEl.value = reverseName;
+  }
+  validateReverseRouteCode();
+}
+
+/** true = hợp lệ / không dùng chiều về; false = trùng mã → chặn gửi. */
+function validateReverseRouteCode() {
+  if (!createReverseRouteEl?.checked) {
+    reverseRouteCodeEl?.classList.remove('is-invalid');
+    if (reverseRouteCodeHintEl) {
+      reverseRouteCodeHintEl.textContent = 'Khác mã tuyến chính; không trùng DB; không dùng cho vòng tham quan.';
+      reverseRouteCodeHintEl.classList.remove('is-error', 'is-ok');
+    }
+    return true;
+  }
+  const main = captureRouteCodeEl?.value.trim() || '';
+  const reverse = reverseRouteCodeEl?.value.trim() || '';
+  if (!reverse) {
+    reverseRouteCodeEl?.classList.add('is-invalid');
+    if (reverseRouteCodeHintEl) {
+      reverseRouteCodeHintEl.textContent = 'Thiếu mã chiều về (BE bắt buộc khi createReverseRoute = true).';
+      reverseRouteCodeHintEl.classList.add('is-error');
+      reverseRouteCodeHintEl.classList.remove('is-ok');
+    }
+    return false;
+  }
+  if (main && reverse.toLowerCase() === main.toLowerCase()) {
+    reverseRouteCodeEl?.classList.add('is-invalid');
+    if (reverseRouteCodeHintEl) {
+      reverseRouteCodeHintEl.textContent = `Mã chiều về phải khác mã tuyến chính ("${main}"). Ví dụ: ${suggestReverseFromMain().reverseCode || `${main}-VE`}.`;
+      reverseRouteCodeHintEl.classList.add('is-error');
+      reverseRouteCodeHintEl.classList.remove('is-ok');
+    }
+    return false;
+  }
+  reverseRouteCodeEl?.classList.remove('is-invalid');
+  if (reverseRouteCodeHintEl) {
+    reverseRouteCodeHintEl.textContent = `OK — chiều về "${reverse}" khác tuyến chính.`;
+    reverseRouteCodeHintEl.classList.add('is-ok');
+    reverseRouteCodeHintEl.classList.remove('is-error');
+  }
+  return true;
+}
+
+function updateReverseRouteUi({ suggest = false } = {}) {
+  const type = getSurveyRouteType();
+  const isLoop = type === 'SightseeingLoop';
+  if (isLoop && createReverseRouteEl) {
+    createReverseRouteEl.checked = false;
+    createReverseRouteEl.disabled = true;
+  } else if (createReverseRouteEl) {
+    createReverseRouteEl.disabled = false;
+  }
+  const show = Boolean(createReverseRouteEl?.checked) && !isLoop;
+  if (reverseFieldsEl) reverseFieldsEl.hidden = !show;
+  if (show && suggest) maybeSuggestReverseRoute();
+  else if (show) validateReverseRouteCode();
+  else validateReverseRouteCode();
+}
+
+reverseRouteCodeEl?.addEventListener('input', () => {
+  if (reverseRouteCodeEl) reverseRouteCodeEl.dataset.touched = '1';
+  validateReverseRouteCode();
+});
+reverseRouteNameEl?.addEventListener('input', () => {
+  if (reverseRouteNameEl) reverseRouteNameEl.dataset.touched = '1';
+});
+updateReverseRouteUi();
 
 function ensureEndStationFromPath({ quiet = false } = {}) {
   if (endStationEl?.value) return true;
@@ -839,20 +1016,6 @@ function ensureEndStationFromPath({ quiet = false } = {}) {
   // Rebuild markers to refresh end styling.
   rebuildCaptureMarkers();
   return true;
-}
-
-function rebuildCaptureMarkers() {
-  for (const marker of captureMarkers) marker.remove();
-  captureMarkers.length = 0;
-  captureState.points.forEach((point, index) => {
-    const marker = L.marker([point.lat, point.lng], {
-      icon: capturePointIcon(index + 1, point.source),
-    }).addTo(map);
-    if (point.label) marker.bindTooltip(point.label, { direction: 'top', offset: [0, -10] });
-    captureMarkers.push(marker);
-  });
-  renderCaptureLine();
-  renderCaptureState();
 }
 
 function addViaStation(station) {
@@ -933,10 +1096,8 @@ function seedToEndStation() {
   const endLng = Number(endStation.lng);
   let last = captureState.points.at(-1);
 
-  // Đã có điểm cuối đúng bến → chỉ sync tọa độ.
+  // Đã có điểm cuối đúng bến → không kéo lại tọa độ (giữ hình user đã chỉnh).
   if (last?.source === 'station-end' && String(last.stationId) === String(endStation.stationId)) {
-    last.lat = endLat;
-    last.lng = endLng;
     last.label = endStation.stationName;
     rebuildCaptureMarkers();
     updateRouteTypeHint();
@@ -949,33 +1110,15 @@ function seedToEndStation() {
   // Đổi bến cuối khác → bỏ điểm end cũ.
   if (last?.source === 'station-end') {
     captureState.points.pop();
-    const marker = captureMarkers.pop();
-    if (marker) marker.remove();
-    last = captureState.points.at(-1);
+    rebuildCaptureMarkers();
   }
 
-  // Loop cùng 1 bến: luôn thêm điểm đóng vòng (kể cả khi điểm cuối đã gần bến đầu).
-  // Regular: nối thẳng tới bến cuối.
-  if (
-    !isLoop
-    && last
-    && last.source === 'manual'
-    && Number.isFinite(endLat)
-    && haversineMeters(last, { lat: endLat, lng: endLng }) <= STOP_DETECT_RADIUS_M
-  ) {
-    last.lat = endLat;
-    last.lng = endLng;
-    last.source = 'station-end';
-    last.label = endStation.stationName;
-    last.stationId = endStation.stationId;
-    rebuildCaptureMarkers();
-  } else {
-    addCapturePoint({ lat: endLat, lng: endLng }, {
-      source: 'station-end',
-      label: endStation.stationName,
-      stationId: endStation.stationId,
-    });
-  }
+  // Luôn nối thêm điểm cuối — không kéo điểm vẽ gần bến vào vị trí station (tránh biến dạng).
+  addCapturePoint({ lat: endLat, lng: endLng }, {
+    source: 'station-end',
+    label: endStation.stationName,
+    stationId: endStation.stationId,
+  });
   maybeFillRouteCode();
   updateRouteTypeHint();
   captureStatusEl.textContent = isLoop
@@ -1024,19 +1167,30 @@ function addCapturePoint(latlng, meta = {}) {
     label: meta.label || null,
     stationId: meta.stationId || null,
     accuracy: meta.accuracy || null,
+    segmentType: null,
+    controlLat: null,
+    controlLng: null,
   };
+  if (captureState.points.length) {
+    point.segmentType = meta.segmentType || captureState.lineMode || 'straight';
+    if (point.segmentType === 'curve') {
+      const prev = captureState.points.at(-1);
+      const control = defaultCurveControl(prev, point);
+      point.controlLat = control.lat;
+      point.controlLng = control.lng;
+    }
+  }
   captureState.points.push(point);
-  const marker = L.marker([point.lat, point.lng], {
-    icon: capturePointIcon(captureState.points.length, point.source),
-  }).addTo(map);
-  if (point.label) marker.bindTooltip(point.label, { direction: 'top', offset: [0, -10] });
-  captureMarkers.push(marker);
-  renderCaptureLine();
-  renderCaptureState();
+  captureState.finished = false;
+  captureState.selectedWaypointIndex = captureState.points.length - 1;
+  captureState.selectedSegmentIndex = captureState.points.length > 1
+    ? captureState.points.length - 1
+    : null;
+  rebuildCaptureMarkers();
   updateRouteTypeHint();
 }
 
-function capturePointIcon(index, source) {
+function capturePointIcon(index, source, selected = false) {
   const roleClass = source === 'station-end'
     ? ' is-station is-end'
     : source === 'station-via'
@@ -1044,27 +1198,74 @@ function capturePointIcon(index, source) {
       : source === 'station'
         ? ' is-station'
         : '';
+  const selectedClass = selected ? ' is-selected' : '';
   return L.divIcon({
     className: '',
-    html: `<div class="capture-point-marker${roleClass}">${index}</div>`,
+    html: `<div class="capture-point-marker${roleClass}${selectedClass}">${index}</div>`,
     iconSize: [24, 24],
     iconAnchor: [12, 12],
   });
 }
 
+function defaultCurveControl(start, end) {
+  const midLat = (Number(start.lat) + Number(end.lat)) / 2;
+  const midLng = (Number(start.lng) + Number(end.lng)) / 2;
+  const dLng = Number(end.lng) - Number(start.lng);
+  const dLat = Number(end.lat) - Number(start.lat);
+  const length = Math.hypot(dLat, dLng) || 1;
+  const bulge = Math.min(0.00055, length * 0.22);
+  return {
+    lat: roundNumber(midLat + (-dLng / length) * bulge, 9),
+    lng: roundNumber(midLng + (dLat / length) * bulge, 9),
+  };
+}
+
+function getCurveControl(start, end) {
+  if (end?.controlLat != null && end?.controlLng != null) {
+    return { lat: Number(end.controlLat), lng: Number(end.controlLng) };
+  }
+  return defaultCurveControl(start, end);
+}
+
+function interpolateQuadraticCurve(start, end, control, steps) {
+  const points = [];
+  for (let i = 0; i <= steps; i += 1) {
+    const t = i / steps;
+    const u = 1 - t;
+    points.push({
+      lat: roundNumber(u * u * start.lat + 2 * u * t * control.lat + t * t * end.lat, 9),
+      lng: roundNumber(u * u * start.lng + 2 * u * t * control.lng + t * t * end.lng, 9),
+    });
+  }
+  return points;
+}
+
+/** Đường hiển thị = đường lưu: thẳng từng đoạn, cong = bezier qua chốt vàng. */
 function expandPath(points) {
   if (!points?.length) return [];
-  if (points.length === 1) return [{ lat: points[0].lat, lng: points[0].lng }];
-  const base = points.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
-  if (captureState.lineMode !== 'curve') {
-    return densifyPolyline(base, 12);
+  if (points.length === 1) return [{ lat: Number(points[0].lat), lng: Number(points[0].lng) }];
+  const result = [{ lat: Number(points[0].lat), lng: Number(points[0].lng) }];
+  for (let i = 1; i < points.length; i += 1) {
+    const prev = points[i - 1];
+    const current = points[i];
+    if (current.segmentType === 'curve') {
+      const curve = interpolateQuadraticCurve(
+        { lat: Number(prev.lat), lng: Number(prev.lng) },
+        { lat: Number(current.lat), lng: Number(current.lng) },
+        getCurveControl(prev, current),
+        36,
+      );
+      for (let j = 1; j < curve.length; j += 1) result.push(curve[j]);
+    } else {
+      result.push({ lat: Number(current.lat), lng: Number(current.lng) });
+    }
   }
-  // Catmull-Rom đi QUA mọi điểm khảo sát — không cắt góc như bezier (tránh lệch km thực tế).
-  return catmullRomPath(base, 28);
+  return result;
 }
 
 function densifyPolyline(points, segmentsPerEdge) {
-  if (points.length < 2) return points.slice();
+  if (!points?.length) return [];
+  if (points.length < 2) return points.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
   const out = [];
   for (let i = 0; i < points.length - 1; i += 1) {
     const a = points[i];
@@ -1081,93 +1282,13 @@ function densifyPolyline(points, segmentsPerEdge) {
   return out;
 }
 
-function catmullRomPath(points, segmentsPerSpan) {
-  if (points.length < 2) return points.slice();
-  if (points.length === 2) return densifyPolyline(points, segmentsPerSpan);
-  const padded = [points[0], ...points, points[points.length - 1]];
-  const out = [];
-  for (let i = 0; i < padded.length - 3; i += 1) {
-    const p0 = padded[i];
-    const p1 = padded[i + 1];
-    const p2 = padded[i + 2];
-    const p3 = padded[i + 3];
-    for (let s = 0; s < segmentsPerSpan; s += 1) {
-      const t = s / segmentsPerSpan;
-      out.push(catmullRomPoint(p0, p1, p2, p3, t));
-    }
-  }
-  out.push({
-    lat: roundNumber(points[points.length - 1].lat, 7),
-    lng: roundNumber(points[points.length - 1].lng, 7),
-  });
-  return out;
-}
-
-function catmullRomPoint(p0, p1, p2, p3, t) {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  const lat = 0.5 * (
-    (2 * p1.lat)
-    + (-p0.lat + p2.lat) * t
-    + (2 * p0.lat - 5 * p1.lat + 4 * p2.lat - p3.lat) * t2
-    + (-p0.lat + 3 * p1.lat - 3 * p2.lat + p3.lat) * t3
-  );
-  const lng = 0.5 * (
-    (2 * p1.lng)
-    + (-p0.lng + p2.lng) * t
-    + (2 * p0.lng - 5 * p1.lng + 4 * p2.lng - p3.lng) * t2
-    + (-p0.lng + 3 * p1.lng - 3 * p2.lng + p3.lng) * t3
-  );
-  return { lat: roundNumber(lat, 7), lng: roundNumber(lng, 7) };
-}
-
 function getPathCoordinates() {
+  // WYSIWYG: đúng polyline đang vẽ. Densify nhẹ để GPS chạy mượt — không đổi hình.
   const expanded = expandPath(captureState.points);
-  const base = expanded.length >= 2
-    ? expanded
-    : captureState.points.map(({ lat, lng }) => ({ lat, lng }));
-  // Chỉ snap đầu/cuối vào bến — không kéo bến giữa vào polyline (tránh gấp khúc).
-  return snapCoordinatesToEndpoints(base, collectOrderedStopsFromClicks());
-}
-
-/** Chỉ ép điểm đầu + điểm cuối đúng tọa độ station đã chọn. */
-function snapCoordinatesToEndpoints(coordinates, stops) {
-  if (!Array.isArray(coordinates) || !coordinates.length) return [];
-  const path = coordinates.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
-  const usable = (stops || []).filter((s) => (
-    s && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
-  ));
-  if (!usable.length) return path;
-  const start = usable[0];
-  path[0] = { lat: Number(start.lat), lng: Number(start.lng) };
-  if (usable.length >= 2) {
-    const end = usable.at(-1);
-    path[path.length - 1] = { lat: Number(end.lat), lng: Number(end.lng) };
+  if (expanded.length < 2) {
+    return captureState.points.map(({ lat, lng }) => ({ lat: Number(lat), lng: Number(lng) }));
   }
-  return path;
-}
-
-/** Ép polyline đi qua stop (server / save). Giữ API cũ nếu cần. */
-function snapCoordinatesToStops(coordinates, stops, radiusM = STOP_DETECT_RADIUS_M) {
-  return snapCoordinatesToEndpoints(coordinates, stops);
-}
-
-function syncCapturePointsToStationCoords() {
-  let changed = false;
-  for (const point of captureState.points) {
-    if (!point.stationId) continue;
-    const station = findStationInCatalog(point.stationId);
-    if (!station) continue;
-    const lat = Number(station.lat);
-    const lng = Number(station.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-    if (point.lat !== lat || point.lng !== lng) {
-      point.lat = lat;
-      point.lng = lng;
-      changed = true;
-    }
-  }
-  if (changed) rebuildCaptureMarkers();
+  return densifyPolyline(expanded, 8);
 }
 
 function renderCaptureLine() {
@@ -1175,38 +1296,161 @@ function renderCaptureLine() {
     captureLine.remove();
     captureLine = null;
   }
+  if (helperCurveLine) {
+    helperCurveLine.remove();
+    helperCurveLine = null;
+  }
   if (captureState.points.length < 2) return;
   const path = expandPath(captureState.points);
-  // Đường mới / đang chỉnh: nét đứt màu cam — khác tuyến đã lưu (xanh liền).
   captureLine = L.polyline(
     path.map((p) => [p.lat, p.lng]),
     {
       ...DRAFT_ROUTE_STYLE,
       weight: captureState.finished ? 5.5 : 4.5,
       interactive: false,
+      smoothFactor: 0,
     },
   ).addTo(map);
+
+  const idx = captureState.selectedSegmentIndex;
+  if (idx > 0 && captureState.points[idx]?.segmentType === 'curve') {
+    const prev = captureState.points[idx - 1];
+    const cur = captureState.points[idx];
+    const control = getCurveControl(prev, cur);
+    helperCurveLine = L.polyline(
+      [[prev.lat, prev.lng], [control.lat, control.lng], [cur.lat, cur.lng]],
+      { color: '#f59e0b', weight: 2, opacity: 0.85, dashArray: '3 5', interactive: false },
+    ).addTo(map);
+  }
   updateStopChainPreview();
+}
+
+function clearControlMarkers() {
+  for (const marker of controlMarkers) marker.remove();
+  controlMarkers.length = 0;
+}
+
+function syncControlMarkers() {
+  clearControlMarkers();
+  const idx = captureState.selectedSegmentIndex;
+  if (!idx || idx < 1) return;
+  const prev = captureState.points[idx - 1];
+  const current = captureState.points[idx];
+  if (!prev || !current || current.segmentType !== 'curve') return;
+
+  const control = getCurveControl(prev, current);
+  const handle = L.marker([control.lat, control.lng], {
+    draggable: true,
+    zIndexOffset: 800,
+    icon: L.divIcon({
+      className: '',
+      html: '<div class="control-handle" title="Kéo để uốn cong"></div>',
+      iconSize: [14, 14],
+      iconAnchor: [7, 7],
+    }),
+  }).addTo(map);
+
+  handle.on('drag', () => {
+    const latlng = handle.getLatLng();
+    current.controlLat = roundNumber(latlng.lat, 9);
+    current.controlLng = roundNumber(latlng.lng, 9);
+    captureState.finished = false;
+    renderCaptureLine();
+    updateDrawStats();
+  });
+  handle.on('dragend', () => {
+    updateRouteTypeHint();
+    renderCaptureState();
+  });
+  controlMarkers.push(handle);
+}
+
+function bindCaptureMarkerEvents(marker, index) {
+  marker.on('click', (event) => {
+    if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+    captureState.selectedWaypointIndex = index;
+    captureState.selectedSegmentIndex = index > 0 ? index : (captureState.points.length > 1 ? 1 : null);
+    if (captureState.selectedSegmentIndex > 0) {
+      const seg = captureState.points[captureState.selectedSegmentIndex];
+      captureState.lineMode = seg.segmentType === 'curve' ? 'curve' : 'straight';
+      modeStraightEl?.classList.toggle('is-active', captureState.lineMode === 'straight');
+      modeCurveEl?.classList.toggle('is-active', captureState.lineMode === 'curve');
+    }
+    rebuildCaptureMarkers();
+    captureStatusEl.textContent = index === 0
+      ? 'Điểm #1. Chọn điểm kế tiếp để chỉnh đoạn.'
+      : `Đã chọn đoạn #${index}. Bấm Thẳng/Cong hoặc kéo điểm / chốt vàng.`;
+  });
+
+  marker.on('drag', () => {
+    const latlng = marker.getLatLng();
+    const point = captureState.points[index];
+    if (!point) return;
+    point.lat = roundNumber(latlng.lat, 9);
+    point.lng = roundNumber(latlng.lng, 9);
+    // Kéo điểm bến → giữ stationId (vẫn là bến đó), chỉ đổi hình đường.
+    captureState.finished = false;
+    renderCaptureLine();
+    syncControlMarkers();
+    updateDrawStats();
+  });
+
+  marker.on('dragend', () => {
+    updateRouteTypeHint();
+    renderCaptureState();
+    captureStatusEl.textContent = `Đã chỉnh điểm #${index + 1}. Đường lưu = đường đang thấy.`;
+  });
+}
+
+function rebuildCaptureMarkers() {
+  for (const marker of captureMarkers) marker.remove();
+  captureMarkers.length = 0;
+  clearControlMarkers();
+  captureState.points.forEach((point, index) => {
+    const selected = captureState.selectedWaypointIndex === index;
+    const marker = L.marker([point.lat, point.lng], {
+      icon: capturePointIcon(index + 1, point.source, selected),
+      draggable: true,
+      zIndexOffset: 600,
+      autoPan: true,
+    }).addTo(map);
+    if (point.label) marker.bindTooltip(point.label, { direction: 'top', offset: [0, -10] });
+    bindCaptureMarkerEvents(marker, index);
+    captureMarkers.push(marker);
+  });
+  renderCaptureLine();
+  syncControlMarkers();
+  renderCaptureState();
 }
 
 function undoCapturePoint() {
   if (!captureState.points.length) return;
   captureState.points.pop();
-  const marker = captureMarkers.pop();
-  if (marker) marker.remove();
-  renderCaptureLine();
-  renderCaptureState();
+  captureState.selectedWaypointIndex = captureState.points.length
+    ? captureState.points.length - 1
+    : null;
+  captureState.selectedSegmentIndex = captureState.points.length > 1
+    ? captureState.points.length - 1
+    : null;
+  rebuildCaptureMarkers();
+  updateRouteTypeHint();
 }
 
 function clearCapturePoints() {
   for (const marker of captureMarkers) marker.remove();
   captureMarkers.length = 0;
+  clearControlMarkers();
   captureState.points = [];
   captureState.finished = false;
-  captureState.lineMode = 'straight';
+  captureState.selectedSegmentIndex = null;
+  captureState.selectedWaypointIndex = null;
   if (captureLine) {
     captureLine.remove();
     captureLine = null;
+  }
+  if (helperCurveLine) {
+    helperCurveLine.remove();
+    helperCurveLine = null;
   }
 }
 
@@ -1421,6 +1665,11 @@ async function startRecording() {
     collectorBoatCodeEl?.focus();
     return;
   }
+  if (!validateReverseRouteCode()) {
+    captureStatusEl.textContent = 'Mã chiều về không hợp lệ — phải khác mã tuyến chính.';
+    reverseRouteCodeEl?.focus();
+    return;
+  }
   applyBoatSpeedLimits();
   if (!(getSurveySpeedKmh() > 0)) {
     captureStatusEl.textContent = 'Nhập tốc độ chạy hợp lệ (≤ max đăng ký).';
@@ -1555,6 +1804,11 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
   }
   if (!checkRouteCodeDuplicate()) {
     captureStatusEl.textContent = 'Mã tuyến bị trùng — đổi mã rồi lưu lại.';
+    return false;
+  }
+  if (!validateReverseRouteCode()) {
+    captureStatusEl.textContent = 'Mã chiều về trùng mã tuyến chính — đổi trước khi lưu.';
+    reverseRouteCodeEl?.focus();
     return false;
   }
   autoSaveInFlight = true;
@@ -1712,6 +1966,14 @@ function renderRouteResult(body) {
     ${stops.length
       ? `<div class="route-result-stops-title">Thứ tự bến đã đẩy lên BE</div><ol class="route-result-stops">${stopLines}</ol>`
       : '<p class="meta">Chưa có station trong route_stops — kiểm tra payload stops[] gửi BE.</p>'}
+    ${body.reverseRoute ? `
+      <div class="route-result-stops-title">Chiếu về (reverseRoute)</div>
+      <div class="route-result-meta">
+        <span><b>${escapeHtml(body.reverseRoute.routeCode || '')}</b></span>
+        <span>${escapeHtml(body.reverseRoute.routeName || '')}</span>
+        <span>id: ${escapeHtml(body.reverseRoute.routeId || body.reverseRoute.id || '')}</span>
+      </div>` : ''}
+    <p class="meta"><a href="/api-log.html">Xem log API đẩy BE →</a></p>
   `;
   routeResultEl.classList.remove('hidden');
 }
@@ -2339,8 +2601,7 @@ function handleStationClick(station) {
       const last = captureState.points.at(-1);
       if (last?.source === 'station-end' && String(last.stationId) === String(startId)) {
         captureState.points.pop();
-        const marker = captureMarkers.pop();
-        if (marker) marker.remove();
+        rebuildCaptureMarkers();
       }
       addViaStation(station);
       return;
@@ -2387,7 +2648,16 @@ function insertViaBeforeEnd(station) {
     source: 'station-via',
     label: station.stationName,
     stationId: station.stationId,
+    segmentType: captureState.lineMode || 'straight',
+    controlLat: null,
+    controlLng: null,
   };
+  if (point.segmentType === 'curve' && endIdx > 0) {
+    const prev = captureState.points[endIdx - 1];
+    const control = defaultCurveControl(prev, point);
+    point.controlLat = control.lat;
+    point.controlLng = control.lng;
+  }
   captureState.points.splice(endIdx, 0, point);
   rebuildCaptureMarkers();
   updateRouteTypeHint();

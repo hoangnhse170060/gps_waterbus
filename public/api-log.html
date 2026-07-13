@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GPS-WB · Log API BE</title>
+    <link rel="icon" href="/favicon.png" type="image/png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/api-log.css">
+  </head>
+  <body class="api-log-page">
+    <header class="api-log-header">
+      <div>
+        <a class="api-log-back" href="/">← GPS Survey</a>
+        <h1>Log API đẩy lên BE</h1>
+        <p>Xem request / response từng lần gọi Azure để bắt lỗi validation, 409, session…</p>
+      </div>
+      <div class="api-log-actions">
+        <label class="api-log-filter">
+          <span>Lọc</span>
+          <select id="filterSelect">
+            <option value="all">Tất cả</option>
+            <option value="error">Chỉ lỗi</option>
+            <option value="from-gps">from-gps</option>
+            <option value="session">tracking session</option>
+          </select>
+        </label>
+        <button id="refreshBtn" type="button">Làm mới</button>
+        <button id="clearBtn" type="button" class="secondary">Xóa log</button>
+      </div>
+    </header>
+
+    <section class="api-log-summary" id="summary">
+      Đang tải…
+    </section>
+
+    <main id="callList" class="api-log-list"></main>
+
+    <script src="/api-log.js"></script>
+  </body>
+</html>

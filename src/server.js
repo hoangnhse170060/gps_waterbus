@@ -39,6 +39,7 @@ const state = {
   lastCollectorSend: null,
   lastRecordingSession: null,
   lastTrackingApiCall: null,
+  apiCallLog: [],
   lastAutoSavedRoute: null,
   dbStatus: { ok: false, message: 'Not loaded yet', loadedAt: null },
 };
@@ -121,6 +122,19 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    if (url.pathname === '/api/debug/calls' && req.method === 'GET') {
+      return sendJson(res, {
+        count: state.apiCallLog.length,
+        calls: state.apiCallLog,
+        lastTrackingApiCall: state.lastTrackingApiCall,
+        lastCollectorSend: state.lastCollectorSend,
+        lastAutoSavedRoute: state.lastAutoSavedRoute,
+      });
+    }
+    if (url.pathname === '/api/debug/calls' && req.method === 'DELETE') {
+      state.apiCallLog = [];
+      return sendJson(res, { ok: true, cleared: true });
+    }
     if (url.pathname === '/api/health' && req.method === 'GET') {
       return sendJson(res, {
         ok: true,
@@ -226,6 +240,9 @@ const server = createServer(async (req, res) => {
           endStationId: stopped.endStationId || null,
           routeType: stopped.routeType || null,
           stops: Array.isArray(stopped.stops) ? stopped.stops : null,
+          createReverseRoute: Boolean(stopped.createReverseRoute),
+          reverseRouteCode: stopped.reverseRouteCode || null,
+          reverseRouteName: stopped.reverseRouteName || null,
           averageSpeedKmh: stopped.speedKmh || null,
           stoppedAt: new Date().toISOString(),
           targetSessionStarted: Boolean(stopped.targetSessionStarted),
@@ -774,7 +791,11 @@ function targetApiUrl(pathname) {
 
 async function postToTargetApi(pathname, payload, deviceId) {
   const url = targetApiUrl(pathname);
-  if (!url) return { ok: false, error: 'Chua cau hinh TARGET_GPS_ENDPOINT', status: 400 };
+  if (!url) {
+    const result = { ok: false, error: 'Chua cau hinh TARGET_GPS_ENDPOINT', status: 400, at: new Date().toISOString(), path: pathname };
+    pushApiCallLog({ method: 'POST', ...result, request: summarizeApiPayload(payload), url: null });
+    return result;
+  }
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -798,6 +819,18 @@ async function postToTargetApi(pathname, payload, deviceId) {
       result.error = formatTargetApiError(data, response.status);
     }
     state.lastTrackingApiCall = result;
+    pushApiCallLog({
+      method: 'POST',
+      url,
+      path: pathname,
+      ok: result.ok,
+      status: result.status,
+      error: result.error,
+      at: result.at,
+      request: summarizeApiPayload(payload),
+      response: summarizeApiPayload(data),
+      deviceId: deviceId || null,
+    });
     return result;
   } catch (error) {
     const result = {
@@ -809,8 +842,63 @@ async function postToTargetApi(pathname, payload, deviceId) {
       path: pathname,
     };
     state.lastTrackingApiCall = result;
+    pushApiCallLog({
+      method: 'POST',
+      url,
+      path: pathname,
+      ok: false,
+      status: 502,
+      error: error.message,
+      at: result.at,
+      request: summarizeApiPayload(payload),
+      response: null,
+      deviceId: deviceId || null,
+    });
     return result;
   }
+}
+
+function summarizeApiPayload(payload) {
+  if (payload == null) return null;
+  if (typeof payload !== 'object') return payload;
+  if (Array.isArray(payload)) {
+    return {
+      _type: 'array',
+      count: payload.length,
+      sample: payload.slice(0, 3),
+    };
+  }
+  const out = { ...payload };
+  if (Array.isArray(out.coordinates)) {
+    const coords = out.coordinates;
+    out.coordinates = {
+      count: coords.length,
+      first: coords[0] || null,
+      last: coords.length > 1 ? coords[coords.length - 1] : null,
+      sample: coords.slice(0, 3),
+    };
+  }
+  if (Array.isArray(out.stops)) {
+    out.stops = out.stops.map((stop) => ({
+      stationId: stop.stationId,
+      stationCode: stop.stationCode,
+      stationName: stop.stationName,
+      stopOrder: stop.stopOrder,
+      standardTravelMin: stop.standardTravelMin ?? null,
+      isPickupAllowed: stop.isPickupAllowed,
+      isDropoffAllowed: stop.isDropoffAllowed,
+    }));
+  }
+  return out;
+}
+
+function pushApiCallLog(entry) {
+  const row = {
+    id: randomUUID(),
+    ...entry,
+  };
+  state.apiCallLog.unshift(row);
+  if (state.apiCallLog.length > 80) state.apiCallLog.length = 80;
 }
 
 function formatTargetApiError(data, status) {
@@ -827,7 +915,11 @@ function formatTargetApiError(data, status) {
 
 async function getFromTargetApi(pathname, deviceId) {
   const url = targetApiUrl(pathname);
-  if (!url) return { ok: false, error: 'Chua cau hinh TARGET_GPS_ENDPOINT', status: 400 };
+  if (!url) {
+    const result = { ok: false, error: 'Chua cau hinh TARGET_GPS_ENDPOINT', status: 400, at: new Date().toISOString(), path: pathname };
+    pushApiCallLog({ method: 'GET', ...result, request: null, url: null });
+    return result;
+  }
   try {
     const response = await fetch(url, {
       method: 'GET',
@@ -849,9 +941,34 @@ async function getFromTargetApi(pathname, deviceId) {
     if (!result.ok) {
       result.error = data?.error || data?.message || data?.title || `BE tra ${response.status}`;
     }
+    pushApiCallLog({
+      method: 'GET',
+      url,
+      path: pathname,
+      ok: result.ok,
+      status: result.status,
+      error: result.error,
+      at: result.at,
+      request: null,
+      response: summarizeApiPayload(data),
+      deviceId: deviceId || null,
+    });
     return result;
   } catch (error) {
-    return { ok: false, status: 502, data: null, error: error.message, at: new Date().toISOString(), path: pathname };
+    const result = { ok: false, status: 502, data: null, error: error.message, at: new Date().toISOString(), path: pathname };
+    pushApiCallLog({
+      method: 'GET',
+      url,
+      path: pathname,
+      ok: false,
+      status: 502,
+      error: error.message,
+      at: result.at,
+      request: null,
+      response: null,
+      deviceId: deviceId || null,
+    });
+    return result;
   }
 }
 
@@ -912,6 +1029,17 @@ async function saveRouteFromGpsOnTarget(session, body) {
   const routeType = resolveRouteType(body, session, startStationId, endStationId);
   payload.routeType = routeType;
   payload.isBookable = routeType !== 'CharterReference';
+
+  const createReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
+    && routeType !== 'SightseeingLoop';
+  if (createReverse) {
+    payload.createReverseRoute = true;
+    const reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
+    const reverseName = cleanOptionalText(body.reverseRouteName || session?.reverseRouteName);
+    if (reverseCode) payload.reverseRouteCode = reverseCode;
+    if (reverseName) payload.reverseRouteName = reverseName;
+  }
+
   const detectRadius = Number(env.STOP_DETECT_RADIUS_M || 200);
   let stops = enrichStopsAlongPath(
     coordinates,
@@ -1024,6 +1152,9 @@ async function persistRecordingSession(body, sessionInput = null) {
       if (route.isBookable == null && targetSave.outboundIsBookable != null) {
         route.isBookable = targetSave.outboundIsBookable;
       }
+      if (!route.reverseRoute && targetSave.data?.reverseRoute) {
+        route.reverseRoute = targetSave.data.reverseRoute;
+      }
       savedTo = 'target';
       state.lastRecordingSession = null;
     } else if (targetSave.status === 409) {
@@ -1100,6 +1231,9 @@ async function finalizeCollectorRecording() {
     endStationId: stopped.endStationId || null,
     routeType: stopped.routeType || null,
     stops: Array.isArray(stopped.stops) ? stopped.stops : null,
+    createReverseRoute: Boolean(stopped.createReverseRoute),
+    reverseRouteCode: stopped.reverseRouteCode || null,
+    reverseRouteName: stopped.reverseRouteName || null,
     averageSpeedKmh: stopped.speedKmh || null,
     stoppedAt: new Date().toISOString(),
     targetSessionStarted: Boolean(stopped.targetSessionStarted),
@@ -1120,6 +1254,9 @@ async function finalizeCollectorRecording() {
       endStationId: stopped.endStationId || null,
       routeType: stopped.routeType || null,
       stops: stopped.stops || null,
+      createReverseRoute: Boolean(stopped.createReverseRoute),
+      reverseRouteCode: stopped.reverseRouteCode || null,
+      reverseRouteName: stopped.reverseRouteName || null,
     }, state.lastRecordingSession);
     state.lastAutoSavedRoute = {
       ...result,
@@ -1551,24 +1688,14 @@ function normalizeRouteStops(rawStops, startStationId = '', endStationId = '') {
   return stops;
 }
 
-/** Chỉ ép điểm đầu + cuối vào station — giữ nét thẳng, không kéo bến giữa vào path. */
-function snapCoordinatesToStops(coordinates, stops, _radiusM = 200) {
+/** Giữ nguyên coordinates FE gửi — không kéo đầu/cuối (tránh biến dạng đường khảo sát). */
+function snapCoordinatesToStops(coordinates, _stops, _radiusM = 200) {
   if (!Array.isArray(coordinates) || !coordinates.length) return coordinates || [];
-  const usable = (Array.isArray(stops) ? stops : []).filter((s) => (
-    s
-    && Number.isFinite(Number(s.lat))
-    && Number.isFinite(Number(s.lng))
-  ));
-  if (!usable.length) return coordinates;
-
-  const path = coordinates.map((p) => ({ ...p, lat: Number(p.lat), lng: Number(p.lng) }));
-  const start = usable[0];
-  path[0] = { ...path[0], lat: Number(start.lat), lng: Number(start.lng) };
-  if (usable.length >= 2) {
-    const end = usable.at(-1);
-    path[path.length - 1] = { ...path[path.length - 1], lat: Number(end.lat), lng: Number(end.lng) };
-  }
-  return path;
+  return coordinates.map((p) => ({
+    ...p,
+    lat: Number(p.lat),
+    lng: Number(p.lng),
+  }));
 }
 
 /**
@@ -1755,6 +1882,9 @@ function startCollector(body) {
     endStationId,
     routeType,
     stops,
+    createReverseRoute: Boolean(body.createReverseRoute) && routeType !== 'SightseeingLoop',
+    reverseRouteCode: cleanOptionalText(body.reverseRouteCode) || null,
+    reverseRouteName: cleanOptionalText(body.reverseRouteName) || null,
     sendIntervalMs: clamp(Number(body.sendIntervalMs || 5000), 3000, 10000),
     recordedPoints: [],
     lastPublishAt: 0,
