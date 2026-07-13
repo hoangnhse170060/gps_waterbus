@@ -91,8 +91,7 @@ select coalesce(jsonb_agg(jsonb_build_object(
   'lat', s.latitude,
   'lng', s.longitude,
   'stopOrder', rs.stop_order,
-  'standardTravelMin', rs.standard_travel_min,
-  'standardDwellMin', rs.standard_dwell_min
+  'standardTravelMin', rs.standard_travel_min
 ) order by rs.route_id, rs.stop_order), '[]'::jsonb)
 from route_stops rs
 join stations s on s.station_id = rs.station_id;
@@ -225,6 +224,8 @@ const server = createServer(async (req, res) => {
           recordedPoints: stopped.recordedPoints,
           startStationId: stopped.startStationId || null,
           endStationId: stopped.endStationId || null,
+          routeType: stopped.routeType || null,
+          stops: Array.isArray(stopped.stops) ? stopped.stops : null,
           averageSpeedKmh: stopped.speedKmh || null,
           stoppedAt: new Date().toISOString(),
           targetSessionStarted: Boolean(stopped.targetSessionStarted),
@@ -903,17 +904,75 @@ async function saveRouteFromGpsOnTarget(session, body) {
   if (session.targetSessionStarted && session.sessionId) {
     payload.sessionId = session.sessionId;
   }
-  // Chi gui station id khi la UUID hop le — tranh 400 validation.
   const startStationId = cleanOptionalText(body.startStationId || session.startStationId);
   const endStationId = cleanOptionalText(body.endStationId || session.endStationId);
   if (startStationId) payload.startStationId = startStationId;
   if (endStationId) payload.endStationId = endStationId;
 
-  return postToTargetApi(
+  const routeType = resolveRouteType(body, session, startStationId, endStationId);
+  payload.routeType = routeType;
+  payload.isBookable = routeType !== 'CharterReference';
+  const detectRadius = Number(env.STOP_DETECT_RADIUS_M || 200);
+  let stops = enrichStopsAlongPath(
+    coordinates,
+    body.stops || session.stops,
+    startStationId,
+    endStationId,
+    detectRadius,
+  ).map((stop, index) => ({
+    stationId: stop.stationId,
+    stationCode: stop.stationCode || null,
+    stationName: stop.stationName || null,
+    stopOrder: Number(stop.stopOrder) || index + 1,
+    lat: Number.isFinite(Number(stop.lat)) ? Number(stop.lat) : null,
+    lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
+    isPickupAllowed: stop.isPickupAllowed !== false,
+    isDropoffAllowed: stop.isDropoffAllowed !== false,
+  }));
+  if (stops.length) {
+    const snapped = snapCoordinatesToStops(coordinates, stops, detectRadius);
+    stops = attachSegmentTravelMinutes(snapped, stops, averageSpeedKmh).map((stop) => ({
+      stationId: stop.stationId,
+      stationCode: stop.stationCode || null,
+      stationName: stop.stationName || null,
+      stopOrder: Number(stop.stopOrder) || null,
+      lat: Number.isFinite(Number(stop.lat)) ? Number(stop.lat) : null,
+      lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
+      isPickupAllowed: stop.isPickupAllowed !== false,
+      isDropoffAllowed: stop.isDropoffAllowed !== false,
+      standardTravelMin: stop.standardTravelMin == null ? null : Number(stop.standardTravelMin),
+      segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
+    }));
+    payload.stops = stops;
+    payload.coordinates = snapped.map((point, index) => ({
+      lat: round(Number(point.lat), 7),
+      lng: round(Number(point.lng), 7),
+      speedKmh: averageSpeedKmh,
+      sequence: index + 1,
+      recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
+    }));
+    const segmentTotal = sumTravelMinutes(stops);
+    if (segmentTotal > 0) {
+      payload.estimatedDurationMin = segmentTotal;
+    }
+    console.log(
+      `[from-gps] ${payload.routeCode} segments:`,
+      stops.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
+    );
+  }
+
+  const targetResult = await postToTargetApi(
     '/api/routes/from-gps',
     payload,
     session.deviceId || deviceIdForBoat({ boatCode: session.boatCode }),
   );
+  // Giữ stops đã gửi để UI/BE fallback nếu Azure không trả stops[].
+  if (targetResult && typeof targetResult === 'object') {
+    targetResult.outboundStops = stops;
+    targetResult.outboundRouteType = routeType;
+    targetResult.outboundIsBookable = payload.isBookable;
+  }
+  return targetResult;
 }
 
 async function persistRecordingSession(body, sessionInput = null) {
@@ -937,6 +996,33 @@ async function persistRecordingSession(body, sessionInput = null) {
           session.deviceId || deviceIdForBoat({ boatCode: session.boatCode }),
         );
         if (details.ok && details.data) route = { ...route, ...details.data };
+      }
+      // BE đôi khi không trả / không giữ phút từng đoạn — ưu tiên bản GPS đã tính.
+      const outboundStops = Array.isArray(targetSave.outboundStops) ? targetSave.outboundStops : [];
+      const returnedStops = Array.isArray(route.stops) ? route.stops : [];
+      if (outboundStops.length) {
+        if (!returnedStops.length) {
+          route.stops = outboundStops;
+        } else {
+          route.stops = returnedStops.map((stop, index) => {
+            const out = outboundStops.find((item) => (
+              String(item.stationId) === String(stop.stationId)
+              && Number(item.stopOrder) === Number(stop.stopOrder)
+            )) || outboundStops[index];
+            const travel = stop.standardTravelMin ?? stop.standard_travel_min ?? out?.standardTravelMin;
+            return {
+              ...stop,
+              standardTravelMin: travel == null || travel === '' ? null : Number(travel),
+              segmentDistanceKm: out?.segmentDistanceKm ?? stop.segmentDistanceKm ?? null,
+            };
+          });
+        }
+      }
+      if (!route.routeType && targetSave.outboundRouteType) {
+        route.routeType = targetSave.outboundRouteType;
+      }
+      if (route.isBookable == null && targetSave.outboundIsBookable != null) {
+        route.isBookable = targetSave.outboundIsBookable;
       }
       savedTo = 'target';
       state.lastRecordingSession = null;
@@ -1012,6 +1098,8 @@ async function finalizeCollectorRecording() {
     recordedPoints: stopped.recordedPoints,
     startStationId: stopped.startStationId || null,
     endStationId: stopped.endStationId || null,
+    routeType: stopped.routeType || null,
+    stops: Array.isArray(stopped.stops) ? stopped.stops : null,
     averageSpeedKmh: stopped.speedKmh || null,
     stoppedAt: new Date().toISOString(),
     targetSessionStarted: Boolean(stopped.targetSessionStarted),
@@ -1030,6 +1118,8 @@ async function finalizeCollectorRecording() {
       averageSpeedKmh: stopped.speedKmh,
       startStationId: stopped.startStationId || null,
       endStationId: stopped.endStationId || null,
+      routeType: stopped.routeType || null,
+      stops: stopped.stops || null,
     }, state.lastRecordingSession);
     state.lastAutoSavedRoute = {
       ...result,
@@ -1105,6 +1195,8 @@ async function saveRecordedRoute(body) {
     averageSpeedKmh: body.averageSpeedKmh,
     startStationId: body.startStationId || session.startStationId || null,
     endStationId: body.endStationId || session.endStationId || null,
+    routeType: body.routeType || session.routeType || null,
+    stops: body.stops || session.stops || null,
     coordinates,
   });
 }
@@ -1112,49 +1204,76 @@ async function saveRecordedRoute(body) {
 async function createCapturedRoute(body) {
   const routeCode = cleanRouteText(body.routeCode, 'Route code');
   const routeName = cleanRouteText(body.routeName || body.routeCode, 'Route name');
-  const description = cleanOptionalText(body.description) || 'Captured from GPS simulator map';
   const status = cleanOptionalText(body.status) || 'Active';
-  const points = validateRoutePoints(body.coordinates);
+  let points = validateRoutePoints(body.coordinates);
   const routeId = randomUUID();
-  const lengthMeters = routeLength(points);
   const boatCode = cleanOptionalText(body.boatCode);
   const maxSpeed = maxSpeedForBoatCode(boatCode);
   const averageSpeedKmh = clampSpeedToBoatMax(
     Number(body.averageSpeedKmh || env.DEFAULT_SPEED_KMH || 16),
     maxSpeed,
   );
-  // phút = (km / tốc_độ_chạy) × 60 · tốc độ ≤ max đăng ký
-  const baseDistanceKm = round(lengthMeters / 1000, 3);
-  const estimatedDurationMin = Math.max(
-    1,
-    Math.round((baseDistanceKm / averageSpeedKmh) * 60),
-  );
   const startStationId = cleanOptionalText(body.startStationId);
   const endStationId = cleanOptionalText(body.endStationId);
+  const routeType = resolveRouteType(body, null, startStationId, endStationId);
+  const baseDescription = cleanOptionalText(body.description) || 'Captured from GPS simulator map';
+  const description = baseDescription.includes(`[${routeType}]`)
+    ? baseDescription
+    : `[${routeType}] ${baseDescription}`.trim();
+  const detectRadius = Number(env.STOP_DETECT_RADIUS_M || 200);
+  const normalizedStops = enrichStopsAlongPath(
+    points,
+    body.stops,
+    startStationId,
+    endStationId,
+    detectRadius,
+  );
+  points = snapCoordinatesToStops(points, normalizedStops, detectRadius);
+  const lengthMeters = routeLength(points);
+  // phút = (km / tốc_độ_chạy) × 60 · tốc độ ≤ max đăng ký
+  const baseDistanceKm = round(lengthMeters / 1000, 3);
+  const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh);
+  const estimatedDurationMin = Math.max(
+    1,
+    sumTravelMinutes(stopsWithTravel) || Math.round((baseDistanceKm / averageSpeedKmh) * 60),
+  );
   const pointSql = points
     .map((point) => `ST_MakePoint(${point.lng}, ${point.lat})::geometry`)
     .join(', ');
-
   const stopRows = [];
-  if (startStationId) {
-    stopRows.push({
-      id: randomUUID(),
-      stationId: startStationId,
-      stopOrder: 1,
-      travel: null, // bến đầu: chưa chạy
-      pickup: true,
-      dropoff: false,
-    });
-  }
-  if (endStationId && endStationId !== startStationId) {
-    stopRows.push({
-      id: randomUUID(),
-      stationId: endStationId,
-      stopOrder: stopRows.length + 1,
-      travel: estimatedDurationMin, // phút chạy từ bến đầu → bến cuối
-      pickup: false,
-      dropoff: true,
-    });
+  if (stopsWithTravel.length) {
+    for (const [index, stop] of stopsWithTravel.entries()) {
+      stopRows.push({
+        id: randomUUID(),
+        stationId: stop.stationId,
+        stopOrder: Number(stop.stopOrder) || index + 1,
+        travel: stop.standardTravelMin == null ? null : Number(stop.standardTravelMin),
+        pickup: stop.isPickupAllowed !== false,
+        dropoff: stop.isDropoffAllowed !== false,
+      });
+    }
+  } else {
+    if (startStationId) {
+      stopRows.push({
+        id: randomUUID(),
+        stationId: startStationId,
+        stopOrder: 1,
+        travel: null,
+        pickup: true,
+        dropoff: routeType === 'SightseeingLoop',
+      });
+    }
+    // Loop: cho phép endStationId === startStationId (cùng bến xuất hiện 2 lần).
+    if (endStationId) {
+      stopRows.push({
+        id: randomUUID(),
+        stationId: endStationId,
+        stopOrder: stopRows.length + 1,
+        travel: estimatedDurationMin,
+        pickup: routeType === 'SightseeingLoop',
+        dropoff: true,
+      });
+    }
   }
 
   const stopsInsert = stopRows.length
@@ -1162,7 +1281,7 @@ async function createCapturedRoute(body) {
 , stops_inserted as (
   insert into route_stops (
     route_stop_id, route_id, station_id, stop_order,
-    standard_travel_min, standard_dwell_min, is_pickup_allowed, is_dropoff_allowed
+    standard_travel_min, is_pickup_allowed, is_dropoff_allowed
   )
   values
   ${stopRows.map((stop) => `(
@@ -1171,11 +1290,10 @@ async function createCapturedRoute(body) {
     ${sqlLiteral(stop.stationId)}::uuid,
     ${stop.stopOrder},
     ${stop.travel == null ? 'null' : Number(stop.travel)},
-    2,
     ${stop.pickup},
     ${stop.dropoff}
   )`).join(',\n  ')}
-  returning route_stop_id, station_id, stop_order, standard_travel_min, standard_dwell_min
+  returning route_stop_id, station_id, stop_order, standard_travel_min
 )`
     : '';
 
@@ -1188,7 +1306,6 @@ async function createCapturedRoute(body) {
       'stationName', s.station_name,
       'stopOrder', si.stop_order,
       'standardTravelMin', si.standard_travel_min,
-      'standardDwellMin', si.standard_dwell_min,
       'lat', s.latitude,
       'lng', s.longitude
     ) order by si.stop_order)
@@ -1234,7 +1351,7 @@ inserted as (
     now(),
     route_geometry
   from route_input
-  returning route_id, route_code, route_name, status, base_distance_km, estimated_duration_min,
+  returning route_id, route_code, route_name, status, base_distance_km, estimated_duration_min, description,
             ST_AsGeoJSON(route_geometry)::jsonb as geojson
 )
 ${stopsInsert}
@@ -1243,9 +1360,11 @@ select jsonb_build_object(
   'routeCode', i.route_code,
   'routeName', i.route_name,
   'status', i.status,
+  'routeType', ${sqlLiteral(routeType)},
   'baseDistanceKm', i.base_distance_km,
   'estimatedDurationMin', i.estimated_duration_min,
   'distanceKm', i.base_distance_km,
+  'description', i.description,
   'geojson', i.geojson,
   'stops', ${stopsSelect}
 )
@@ -1282,7 +1401,6 @@ async function getRouteDetail(routeId) {
       stationName: stop.stationName,
       stopOrder: stop.stopOrder,
       standardTravelMin: stop.standardTravelMin,
-      standardDwellMin: stop.standardDwellMin,
       lat: Number(stop.lat),
       lng: Number(stop.lng),
     }));
@@ -1320,7 +1438,6 @@ select jsonb_build_object(
       'stationName', s.station_name,
       'stopOrder', rs.stop_order,
       'standardTravelMin', rs.standard_travel_min,
-      'standardDwellMin', rs.standard_dwell_min,
       'lat', s.latitude,
       'lng', s.longitude
     ) order by rs.stop_order)
@@ -1360,6 +1477,217 @@ function clampSpeedToBoatMax(speedKmh, maxSpeedKmh) {
   return clamp(Number(speedKmh), 1, max);
 }
 
+function resolveRouteType(body = {}, session = null, startStationId = '', endStationId = '') {
+  const explicit = cleanOptionalText(body.routeType || session?.routeType);
+  if (/sightseeingloop|loop/i.test(explicit)) return 'SightseeingLoop';
+  if (/charter/i.test(explicit)) return 'CharterReference';
+  if (/regular/i.test(explicit)) return 'Regular';
+  const start = cleanOptionalText(startStationId || body.startStationId || session?.startStationId);
+  const end = cleanOptionalText(endStationId || body.endStationId || session?.endStationId);
+  if (start && end && start === end) return 'SightseeingLoop';
+  return 'Regular';
+}
+
+function haversineMetersSimple(a, b) {
+  const toRad = (value) => (Number(value) * Math.PI) / 180;
+  const earth = 6371000;
+  const dLat = toRad(Number(b.lat) - Number(a.lat));
+  const dLng = toRad(Number(b.lng) - Number(a.lng));
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function normalizeRouteStops(rawStops, startStationId = '', endStationId = '') {
+  const stops = [];
+  if (Array.isArray(rawStops)) {
+    for (const [index, stop] of rawStops.entries()) {
+      const stationId = cleanOptionalText(stop?.stationId);
+      if (!stationId) continue;
+      stops.push({
+        stationId,
+        stationCode: cleanOptionalText(stop.stationCode) || null,
+        stationName: cleanOptionalText(stop.stationName) || null,
+        stopOrder: Number(stop.stopOrder) || index + 1,
+        lat: Number.isFinite(Number(stop.lat)) ? Number(stop.lat) : null,
+        lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
+        isPickupAllowed: stop.isPickupAllowed !== false,
+        isDropoffAllowed: stop.isDropoffAllowed !== false,
+      });
+    }
+  }
+  if (stops.length) {
+    return stops
+      .sort((a, b) => a.stopOrder - b.stopOrder)
+      .map((stop, index) => ({ ...stop, stopOrder: index + 1 }));
+  }
+  const start = cleanOptionalText(startStationId);
+  const end = cleanOptionalText(endStationId);
+  if (start) {
+    stops.push({
+      stationId: start,
+      stationCode: null,
+      stationName: null,
+      stopOrder: 1,
+      lat: null,
+      lng: null,
+      isPickupAllowed: true,
+      isDropoffAllowed: Boolean(end && end === start),
+    });
+  }
+  if (end) {
+    stops.push({
+      stationId: end,
+      stationCode: null,
+      stationName: null,
+      stopOrder: stops.length + 1,
+      lat: null,
+      lng: null,
+      isPickupAllowed: Boolean(start && end === start),
+      isDropoffAllowed: true,
+    });
+  }
+  return stops;
+}
+
+/** Chỉ ép điểm đầu + cuối vào station — giữ nét thẳng, không kéo bến giữa vào path. */
+function snapCoordinatesToStops(coordinates, stops, _radiusM = 200) {
+  if (!Array.isArray(coordinates) || !coordinates.length) return coordinates || [];
+  const usable = (Array.isArray(stops) ? stops : []).filter((s) => (
+    s
+    && Number.isFinite(Number(s.lat))
+    && Number.isFinite(Number(s.lng))
+  ));
+  if (!usable.length) return coordinates;
+
+  const path = coordinates.map((p) => ({ ...p, lat: Number(p.lat), lng: Number(p.lng) }));
+  const start = usable[0];
+  path[0] = { ...path[0], lat: Number(start.lat), lng: Number(start.lng) };
+  if (usable.length >= 2) {
+    const end = usable.at(-1);
+    path[path.length - 1] = { ...path[path.length - 1], lat: Number(end.lat), lng: Number(end.lng) };
+  }
+  return path;
+}
+
+/**
+ * Ưu tiên stops GPS đã gửi. Không tự thêm bến “đi qua” nếu client đã gửi stops[].
+ * Chỉ fallback start/end khi không có stops.
+ */
+function enrichStopsAlongPath(coordinates, rawStops, startStationId = '', endStationId = '', radiusM = 200) {
+  const start = cleanOptionalText(startStationId);
+  const end = cleanOptionalText(endStationId);
+  const explicit = normalizeRouteStops(rawStops, start, end);
+  // Client đã chọn bến tường minh → dùng nguyên, không auto-detect thêm.
+  if (Array.isArray(rawStops) && rawStops.length >= 1 && explicit.length) {
+    return explicit.map((stop, index, arr) => ({
+      ...stop,
+      stopOrder: index + 1,
+      isPickupAllowed: index === 0 || (start && end && start === end) || index < arr.length - 1
+        ? (stop.isPickupAllowed !== false)
+        : stop.isPickupAllowed !== false,
+      isDropoffAllowed: stop.isDropoffAllowed !== false,
+    }));
+  }
+
+  const path = Array.isArray(coordinates)
+    ? coordinates.filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
+    : [];
+  const stations = Array.isArray(state.stations) ? state.stations : [];
+  if (path.length < 2 || !stations.length) return explicit;
+
+  const explicitIds = new Set(explicit.map((s) => s.stationId));
+  const hits = [];
+  for (const station of stations) {
+    const id = cleanOptionalText(station.stationId);
+    if (!id) continue;
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < path.length; i += 1) {
+      const dist = haversineMetersSimple(path[i], station);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    const forced = id === start || id === end || explicitIds.has(id);
+    if (!forced && bestDist > radiusM) continue;
+    hits.push({
+      stationId: id,
+      stationCode: cleanOptionalText(station.stationCode) || null,
+      stationName: cleanOptionalText(station.stationName) || null,
+      lat: Number(station.lat),
+      lng: Number(station.lng),
+      pathIndex: bestIdx,
+      dist: bestDist,
+      forced,
+    });
+  }
+
+  hits.sort((a, b) => {
+    if (a.stationId === start && b.stationId !== start) return -1;
+    if (b.stationId === start && a.stationId !== start) return 1;
+    if (a.stationId === end && b.stationId !== end) return 1;
+    if (b.stationId === end && a.stationId !== end) return -1;
+    return a.pathIndex - b.pathIndex || a.dist - b.dist;
+  });
+
+  const ordered = [];
+  const seen = new Set();
+  const isLoop = Boolean(start && end && start === end);
+  for (const hit of hits) {
+    if (seen.has(hit.stationId)) continue;
+    // Loop trùng bến đầu = bến cuối: chỉ giữ bến đầu, không tự thêm bến "đi qua".
+    if (isLoop && hit.stationId !== start) continue;
+    // Loop: bỏ qua end==start ở giữa; sẽ gắn lại cuối.
+    if (hit.stationId === start && ordered.length > 0 && isLoop) continue;
+    seen.add(hit.stationId);
+    const fromExplicit = explicit.find((s) => s.stationId === hit.stationId);
+    ordered.push({
+      stationId: hit.stationId,
+      stationCode: hit.stationCode || fromExplicit?.stationCode || null,
+      stationName: hit.stationName || fromExplicit?.stationName || null,
+      stopOrder: ordered.length + 1,
+      lat: hit.lat,
+      lng: hit.lng,
+      isPickupAllowed: true,
+      isDropoffAllowed: true,
+    });
+  }
+
+  if (isLoop && ordered.length) {
+    ordered.push({
+      ...ordered[0],
+      stopOrder: ordered.length + 1,
+      isPickupAllowed: true,
+      isDropoffAllowed: true,
+    });
+  } else if (end && ordered.length && ordered.at(-1).stationId !== end) {
+    const endHit = hits.find((h) => h.stationId === end)
+      || explicit.find((s) => s.stationId === end);
+    if (endHit) {
+      ordered.push({
+        stationId: end,
+        stationCode: endHit.stationCode || null,
+        stationName: endHit.stationName || null,
+        stopOrder: ordered.length + 1,
+        lat: endHit.lat ?? null,
+        lng: endHit.lng ?? null,
+        isPickupAllowed: true,
+        isDropoffAllowed: true,
+      });
+    }
+  }
+
+  return ordered.map((stop, index, arr) => ({
+    ...stop,
+    stopOrder: index + 1,
+    isPickupAllowed: index === 0 || (start && end && start === end) || index < arr.length - 1,
+    isDropoffAllowed: index === arr.length - 1 || (start && end && start === end) || index > 0,
+  }));
+}
+
 function startCollector(body) {
   const routeCode = cleanRouteText(body.routeCode, 'Route code');
   const routeName = cleanRouteText(body.routeName || body.routeCode, 'Route name');
@@ -1383,6 +1711,16 @@ function startCollector(body) {
   const speedKmh = clampSpeedToBoatMax(
     Number(body.speedKmh || env.DEFAULT_SPEED_KMH || 16),
     maxSpeedKmh,
+  );
+  const startStationId = cleanOptionalText(body.startStationId) || null;
+  const endStationId = cleanOptionalText(body.endStationId) || null;
+  const routeType = resolveRouteType(body, null, startStationId, endStationId);
+  const stops = enrichStopsAlongPath(
+    coordinates,
+    body.stops,
+    startStationId,
+    endStationId,
+    Number(env.STOP_DETECT_RADIUS_M || 200),
   );
   return {
     boatId: `collector-${routeCode}`,
@@ -1413,8 +1751,10 @@ function startCollector(body) {
     recording: body.recording !== false,
     recordingStatus: 'recording',
     sessionId: randomUUID(),
-    startStationId: cleanOptionalText(body.startStationId) || null,
-    endStationId: cleanOptionalText(body.endStationId) || null,
+    startStationId,
+    endStationId,
+    routeType,
+    stops,
     sendIntervalMs: clamp(Number(body.sendIntervalMs || 5000), 3000, 10000),
     recordedPoints: [],
     lastPublishAt: 0,
@@ -1427,26 +1767,32 @@ function startCollector(body) {
 }
 
 function createDbPool(envValues) {
+  let pool = null;
   if (envValues.DATABASE_URL) {
-    return new Pool({
+    pool = new Pool({
       connectionString: envValues.DATABASE_URL,
       ssl: { rejectUnauthorized: false },
       max: 5,
       idleTimeoutMillis: 30_000,
     });
-  }
-  if (!envValues.DB_HOST || String(envValues.DB_HOST).startsWith('http')) {
+  } else if (!envValues.DB_HOST || String(envValues.DB_HOST).startsWith('http')) {
     return null;
+  } else {
+    pool = new Pool({
+      host: envValues.DB_HOST,
+      port: Number(envValues.DB_PORT || 5432),
+      database: envValues.DB_NAME || 'waterbusdb',
+      user: envValues.DB_USER || 'postgres',
+      password: envValues.DB_PASSWORD || '',
+      max: 5,
+      idleTimeoutMillis: 30_000,
+    });
   }
-  return new Pool({
-    host: envValues.DB_HOST,
-    port: Number(envValues.DB_PORT || 5432),
-    database: envValues.DB_NAME || 'waterbusdb',
-    user: envValues.DB_USER || 'postgres',
-    password: envValues.DB_PASSWORD || '',
-    max: 5,
-    idleTimeoutMillis: 30_000,
+  // Idle Neon/TLS timeout không được làm crash cả process.
+  pool.on('error', (error) => {
+    console.warn(`[db] idle client error: ${error.message}`);
   });
+  return pool;
 }
 
 async function queryJson(sql) {
@@ -1512,6 +1858,88 @@ function routeLength(points) {
   let total = 0;
   for (let i = 1; i < points.length; i += 1) total += distanceMeters(points[i - 1], points[i]);
   return total;
+}
+
+/** Index điểm trên path gần stop nhất + khoảng cách dọc path tới điểm đó. */
+function nearestPathProbe(path, stop) {
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < path.length; i += 1) {
+    const dist = distanceMeters(path[i], stop);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  let along = 0;
+  for (let i = 1; i <= bestIdx; i += 1) along += distanceMeters(path[i - 1], path[i]);
+  return { index: bestIdx, alongMeters: along, distToPath: bestDist };
+}
+
+/**
+ * Gắn standardTravelMin = phút chạy theo ĐƯỜNG GPS thực giữa 2 bến liên tiếp.
+ * Không bịa bằng khoảng cách thẳng bến↔bến khi đường không đi qua đoạn đó.
+ * A→B→C: A=null; B/C chỉ có phút nếu path thật sự có đoạn length > 0 giữa 2 điểm gắn bến.
+ */
+function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
+  const path = Array.isArray(coordinates)
+    ? coordinates.filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
+    : [];
+  const list = Array.isArray(stops) ? stops.map((s) => ({ ...s })) : [];
+  const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
+  const nearM = Number(env.STOP_DETECT_RADIUS_M || 200);
+  if (!list.length) return [];
+  if (list.length === 1 || path.length < 2) {
+    return list.map((stop, index) => ({
+      ...stop,
+      standardTravelMin: null,
+      segmentDistanceKm: null,
+    }));
+  }
+
+  const probes = list.map((stop) => (
+    Number.isFinite(Number(stop.lat)) && Number.isFinite(Number(stop.lng))
+      ? nearestPathProbe(path, stop)
+      : { index: 0, alongMeters: 0, distToPath: Infinity }
+  ));
+
+  // Ép chỉ số tăng dần dọc path (không lùi), nhưng không bịa tỉ lệ thẳng.
+  for (let i = 1; i < probes.length; i += 1) {
+    if (probes[i].alongMeters < probes[i - 1].alongMeters) {
+      probes[i] = {
+        ...probes[i],
+        alongMeters: probes[i - 1].alongMeters,
+        index: Math.max(probes[i].index, probes[i - 1].index),
+      };
+    }
+  }
+
+  return list.map((stop, index) => {
+    if (index === 0) {
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    }
+    const prev = probes[index - 1];
+    const cur = probes[index];
+    // Bến không nằm gần đường vẽ → không gán phút đoạn (không có “nối” thật).
+    if (prev.distToPath > nearM || cur.distToPath > nearM) {
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    }
+    const meters = cur.alongMeters - prev.alongMeters;
+    if (!(meters > 5)) {
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    }
+    const km = meters / 1000;
+    const minutes = Math.max(1, Math.round((km / speed) * 60));
+    return {
+      ...stop,
+      standardTravelMin: minutes,
+      segmentDistanceKm: round(km, 3),
+    };
+  });
+}
+
+function sumTravelMinutes(stops) {
+  return (stops || []).reduce((sum, stop) => sum + (Number(stop.standardTravelMin) || 0), 0);
 }
 
 function pointAtDistance(points, targetMeters) {
@@ -1674,13 +2102,20 @@ function snapshot() {
       baseDistanceKm: state.lastAutoSavedRoute.baseDistanceKm ?? state.lastAutoSavedRoute.distanceKm ?? null,
       estimatedDurationMin: state.lastAutoSavedRoute.estimatedDurationMin ?? null,
       stops: Array.isArray(state.lastAutoSavedRoute.stops)
-        ? state.lastAutoSavedRoute.stops.map((stop) => ({
-            stopOrder: stop.stopOrder,
-            stationName: stop.stationName,
-            stationCode: stop.stationCode,
-            standardTravelMin: stop.standardTravelMin,
+        ? state.lastAutoSavedRoute.stops.map((stop, index) => ({
+            stationId: stop.stationId || null,
+            stationCode: stop.stationCode || null,
+            stationName: stop.stationName || null,
+            stopOrder: Number(stop.stopOrder) || index + 1,
+            standardTravelMin: stop.standardTravelMin ?? null,
+            lat: Number.isFinite(Number(stop.lat)) ? Number(stop.lat) : null,
+            lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
+            isPickupAllowed: stop.isPickupAllowed,
+            isDropoffAllowed: stop.isDropoffAllowed,
           }))
         : [],
+      routeType: state.lastAutoSavedRoute.routeType || null,
+      isBookable: state.lastAutoSavedRoute.isBookable,
     } : null,
     config: publicConfig(),
     dbStatus: state.dbStatus,

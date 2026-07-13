@@ -21,6 +21,7 @@ const boatsEl = document.querySelector('#boats');
 const payloadLogEl = document.querySelector('#payloadLog');
 const mapLegendSelectEl = document.querySelector('#mapLegendSelect');
 const mapLegendSwatchEl = document.querySelector('#mapLegendSwatch');
+const toggleSavedRoutesEl = document.querySelector('#toggleSavedRoutes');
 const captureCountEl = document.querySelector('#captureCount');
 const captureStatusEl = document.querySelector('#captureStatus');
 const collectorStatusEl = document.querySelector('#collectorStatus');
@@ -57,7 +58,10 @@ const estimateSpeedEl = document.querySelector('#estimateSpeed');
 const estimateMinEl = document.querySelector('#estimateMin');
 const stationCountEl = document.querySelector('#stationCount');
 const routeCodeHintEl = document.querySelector('#routeCodeHint');
+const routeTypeHintEl = document.querySelector('#routeTypeHint');
+const stopChainPreviewEl = document.querySelector('#stopChainPreview');
 const workflowStepsEl = document.querySelector('#workflowSteps');
+const routeStopsListEl = document.querySelector('#routeStopsList');
 
 const markers = new Map();
 const routeLayers = new Map();
@@ -67,6 +71,9 @@ let captureLine = null;
 let plannedRouteLine = null;
 let lockedSurveyPath = null; // giữ đường vẽ suốt lúc tàu chạy — không cho auto-save cũ xóa
 let collectorMarker = null;
+let routeStopMarkersLayer = null;
+let selectedRouteStops = [];
+let showSavedRoutes = true;
 let latest = null;
 let hasFitInitialRoutes = false;
 let lastStationsFingerprint = '';
@@ -194,6 +201,7 @@ function syncEndStationDisplay() {
     textEl.textContent = 'Nhấn bến trên map để chọn';
     endStationDisplayEl.classList.add('is-empty');
   }
+  updateRouteTypeHint();
 }
 
 function setStationComboValue(key, stationId, { emitChange = true } = {}) {
@@ -384,13 +392,23 @@ function finishDraw() {
     captureStatusEl.textContent = 'Cần ít nhất 2 điểm trước khi hoàn thành.';
     return;
   }
-  captureState.lineMode = 'curve';
+  ensureEndStationFromPath();
+  if (endStationEl?.value) seedToEndStation();
+  // Chỉ kéo sát đầu/cuối vào bến đã chọn — không ép nét cong / không tự nhận bến giữa.
+  syncCapturePointsToStationCoords();
+  captureState.lineMode = 'straight';
   captureState.finished = true;
-  setLineMode('curve');
+  setLineMode('straight');
   setDrawTool('pan');
-  captureStatusEl.textContent = 'Đã tạo đường cong đi qua các điểm khảo sát. Kiểm tra km/phút, chỉnh tốc độ cho khớp thực tế, rồi ghi GPS.';
+  const type = getSurveyRouteType();
+  const stopCount = buildSurveyStops().length;
+  captureStatusEl.textContent = type === 'SightseeingLoop'
+    ? `Đã xong vòng sightseeing (${stopCount} bến, nét thẳng). Kiểm tra km/phút rồi ghi GPS.`
+    : `Đã xong đường thẳng qua ${stopCount} bến (chỉ bến đã click). Kiểm tra km/phút rồi ghi GPS.`;
   updateWorkflow('run');
+  updateRouteTypeHint();
   checkRouteCodeDuplicate();
+  renderCaptureLine();
 }
 
 function updateWorkflow(step) {
@@ -486,7 +504,12 @@ function stationsFingerprint(stations) {
 }
 
 function routesFingerprint(routes) {
-  return (routes || []).map((r) => `${r.routeId}:${r.lengthMeters}`).join('|');
+  return (routes || []).map((r) => {
+    const stopKey = (r.stops || [])
+      .map((s) => `${s.stopOrder}:${s.stationId || s.stationCode || ''}`)
+      .join(',');
+    return `${r.routeId}:${r.lengthMeters}:${stopKey}`;
+  }).join('|');
 }
 
 function render(data) {
@@ -539,19 +562,337 @@ function renderStationOptions(stations, placeholder) {
 }
 
 function getSelectedStation() {
-  if (!latest?.stations?.length || !startStationEl.value) return null;
-  return uniqueStations(latest.stations).find((s) => s.stationId === startStationEl.value) || null;
+  if (!startStationEl?.value) return null;
+  return findStationInCatalog(startStationEl.value)
+    || uniqueStations(latest?.stations || []).find((s) => String(s.stationId) === String(startStationEl.value))
+    || null;
 }
 
 function getSelectedEndStation() {
-  if (!latest?.stations?.length || !endStationEl.value) return null;
-  return uniqueStations(latest.stations).find((s) => s.stationId === endStationEl.value) || null;
+  if (!endStationEl?.value) return null;
+  return findStationInCatalog(endStationEl.value)
+    || uniqueStations(latest?.stations || []).find((s) => String(s.stationId) === String(endStationEl.value))
+    || null;
+}
+
+function getSurveyRouteType() {
+  const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
+  const endPoint = [...captureState.points].reverse().find((p) => p.source === 'station-end');
+  const endId = endStationEl?.value || endPoint?.stationId || '';
+  if (startId && endId && String(startId) === String(endId)) return 'SightseeingLoop';
+  return 'Regular';
+}
+
+const STOP_DETECT_RADIUS_M = 200;
+
+function collectClickedStationStops() {
+  const stationPoints = captureState.points.filter((p) => p.stationId);
+  return stationPoints.map((point) => {
+    const station = findStationInCatalog(point.stationId) || {
+      stationId: point.stationId,
+      stationName: point.label,
+      stationCode: null,
+      lat: point.lat,
+      lng: point.lng,
+    };
+    return {
+      stationId: String(station.stationId),
+      stationCode: station.stationCode || null,
+      stationName: station.stationName || point.label || null,
+      lat: Number(station.lat ?? point.lat),
+      lng: Number(station.lng ?? point.lng),
+      source: point.source || 'station',
+      pathIndex: captureState.points.indexOf(point),
+      clicked: true,
+    };
+  });
+}
+
+/** Chỉ lấy bến đã click gắn vào path — không tự nhận bến “đi qua”. */
+function collectOrderedStopsFromClicks() {
+  const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
+  const endId = endStationEl?.value
+    || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId
+    || '';
+  const clicked = collectClickedStationStops();
+  const path = (() => {
+    const expanded = captureState.points.length >= 2
+      ? expandPath(captureState.points)
+      : captureState.points;
+    return (expanded || []).filter((p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)));
+  })();
+
+  const hits = clicked.map((stop) => {
+    let pathIndex = stop.pathIndex ?? 0;
+    if (path.length) {
+      let best = Infinity;
+      for (let i = 0; i < path.length; i += 1) {
+        const dist = haversineMeters(path[i], stop);
+        if (dist < best) {
+          best = dist;
+          pathIndex = i;
+        }
+      }
+    }
+    return { ...stop, pathIndex, dist: 0 };
+  });
+
+  hits.sort((a, b) => {
+    if (String(a.stationId) === String(startId) && String(b.stationId) !== String(startId)) return -1;
+    if (String(b.stationId) === String(startId) && String(a.stationId) !== String(startId)) return 1;
+    if (String(a.stationId) === String(endId) && String(b.stationId) !== String(endId)) return 1;
+    if (String(b.stationId) === String(endId) && String(a.stationId) !== String(endId)) return -1;
+    return (a.pathIndex - b.pathIndex) || ((a.dist || 0) - (b.dist || 0));
+  });
+
+  const isLoop = Boolean(startId && endId && String(startId) === String(endId));
+  const ordered = [];
+  const seen = new Set();
+  for (const hit of hits) {
+    if (seen.has(hit.stationId)) continue;
+    // Loop trùng bến đầu = bến cuối: chỉ giữ đúng bến đầu, bỏ mọi bến giữa
+    // (đi lượn quanh sông, không ghé bến nào cho tới khi đóng vòng).
+    if (isLoop && String(hit.stationId) !== String(startId)) continue;
+    if (String(hit.stationId) === String(startId) && ordered.length > 0 && isLoop) {
+      continue;
+    }
+    seen.add(hit.stationId);
+    ordered.push(hit);
+  }
+
+  if (isLoop && ordered.length) {
+    ordered.push({ ...ordered[0], source: 'station-end', clicked: true });
+  } else if (endId && ordered.length && String(ordered.at(-1).stationId) !== String(endId)) {
+    const endStation = findStationInCatalog(endId) || hits.find((h) => String(h.stationId) === String(endId));
+    if (endStation) {
+      ordered.push({
+        stationId: String(endId),
+        stationCode: endStation.stationCode || null,
+        stationName: endStation.stationName || null,
+        lat: Number(endStation.lat),
+        lng: Number(endStation.lng),
+        source: 'station-end',
+        clicked: true,
+      });
+    }
+  }
+
+  return ordered.map((stop, index, arr) => ({
+    ...stop,
+    stopOrder: index + 1,
+    isFirst: index === 0,
+    isLast: index === arr.length - 1,
+  }));
+}
+
+function buildSurveyStops() {
+  const routeType = getSurveyRouteType();
+  const ordered = collectOrderedStopsFromClicks();
+  const withTravel = attachSegmentTravelMinutesFe(getPathCoordinates(), ordered, getSurveySpeedKmh());
+  return withTravel.map((stop) => ({
+    stationId: stop.stationId,
+    stationCode: stop.stationCode,
+    stationName: stop.stationName,
+    stopOrder: stop.stopOrder,
+    lat: stop.lat,
+    lng: stop.lng,
+    isPickupAllowed: stop.isFirst || routeType === 'SightseeingLoop' || !stop.isLast,
+    isDropoffAllowed: stop.isLast || routeType === 'SightseeingLoop' || !stop.isFirst,
+    standardTravelMin: stop.standardTravelMin,
+    segmentDistanceKm: stop.segmentDistanceKm,
+  }));
+}
+
+function nearestPathIndexFe(path, stop) {
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < path.length; i += 1) {
+    const dist = haversineMeters(path[i], stop);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  let along = 0;
+  for (let i = 1; i <= bestIdx; i += 1) along += haversineMeters(path[i - 1], path[i]);
+  return { index: bestIdx, alongMeters: along, distToPath: bestDist };
+}
+
+/** Phút chạy chỉ khi đường vẽ thật sự có đoạn giữa 2 bến (không bịa nối thẳng). */
+function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
+  const path = Array.isArray(coordinates)
+    ? coordinates.filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
+    : [];
+  const list = Array.isArray(stops) ? stops.map((s) => ({ ...s })) : [];
+  const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
+  if (!list.length) return [];
+  if (list.length === 1 || path.length < 2) {
+    return list.map((stop) => ({ ...stop, standardTravelMin: null, segmentDistanceKm: null }));
+  }
+
+  const probes = list.map((stop) => (
+    Number.isFinite(Number(stop.lat))
+      ? nearestPathIndexFe(path, stop)
+      : { index: 0, alongMeters: 0, distToPath: Infinity }
+  ));
+  for (let i = 1; i < probes.length; i += 1) {
+    if (probes[i].alongMeters < probes[i - 1].alongMeters) {
+      probes[i] = {
+        ...probes[i],
+        alongMeters: probes[i - 1].alongMeters,
+        index: Math.max(probes[i].index, probes[i - 1].index),
+      };
+    }
+  }
+
+  return list.map((stop, index) => {
+    if (index === 0) return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    const prev = probes[index - 1];
+    const cur = probes[index];
+    if (prev.distToPath > STOP_DETECT_RADIUS_M || cur.distToPath > STOP_DETECT_RADIUS_M) {
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    }
+    const meters = cur.alongMeters - prev.alongMeters;
+    if (!(meters > 5)) return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    const km = meters / 1000;
+    const minutes = Math.max(1, Math.round((km / speed) * 60));
+    return { ...stop, standardTravelMin: minutes, segmentDistanceKm: roundNumber(km, 3) };
+  });
+}
+
+function updateRouteTypeHint() {
+  const type = getSurveyRouteType();
+  const ordered = collectOrderedStopsFromClicks();
+  const viaCount = Math.max(0, ordered.length - 2);
+  const isLoop = type === 'SightseeingLoop';
+  if (routeTypeHintEl) {
+    if (ordered.length >= 2) {
+      routeTypeHintEl.textContent = isLoop
+        ? `${type} · loop bến đầu = bến cuối · đi lượn quanh sông, không ghé bến giữa.`
+        : `${type} · ${ordered.length} bến đã click${viaCount ? ` · ${viaCount} bến giữa` : ''}. Nét thẳng — không tự nhận bến đi qua.`;
+      routeTypeHintEl.classList.add('is-ok');
+      routeTypeHintEl.classList.remove('is-error');
+    } else {
+      routeTypeHintEl.textContent = 'Click từng bến muốn dừng. Vẽ nét thẳng giữa các bến — không tự thêm bến.';
+      routeTypeHintEl.classList.remove('is-ok', 'is-error');
+    }
+  }
+  updateStopChainPreview(ordered);
+}
+
+function updateStopChainPreview(orderedInput) {
+  if (!stopChainPreviewEl) return;
+  const ordered = orderedInput || collectOrderedStopsFromClicks();
+  if (!ordered.length) {
+    stopChainPreviewEl.innerHTML = 'Chưa có bến — click bến hoặc vẽ qua gần bến catalog.';
+    stopChainPreviewEl.classList.add('is-empty');
+    return;
+  }
+  const withTravel = attachSegmentTravelMinutesFe(getPathCoordinates(), ordered, getSurveySpeedKmh());
+  const parts = [];
+  withTravel.forEach((stop, index) => {
+    if (index > 0) {
+      const min = stop.standardTravelMin != null
+        ? `${stop.standardTravelMin} phút`
+        : 'chưa đo';
+      const km = stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : '';
+      parts.push(`<span class="stop-seg${stop.standardTravelMin == null ? ' is-missing' : ''}">${escapeHtml(min)}${escapeHtml(km)}</span>`);
+      parts.push('<span class="stop-sep">→</span>');
+    }
+    const tag = stop.isFirst ? 'Đầu' : (stop.isLast ? 'Cuối' : (stop.source === 'path-near' ? 'Đi qua' : `Giữa ${index}`));
+    const name = stop.stationName || stop.stationCode || stop.stationId;
+    parts.push(`<span class="stop-chip${stop.source === 'path-near' ? ' is-auto' : ''}"><b>${tag}</b> ${escapeHtml(name)}</span>`);
+    if (index < withTravel.length - 1) parts.push('<span class="stop-sep">→</span>');
+  });
+  stopChainPreviewEl.innerHTML = parts.join('');
+  stopChainPreviewEl.classList.remove('is-empty');
+}
+
+function surveySaveFields() {
+  ensureEndStationFromPath({ quiet: true });
+  return {
+    routeType: getSurveyRouteType(),
+    startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
+    endStationId: endStationEl.value || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId || null,
+    stops: buildSurveyStops(),
+  };
+}
+
+function ensureEndStationFromPath({ quiet = false } = {}) {
+  if (endStationEl?.value) return true;
+  const stationPoints = captureState.points.filter((p) => p.stationId);
+  if (stationPoints.length < 2) return false;
+  const last = stationPoints.at(-1);
+  if (!last?.stationId) return false;
+  if (last.source === 'station' && stationPoints.length === 1) return false;
+
+  // Promote last station waypoint to end (giữ tọa độ đã có trên path).
+  if (last.source === 'station-via' || last.source === 'station') {
+    last.source = 'station-end';
+  }
+  setStationComboValue('end', last.stationId, { emitChange: false });
+  syncEndStationDisplay();
+  updateStopChainPreview();
+  if (!quiet) {
+    captureStatusEl.textContent = `Đã lấy bến cuối: ${last.label || last.stationId}.`;
+  }
+  // Rebuild markers to refresh end styling.
+  rebuildCaptureMarkers();
+  return true;
+}
+
+function rebuildCaptureMarkers() {
+  for (const marker of captureMarkers) marker.remove();
+  captureMarkers.length = 0;
+  captureState.points.forEach((point, index) => {
+    const marker = L.marker([point.lat, point.lng], {
+      icon: capturePointIcon(index + 1, point.source),
+    }).addTo(map);
+    if (point.label) marker.bindTooltip(point.label, { direction: 'top', offset: [0, -10] });
+    captureMarkers.push(marker);
+  });
+  renderCaptureLine();
+  renderCaptureState();
+}
+
+function addViaStation(station) {
+  const last = captureState.points.at(-1);
+  if (last?.stationId && String(last.stationId) === String(station.stationId)) {
+    captureStatusEl.textContent = 'Bến này vừa được gắn — chọn bến khác, hoặc click lại bến đầu để đóng vòng sightseeing.';
+    return;
+  }
+  captureState.enabled = true;
+  captureState.finished = false;
+  const lat = Number(station.lat);
+  const lng = Number(station.lng);
+  // Luôn nối thẳng tới tọa độ bến (không bỏ qua dù điểm trước gần bến).
+  addCapturePoint({ lat, lng }, {
+    source: 'station-via',
+    label: station.stationName,
+    stationId: station.stationId,
+  });
+  map.panTo([lat, lng], { animate: true });
+  updateRouteTypeHint();
+  captureStatusEl.textContent = `Đã nối tới: ${station.stationName}. Vẽ tiếp hoặc double-click bến cuối / click lại bến đầu để đóng vòng.`;
+}
+
+function closeAsEndStation(station) {
+  const start = captureState.points[0];
+  const isLoop = Boolean(start?.stationId && String(start.stationId) === String(station.stationId));
+  if (isLoop && captureState.points.length < 2) {
+    captureStatusEl.textContent = 'Vòng sightseeing: vẽ đường hoặc thêm bến giữa trước, rồi click lại cùng bến đầu để đóng.';
+    return;
+  }
+  captureState.enabled = true;
+  captureState.finished = false;
+  setStationComboValue('end', station.stationId, { emitChange: false });
+  seedToEndStation();
 }
 
 function seedFromStation() {
   const station = getSelectedStation();
   if (!station) {
-    captureStatusEl.textContent = 'Chon ben xuat phat truoc.';
+    captureStatusEl.textContent = 'Chọn bến xuất phát trước.';
     return;
   }
   clearCapturePoints();
@@ -563,47 +904,93 @@ function seedFromStation() {
   });
   captureState.enabled = true;
   map.setView([station.lat, station.lng], Math.max(map.getZoom(), 16), { animate: true });
-  captureStatusEl.textContent = `Điểm 1: ${station.stationName}. Vẽ đường rồi click bến cuối trên map.`;
+  captureStatusEl.textContent = `Điểm 1: ${station.stationName}. Click bến khác để nối, hoặc vẽ tay rồi click lại bến này để đóng vòng.`;
   maybeFillRouteCode();
+  updateRouteTypeHint();
   renderCaptureState();
 }
 
 function seedToEndStation() {
   const endStation = getSelectedEndStation();
   if (!endStation) {
-    captureStatusEl.textContent = 'Chon ben ket thuc truoc.';
+    captureStatusEl.textContent = 'Chọn bến kết thúc trên map.';
     return;
   }
   if (!captureState.points.length) {
-    captureStatusEl.textContent = 'Can ben xuat phat truoc.';
+    captureStatusEl.textContent = 'Cần bến xuất phát trước.';
     return;
   }
-  const last = captureState.points.at(-1);
-  if (last?.stationId === endStation.stationId) {
-    captureStatusEl.textContent = 'Ben ket thuc trung ben cuoi.';
+  const start = captureState.points[0];
+  const isLoop = Boolean(start?.stationId && String(start.stationId) === String(endStation.stationId));
+  if (isLoop && captureState.points.length < 2) {
+    captureStatusEl.textContent = 'Vòng sightseeing: hãy vẽ đường vòng trước, rồi click lại cùng bến để đóng.';
+    setStationComboValue('end', '', { emitChange: false });
+    updateRouteTypeHint();
     return;
   }
+
+  const endLat = Number(endStation.lat);
+  const endLng = Number(endStation.lng);
+  let last = captureState.points.at(-1);
+
+  // Đã có điểm cuối đúng bến → chỉ sync tọa độ.
+  if (last?.source === 'station-end' && String(last.stationId) === String(endStation.stationId)) {
+    last.lat = endLat;
+    last.lng = endLng;
+    last.label = endStation.stationName;
+    rebuildCaptureMarkers();
+    updateRouteTypeHint();
+    captureStatusEl.textContent = isLoop
+      ? `Đã đóng vòng tại ${endStation.stationName}.`
+      : `Đã gắn bến kết thúc: ${endStation.stationName}.`;
+    return;
+  }
+
+  // Đổi bến cuối khác → bỏ điểm end cũ.
   if (last?.source === 'station-end') {
     captureState.points.pop();
     const marker = captureMarkers.pop();
     if (marker) marker.remove();
+    last = captureState.points.at(-1);
   }
-  addCapturePoint({ lat: endStation.lat, lng: endStation.lng }, {
-    source: 'station-end',
-    label: endStation.stationName,
-    stationId: endStation.stationId,
-  });
+
+  // Loop cùng 1 bến: luôn thêm điểm đóng vòng (kể cả khi điểm cuối đã gần bến đầu).
+  // Regular: nối thẳng tới bến cuối.
+  if (
+    !isLoop
+    && last
+    && last.source === 'manual'
+    && Number.isFinite(endLat)
+    && haversineMeters(last, { lat: endLat, lng: endLng }) <= STOP_DETECT_RADIUS_M
+  ) {
+    last.lat = endLat;
+    last.lng = endLng;
+    last.source = 'station-end';
+    last.label = endStation.stationName;
+    last.stationId = endStation.stationId;
+    rebuildCaptureMarkers();
+  } else {
+    addCapturePoint({ lat: endLat, lng: endLng }, {
+      source: 'station-end',
+      label: endStation.stationName,
+      stationId: endStation.stationId,
+    });
+  }
   maybeFillRouteCode();
-  captureStatusEl.textContent = `Da gan ben ket thuc: ${endStation.stationName}.`;
+  updateRouteTypeHint();
+  captureStatusEl.textContent = isLoop
+    ? `Đã nối đóng vòng sightseeing về ${endStation.stationName} (cùng bến đầu).`
+    : `Đã nối tới bến kết thúc: ${endStation.stationName}.`;
   renderCaptureState();
 }
 
 function maybeFillRouteCode() {
   const start = captureState.points[0];
   const end = captureState.points.at(-1);
-  if (!start?.label || !end?.label || start === end) return;
+  if (!start?.label || !end?.label) return;
   if (captureRouteCodeEl.value.trim()) {
     checkRouteCodeDuplicate();
+    updateRouteTypeHint();
     return;
   }
   const abbrev = (name) => String(name || '')
@@ -613,11 +1000,20 @@ function maybeFillRouteCode() {
     .map((w) => w[0])
     .join('')
     .toUpperCase();
-  captureRouteCodeEl.value = `${abbrev(start.label)}-${abbrev(end.label)}`;
-  if (!captureRouteNameEl.value.trim()) {
-    captureRouteNameEl.value = `${start.label} - ${end.label}`;
+  const isLoop = Boolean(start.stationId && end.stationId && String(start.stationId) === String(end.stationId));
+  if (isLoop) {
+    captureRouteCodeEl.value = `LOOP-${abbrev(start.label)}`;
+    if (!captureRouteNameEl.value.trim()) {
+      captureRouteNameEl.value = `${start.label} · Vòng sightseeing`;
+    }
+  } else if (start !== end) {
+    captureRouteCodeEl.value = `${abbrev(start.label)}-${abbrev(end.label)}`;
+    if (!captureRouteNameEl.value.trim()) {
+      captureRouteNameEl.value = `${start.label} - ${end.label}`;
+    }
   }
   checkRouteCodeDuplicate();
+  updateRouteTypeHint();
 }
 
 function addCapturePoint(latlng, meta = {}) {
@@ -637,13 +1033,20 @@ function addCapturePoint(latlng, meta = {}) {
   captureMarkers.push(marker);
   renderCaptureLine();
   renderCaptureState();
+  updateRouteTypeHint();
 }
 
 function capturePointIcon(index, source) {
-  const isStation = source === 'station' || source === 'station-end';
+  const roleClass = source === 'station-end'
+    ? ' is-station is-end'
+    : source === 'station-via'
+      ? ' is-station is-via'
+      : source === 'station'
+        ? ' is-station'
+        : '';
   return L.divIcon({
     className: '',
-    html: `<div class="capture-point-marker${isStation ? ' is-station' : ''}">${index}</div>`,
+    html: `<div class="capture-point-marker${roleClass}">${index}</div>`,
     iconSize: [24, 24],
     iconAnchor: [12, 12],
   });
@@ -720,7 +1123,51 @@ function catmullRomPoint(p0, p1, p2, p3, t) {
 
 function getPathCoordinates() {
   const expanded = expandPath(captureState.points);
-  return expanded.length >= 2 ? expanded : captureState.points.map(({ lat, lng }) => ({ lat, lng }));
+  const base = expanded.length >= 2
+    ? expanded
+    : captureState.points.map(({ lat, lng }) => ({ lat, lng }));
+  // Chỉ snap đầu/cuối vào bến — không kéo bến giữa vào polyline (tránh gấp khúc).
+  return snapCoordinatesToEndpoints(base, collectOrderedStopsFromClicks());
+}
+
+/** Chỉ ép điểm đầu + điểm cuối đúng tọa độ station đã chọn. */
+function snapCoordinatesToEndpoints(coordinates, stops) {
+  if (!Array.isArray(coordinates) || !coordinates.length) return [];
+  const path = coordinates.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+  const usable = (stops || []).filter((s) => (
+    s && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
+  ));
+  if (!usable.length) return path;
+  const start = usable[0];
+  path[0] = { lat: Number(start.lat), lng: Number(start.lng) };
+  if (usable.length >= 2) {
+    const end = usable.at(-1);
+    path[path.length - 1] = { lat: Number(end.lat), lng: Number(end.lng) };
+  }
+  return path;
+}
+
+/** Ép polyline đi qua stop (server / save). Giữ API cũ nếu cần. */
+function snapCoordinatesToStops(coordinates, stops, radiusM = STOP_DETECT_RADIUS_M) {
+  return snapCoordinatesToEndpoints(coordinates, stops);
+}
+
+function syncCapturePointsToStationCoords() {
+  let changed = false;
+  for (const point of captureState.points) {
+    if (!point.stationId) continue;
+    const station = findStationInCatalog(point.stationId);
+    if (!station) continue;
+    const lat = Number(station.lat);
+    const lng = Number(station.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    if (point.lat !== lat || point.lng !== lng) {
+      point.lat = lat;
+      point.lng = lng;
+      changed = true;
+    }
+  }
+  if (changed) rebuildCaptureMarkers();
 }
 
 function renderCaptureLine() {
@@ -739,6 +1186,7 @@ function renderCaptureLine() {
       interactive: false,
     },
   ).addTo(map);
+  updateStopChainPreview();
 }
 
 function undoCapturePoint() {
@@ -913,9 +1361,10 @@ function updateDrawStats() {
   const formulaEl = document.querySelector('#estimateFormula');
   if (formulaEl) {
     formulaEl.textContent = meters > 0
-      ? `(${km.toFixed(3)} km ÷ ${speed} km/h chạy) × 60 = ${minutesExact.toFixed(2)} phút`
-      : 'phút = (km ÷ tốc độ chạy) × 60 · tốc độ ≤ max đăng ký';
+      ? `(${km.toFixed(3)} km ÷ ${speed} km/h chạy) × 60 = ${minutesExact.toFixed(2)} phút · từng đoạn A→B tính riêng`
+      : 'phút = (km ÷ tốc độ chạy) × 60 · mỗi đoạn A→B tính riêng';
   }
+  updateStopChainPreview();
 }
 
 async function saveCapturedRoute() {
@@ -939,8 +1388,7 @@ async function saveCapturedRoute() {
         routeName,
         boatCode: collectorBoatCodeEl.value.trim() || null,
         averageSpeedKmh: getSurveySpeedKmh(),
-        startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
-        endStationId: endStationEl.value || captureState.points.at(-1)?.stationId || null,
+        ...surveySaveFields(),
         coordinates: getPathCoordinates(),
       }),
     });
@@ -989,6 +1437,13 @@ async function startRecording() {
   }
   if (!captureState.finished) {
     finishDraw();
+  } else {
+    ensureEndStationFromPath();
+  }
+
+  if (!ensureEndStationFromPath({ quiet: true }) && !endStationEl?.value) {
+    captureStatusEl.textContent = 'Cần bến cuối: double-click bến đích hoặc thêm ≥2 bến rồi bấm Xong.';
+    return;
   }
 
   const sendIntervalMs = clampNumber(Number(sendIntervalSecEl.value || 5), 3, 10) * 1000;
@@ -1026,8 +1481,7 @@ async function startRecording() {
         sendToTarget: true,
         recording: true,
         isNewRouteSurvey: true,
-        startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
-        endStationId: endStationEl.value || captureState.points.at(-1)?.stationId || null,
+        ...surveySaveFields(),
         coordinates: plannedCoords,
       }),
     });
@@ -1117,8 +1571,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
         description: 'Captured from GPS recording session',
         status: 'Active',
         averageSpeedKmh: getSurveySpeedKmh(),
-        startStationId: startStationEl.value || null,
-        endStationId: endStationEl.value || null,
+        ...surveySaveFields(),
       }),
     });
     const body = await response.json();
@@ -1230,10 +1683,20 @@ function renderRouteResult(body) {
   const distance = body.baseDistanceKm ?? body.distanceKm;
   const duration = body.estimatedDurationMin;
   const stops = Array.isArray(body.stops) ? body.stops : [];
-  const stopLines = stops.map((stop) => {
-    const travel = stop.standardTravelMin != null ? ` · ${stop.standardTravelMin} phút` : '';
-    return `<li><strong>${escapeHtml(stop.stationName || stop.stationCode || `Bến ${stop.stopOrder}`)}</strong> (#${stop.stopOrder}${travel})</li>`;
-  }).join('');
+  const stopLines = stops
+    .slice()
+    .sort((a, b) => Number(a.stopOrder) - Number(b.stopOrder))
+    .map((stop, index, arr) => {
+      const order = Number(stop.stopOrder) || index + 1;
+      const code = stop.stationCode ? ` (${stop.stationCode})` : '';
+      const prev = arr[index - 1];
+      const segment = index > 0
+        ? (stop.standardTravelMin != null
+          ? `<div class="route-result-seg">← ${stop.standardTravelMin} phút${stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : ''} trên đường GPS từ ${escapeHtml(prev?.stationName || prev?.stationCode || `bến ${order - 1}`)}</div>`
+          : `<div class="route-result-seg is-missing">← chưa đo được đoạn (đường không nối qua bến này)</div>`)
+        : '';
+      return `<li><strong>#${order}</strong> ${escapeHtml(stop.stationName || stop.stationCode || `Bến ${order}`)}${escapeHtml(code)}${segment}</li>`;
+    }).join('');
 
   routeResultEl.innerHTML = `
     <div class="route-result-head">
@@ -1241,11 +1704,14 @@ function renderRouteResult(body) {
       <span>${escapeHtml(body.routeCode || '')}</span>
     </div>
     <div class="route-result-meta">
+      <span>Loại: <b>${escapeHtml(body.routeType || getSurveyRouteType())}</b></span>
       <span>Quãng đường: <b>${distance != null ? `${distance} km` : '?'}</b></span>
       <span>Thời gian ước tính: <b>${duration != null ? `${duration} phút` : '?'}</b></span>
       <span>Số bến: <b>${stops.length}</b></span>
     </div>
-    ${stops.length ? `<ul class="route-result-stops">${stopLines}</ul>` : '<p class="meta">Chưa có station trong route_stops.</p>'}
+    ${stops.length
+      ? `<div class="route-result-stops-title">Thứ tự bến đã đẩy lên BE</div><ol class="route-result-stops">${stopLines}</ol>`
+      : '<p class="meta">Chưa có station trong route_stops — kiểm tra payload stops[] gửi BE.</p>'}
   `;
   routeResultEl.classList.remove('hidden');
 }
@@ -1596,6 +2062,35 @@ function boatIcon(heading) {
   });
 }
 
+function applySavedRoutesVisibility() {
+  for (const layer of routeLayers.values()) {
+    if (showSavedRoutes) {
+      if (!map.hasLayer(layer)) layer.addTo(map);
+    } else if (map.hasLayer(layer)) {
+      map.removeLayer(layer);
+    }
+  }
+  if (!showSavedRoutes) {
+    clearRouteStopMarkers();
+    if (routeStopsListEl) {
+      routeStopsListEl.classList.add('is-empty');
+      routeStopsListEl.innerHTML = '<li>Đang ẩn tuyến có sẵn — bật lại để xem bến.</li>';
+    }
+  } else if (mapLegendSelectEl?.value) {
+    showSelectedRouteStops(mapLegendSelectEl.value);
+  }
+  if (toggleSavedRoutesEl) {
+    toggleSavedRoutesEl.classList.toggle('is-on', showSavedRoutes);
+    toggleSavedRoutesEl.classList.toggle('is-off', !showSavedRoutes);
+    toggleSavedRoutesEl.textContent = showSavedRoutes ? 'Ẩn tuyến có sẵn' : 'Hiện tuyến có sẵn';
+  }
+}
+
+toggleSavedRoutesEl?.addEventListener('click', () => {
+  showSavedRoutes = !showSavedRoutes;
+  applySavedRoutesVisibility();
+});
+
 function renderRoutes(routes) {
   const seen = new Set();
   const bounds = [];
@@ -1610,12 +2105,15 @@ function renderRoutes(routes) {
     let layer = routeLayers.get(route.routeId);
     const latlngs = (route.coordinates || []).map((p) => [p.lat, p.lng]);
     if (!layer) {
-      layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE }).addTo(map);
+      layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE });
+      if (showSavedRoutes) layer.addTo(map);
       layer.bindTooltip(`${route.routeCode} · ${route.routeName}`);
       routeLayers.set(route.routeId, layer);
     } else {
       layer.setLatLngs(latlngs);
       layer.setStyle({ ...SAVED_ROUTE_STYLE });
+      if (showSavedRoutes && !map.hasLayer(layer)) layer.addTo(map);
+      if (!showSavedRoutes && map.hasLayer(layer)) map.removeLayer(layer);
     }
     for (const p of latlngs) bounds.push(p);
 
@@ -1639,12 +2137,85 @@ function renderRoutes(routes) {
     const stillExists = [...mapLegendSelectEl.options].some((opt) => opt.value === previousValue);
     mapLegendSelectEl.value = stillExists ? previousValue : '';
     updateLegendSwatch();
+    if (showSavedRoutes) showSelectedRouteStops(mapLegendSelectEl.value || '');
+    else applySavedRoutesVisibility();
   }
 
   if (!hasFitInitialRoutes && bounds.length && !recordingActive && !lockedSurveyPath) {
     hasFitInitialRoutes = true;
     map.fitBounds(bounds, { padding: [48, 48] });
   }
+}
+
+function clearRouteStopMarkers() {
+  if (routeStopMarkersLayer) {
+    routeStopMarkersLayer.clearLayers();
+  }
+  selectedRouteStops = [];
+}
+
+function routeStopIcon(order, { isFirst = false, isLast = false } = {}) {
+  const role = isFirst ? ' is-first' : (isLast ? ' is-last' : '');
+  return L.divIcon({
+    className: '',
+    html: `<div class="route-stop-marker${role}">${order}</div>`,
+    iconSize: [26, 26],
+    iconAnchor: [13, 13],
+  });
+}
+
+function showSelectedRouteStops(routeId) {
+  clearRouteStopMarkers();
+  if (!routeStopsListEl) return;
+
+  if (!routeId) {
+    routeStopsListEl.classList.add('is-empty');
+    routeStopsListEl.innerHTML = '<li>Chọn tuyến để xem chuỗi bến đã lưu.</li>';
+    return;
+  }
+
+  const route = (latest?.routes || []).find((r) => String(r.routeId) === String(routeId));
+  const stops = Array.isArray(route?.stops)
+    ? [...route.stops].sort((a, b) => Number(a.stopOrder) - Number(b.stopOrder))
+    : [];
+  selectedRouteStops = stops;
+
+  if (!stops.length) {
+    routeStopsListEl.classList.add('is-empty');
+    routeStopsListEl.innerHTML = '<li>Tuyến này chưa có stops từ BE/DB.</li>';
+    return;
+  }
+
+  routeStopsListEl.classList.remove('is-empty');
+  routeStopsListEl.innerHTML = stops.map((stop, index) => {
+    const order = Number(stop.stopOrder) || index + 1;
+    const name = stop.stationName || stop.stationCode || stop.stationId || `Bến ${order}`;
+    const code = stop.stationCode ? ` (${stop.stationCode})` : '';
+    const travel = stop.standardTravelMin != null ? ` · ${stop.standardTravelMin} phút` : '';
+    return `<li><b>#${order}</b>${escapeHtml(name)}${escapeHtml(code)}${travel}</li>`;
+  }).join('');
+
+  if (!routeStopMarkersLayer) {
+    routeStopMarkersLayer = L.layerGroup().addTo(map);
+  }
+  stops.forEach((stop, index) => {
+    const lat = Number(stop.lat);
+    const lng = Number(stop.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    const order = Number(stop.stopOrder) || index + 1;
+    const marker = L.marker([lat, lng], {
+      icon: routeStopIcon(order, {
+        isFirst: index === 0,
+        isLast: index === stops.length - 1,
+      }),
+      zIndexOffset: 500,
+    });
+    marker.bindTooltip(
+      `#${order} · ${stop.stationName || stop.stationCode || stop.stationId}`,
+      { direction: 'top', offset: [0, -10] },
+    );
+    routeStopMarkersLayer.addLayer(marker);
+  });
 }
 
 function updateLegendSwatch() {
@@ -1659,11 +2230,23 @@ function updateLegendSwatch() {
 mapLegendSelectEl?.addEventListener('change', () => {
   updateLegendSwatch();
   const routeId = mapLegendSelectEl.value;
+  if (!showSavedRoutes) {
+    showSavedRoutes = true;
+    applySavedRoutesVisibility();
+  }
+  showSelectedRouteStops(routeId);
   if (!routeId) return;
   const layer = routeLayers.get(routeId);
   if (!layer) return;
   try {
-    map.fitBounds(layer.getBounds(), { padding: [40, 40], maxZoom: 16 });
+    const stopBounds = selectedRouteStops
+      .filter((s) => Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)))
+      .map((s) => [Number(s.lat), Number(s.lng)]);
+    if (stopBounds.length >= 2) {
+      map.fitBounds(stopBounds, { padding: [48, 48], maxZoom: 16 });
+    } else {
+      map.fitBounds(layer.getBounds(), { padding: [40, 40], maxZoom: 16 });
+    }
   } catch {
     // ignore
   }
@@ -1685,7 +2268,17 @@ function renderStations(stations) {
         direction: 'top',
         offset: [0, -28],
       });
-      layer.on('click', () => handleStationClick(station));
+      layer.on('click', (event) => {
+        if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+        handleStationClick(station);
+      });
+      layer.on('dblclick', (event) => {
+        if (event.originalEvent) {
+          L.DomEvent.stopPropagation(event.originalEvent);
+          L.DomEvent.preventDefault(event.originalEvent);
+        }
+        handleStationDoubleClick(station);
+      });
       stationLayers.set(station.stationId, layer);
     } else {
       layer.setIcon(icon);
@@ -1723,7 +2316,90 @@ function handleStationClick(station) {
     setStationComboValue('start', station.stationId);
     return;
   }
-  setStationComboValue('end', station.stationId);
+
+  const startId = captureState.points[0]?.stationId;
+  const isSameAsStart = startId && String(station.stationId) === String(startId);
+
+  // Click lại bến đầu khi đã có đường → đóng vòng sightseeing (cùng 1 bến).
+  if (isSameAsStart && captureState.points.length >= 2) {
+    closeAsEndStation(station);
+    return;
+  }
+  if (isSameAsStart) {
+    captureStatusEl.textContent = 'Cùng bến đầu: hãy vẽ điểm giữa trước, rồi click lại bến này để đóng vòng.';
+    return;
+  }
+
+  // Đã có bến cuối: click bến khác (không phải cuối) = chèn bến giữa trước điểm cuối.
+  if (endStationEl?.value) {
+    // Đang đóng vòng (end === start) mà click bến khác → đổi thành Regular tới bến đó.
+    if (String(endStationEl.value) === String(startId)) {
+      setStationComboValue('end', '', { emitChange: false });
+      // Gỡ điểm đóng vòng cũ nếu có.
+      const last = captureState.points.at(-1);
+      if (last?.source === 'station-end' && String(last.stationId) === String(startId)) {
+        captureState.points.pop();
+        const marker = captureMarkers.pop();
+        if (marker) marker.remove();
+      }
+      addViaStation(station);
+      return;
+    }
+    if (String(station.stationId) === String(endStationEl.value)) {
+      closeAsEndStation(station);
+      return;
+    }
+    insertViaBeforeEnd(station);
+    return;
+  }
+
+  // Mặc định: nối thẳng tới bến này (via). Double-click để đặt làm cuối.
+  addViaStation(station);
+}
+
+function insertViaBeforeEnd(station) {
+  const endId = endStationEl?.value;
+  const startId = captureState.points[0]?.stationId;
+  const endIdx = [...captureState.points]
+    .map((p, i) => ({ p, i }))
+    .reverse()
+    .find((x) => x.p.stationId && String(x.p.stationId) === String(endId))?.i;
+  if (endIdx == null) {
+    addViaStation(station);
+    return;
+  }
+  // Cho phép trùng bến đầu khi loop; chặn trùng bến khác đã có.
+  const dup = captureState.points.some((p, i) => (
+    i !== 0
+    && p.stationId
+    && String(p.stationId) === String(station.stationId)
+    && String(station.stationId) !== String(startId)
+  ));
+  if (dup) {
+    captureStatusEl.textContent = 'Bến này đã có trong lộ trình.';
+    return;
+  }
+  captureState.enabled = true;
+  captureState.finished = false;
+  const point = {
+    lat: Number(station.lat),
+    lng: Number(station.lng),
+    source: 'station-via',
+    label: station.stationName,
+    stationId: station.stationId,
+  };
+  captureState.points.splice(endIdx, 0, point);
+  rebuildCaptureMarkers();
+  updateRouteTypeHint();
+  captureStatusEl.textContent = `Đã chèn bến giữa: ${station.stationName} (trước bến cuối).`;
+}
+
+function handleStationDoubleClick(station) {
+  if (!captureState.points.length || captureState.points[0]?.source !== 'station') {
+    setStationComboValue('start', station.stationId);
+    return;
+  }
+  closeAsEndStation(station);
 }
 
 function formatTime(value) {

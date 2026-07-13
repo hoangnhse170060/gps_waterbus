@@ -45,7 +45,7 @@
           <button id="toolClear" type="button" class="tool-btn danger" title="Xóa đường vẽ" disabled>
             <span>×</span><small>Xóa</small>
           </button>
-          <button id="finishDraw" type="button" class="tool-btn accent" title="Hoàn thành — tự tạo nét cong" disabled>
+          <button id="finishDraw" type="button" class="tool-btn accent" title="Hoàn thành — giữ nét thẳng" disabled>
             <span>✓</span><small>Xong</small>
           </button>
         </div>
@@ -67,6 +67,15 @@
           <div class="legend-keys">
             <span class="legend-key is-saved">Đã lưu · nét liền</span>
             <span class="legend-key is-draft">Đang vẽ/chạy · nét đứt</span>
+          </div>
+          <button id="toggleSavedRoutes" type="button" class="legend-toggle is-on" title="Ẩn/hiện các tuyến đã lưu trên map">
+            Ẩn tuyến có sẵn
+          </button>
+          <div class="route-stops-panel" id="routeStopsPanel">
+            <div class="route-stops-title">Thứ tự bến (từ BE)</div>
+            <ol class="route-stops-list is-empty" id="routeStopsList">
+              <li>Chọn tuyến để xem chuỗi bến đã lưu.</li>
+            </ol>
           </div>
         </div>
       </section>
@@ -132,7 +141,8 @@
                 <span class="station-map-pick-text">Nhấn bến trên map để chọn</span>
               </div>
               <input type="hidden" id="endStation" value="">
-              <small class="field-hint">Không chọn trong list — phải nhấn bến đích trên bản đồ.</small>
+              <div class="stop-chain" id="stopChainPreview">Chưa có chuỗi bến.</div>
+              <small class="field-hint" id="routeTypeHint">Click từng bến muốn dừng. Vẽ nét thẳng — không tự nhận bến đi qua.</small>
             </label>
 
             <div class="route-estimate" id="routeEstimate">
@@ -176,7 +186,7 @@
             <button id="stopCollector" class="secondary" type="button" disabled>Kết thúc &amp; lưu</button>
           </div>
 
-          <p id="captureStatus" class="meta">1) Chọn bến đầu · 2) Vẽ đường · 3) Click bến cuối trên map · 4) Xong · 5) Ghi GPS.</p>
+          <p id="captureStatus" class="meta">1) Bến đầu · 2) Click bến giữa (nếu cần) · 3) Double-click bến cuối · 4) Xong (nét thẳng) · 5) Ghi GPS.</p>
           <p id="collectorStatus" class="meta">Chưa ghi GPS.</p>
           <div class="route-result-card hidden" id="routeResult"></div>
         </section>
