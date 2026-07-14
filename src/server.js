@@ -1030,14 +1030,33 @@ async function saveRouteFromGpsOnTarget(session, body) {
   // (start≠end → route nguồn; start=end → sightseeing loop).
   const inferredLoop = Boolean(startStationId && endStationId && startStationId === endStationId);
 
-  const createReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
+  const wantReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
     && !inferredLoop;
-  if (createReverse) {
+  if (wantReverse) {
+    let reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
+    let reverseName = cleanOptionalText(body.reverseRouteName || session?.reverseRouteName);
+    // BE bắt buộc reverseRouteCode khác routeCode — tự sửa nếu thiếu/trùng.
+    if (!reverseCode || reverseCode.toLowerCase() === String(payload.routeCode).toLowerCase()) {
+      const parts = String(payload.routeCode || '').split('-').map((s) => s.trim()).filter(Boolean);
+      reverseCode = parts.length >= 2
+        ? parts.reverse().join('-')
+        : `${payload.routeCode}-VE`;
+      if (reverseCode.toLowerCase() === String(payload.routeCode).toLowerCase()) {
+        reverseCode = `${payload.routeCode}-VE`;
+      }
+    }
+    if (!reverseName) {
+      const nameParts = String(payload.routeName || '').split(/\s+-\s+/).map((s) => s.trim()).filter(Boolean);
+      reverseName = nameParts.length >= 2
+        ? nameParts.reverse().join(' - ')
+        : `${payload.routeName || payload.routeCode} (chiều về)`;
+    }
     payload.createReverseRoute = true;
-    const reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
-    const reverseName = cleanOptionalText(body.reverseRouteName || session?.reverseRouteName);
-    if (reverseCode) payload.reverseRouteCode = reverseCode;
-    if (reverseName) payload.reverseRouteName = reverseName;
+    payload.reverseRouteCode = reverseCode;
+    payload.reverseRouteName = reverseName;
+    console.log(
+      `[from-gps] reverse → ${reverseCode} (${reverseName}) for ${payload.routeCode}`,
+    );
   }
 
   const detectRadius = Number(env.STOP_DETECT_RADIUS_M || 200);
@@ -1113,7 +1132,27 @@ async function persistRecordingSession(body, sessionInput = null) {
   const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && session?.targetSessionStarted);
 
   if (canTryAzure) {
-    const targetSave = await saveRouteFromGpsOnTarget(session, body);
+    let targetSave = await saveRouteFromGpsOnTarget(session, body);
+    let reverseError = null;
+    // Lỗi khi đang gửi reverse (trùng mã chiều về, …) → thử lại chỉ chiều đi để tuyến chính vẫn lên BE.
+    const wantedReverse = Boolean(body.createReverseRoute || session?.createReverseRoute);
+    if (
+      !targetSave.ok
+      && targetSave.status !== 409
+      && wantedReverse
+    ) {
+      reverseError = targetSave.error || `BE from-gps trả ${targetSave.status}`;
+      console.warn(`[save-route] from-gps failed with reverse (${targetSave.status}): ${reverseError}. Retry without createReverseRoute.`);
+      const retrySave = await saveRouteFromGpsOnTarget(
+        { ...session, createReverseRoute: false, reverseRouteCode: null, reverseRouteName: null },
+        { ...body, createReverseRoute: false, reverseRouteCode: null, reverseRouteName: null },
+      );
+      if (retrySave.ok) {
+        targetSave = retrySave;
+        warning = `Chiều đi đã lên BE; chiều về lỗi: ${reverseError}`;
+      }
+    }
+
     if (targetSave.ok) {
       route = targetSave.data || {};
       const routeId = route.routeId || route.id;
@@ -1150,6 +1189,10 @@ async function persistRecordingSession(body, sessionInput = null) {
       }
       if (route.createReverseRoute == null) {
         route.createReverseRoute = Boolean(targetSave.outboundCreateReverse);
+      }
+      if (warning && !route.reverseRoute) {
+        route.createReverseRoute = false;
+        route.reverseWarning = warning;
       }
       savedTo = 'target';
       state.lastRecordingSession = null;

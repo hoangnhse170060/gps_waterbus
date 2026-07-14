@@ -907,14 +907,44 @@ function surveySaveFields() {
     && (fields.stops?.length || 0) >= 2;
   if (wantReverse) {
     fields.createReverseRoute = true;
-    const reverseCode = reverseRouteCodeEl?.value.trim() || '';
-    const reverseName = reverseRouteNameEl?.value.trim() || '';
-    if (reverseCode) fields.reverseRouteCode = reverseCode;
-    if (reverseName) fields.reverseRouteName = reverseName;
+    // Luôn đảm bảo có mã/tên chiều về hợp lệ trước khi đẩy BE.
+    const ensured = ensureReverseRouteFields();
+    fields.reverseRouteCode = ensured.reverseCode;
+    fields.reverseRouteName = ensured.reverseName;
   } else {
     fields.createReverseRoute = false;
   }
   return fields;
+}
+
+/** Điền / sửa mã chiều về cho khác routeCode và không trùng tuyến local đã biết. */
+function ensureReverseRouteFields() {
+  const main = captureRouteCodeEl?.value.trim() || '';
+  const suggested = suggestReverseFromMain();
+  let reverseCode = reverseRouteCodeEl?.value.trim() || suggested.reverseCode || (main ? `${main}-VE` : '');
+  let reverseName = reverseRouteNameEl?.value.trim() || suggested.reverseName || (main ? `${main} (chiều về)` : '');
+  const used = new Set(
+    (latest?.routes || [])
+      .map((r) => String(r.routeCode || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (main) used.add(main.toLowerCase());
+  if (!reverseCode || used.has(reverseCode.toLowerCase())) {
+    const base = suggested.reverseCode && suggested.reverseCode.toLowerCase() !== main.toLowerCase()
+      ? suggested.reverseCode
+      : (main ? `${main}-VE` : 'REV');
+    reverseCode = base;
+    let n = 2;
+    while (used.has(reverseCode.toLowerCase())) {
+      reverseCode = `${base}${n}`;
+      n += 1;
+    }
+  }
+  if (reverseRouteCodeEl) reverseRouteCodeEl.value = reverseCode;
+  if (reverseRouteNameEl && !reverseRouteNameEl.value.trim()) reverseRouteNameEl.value = reverseName;
+  reverseName = reverseRouteNameEl?.value.trim() || reverseName;
+  validateReverseRouteCode();
+  return { reverseCode, reverseName };
 }
 
 function suggestReverseFromMain() {
@@ -1999,9 +2029,11 @@ function renderRouteResult(body) {
         <span>${escapeHtml(body.reverseRoute.routeName || '')}</span>
         <span>id: ${escapeHtml(body.reverseRoute.routeId || body.reverseRoute.id || '')}</span>
       </div>`
-      : (body.createReverseRoute
-        ? '<p class="meta">Đã gửi createReverseRoute nhưng BE chưa trả reverseRoute.</p>'
-        : '')}
+      : (body.reverseWarning || body.warning
+        ? `<p class="meta is-error">${escapeHtml(body.reverseWarning || body.warning)}</p>`
+        : (body.createReverseRoute
+          ? '<p class="meta">Đã gửi createReverseRoute nhưng BE chưa trả reverseRoute.</p>'
+          : ''))}
     <p class="meta"><a href="/api-log.html">Xem log API đẩy BE →</a></p>
   `;
   routeResultEl.classList.remove('hidden');

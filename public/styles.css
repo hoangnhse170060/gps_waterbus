@@ -720,6 +720,11 @@ button.secondary:hover,
   color: var(--red);
 }
 
+.meta.is-error {
+  color: var(--red);
+  font-weight: 600;
+}
+
 .field-hint.is-ok {
   color: var(--brand-strong);
 }
