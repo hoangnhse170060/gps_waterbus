@@ -334,8 +334,8 @@ function renderHubBoats(hubBoats) {
     const lat = Number(boat.lat);
     const lng = Number(boat.lng);
     if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-    // Vẫn giữ marker tàu đang chọn / vừa thả dù hub báo offline.
-    if (boat.isOnline === false && code !== selected && !pinnedFor(code)) continue;
+    // Hiện cả offline = last known từ Azure (để vào lại vẫn đúng chỗ đã gửi).
+    const offline = boat.isOnline === false;
     seen.add(code);
 
     const isSelected = code === selected;
@@ -349,8 +349,9 @@ function renderHubBoats(hubBoats) {
     const tip = [
       code,
       boat.boatName || '',
-      Number.isFinite(Number(boat.speedKmh)) ? `${boat.speedKmh} km/h` : '',
-      isSelected ? (dragging ? 'đang kéo' : (pin ? 'đã thả · giữ vị trí' : 'kéo được')) : 'live',
+      offline ? 'offline · vị trí đã lưu' : '',
+      Number.isFinite(Number(boat.speedKmh)) && !offline ? `${boat.speedKmh} km/h` : '',
+      isSelected ? (dragging ? 'đang kéo' : (pin ? 'đã thả · giữ vị trí' : 'kéo được')) : (offline ? '' : 'live'),
     ].filter(Boolean).join(' · ');
 
     if (!marker) {
@@ -359,6 +360,7 @@ function renderHubBoats(hubBoats) {
         draggable: isSelected,
         zIndexOffset: isSelected ? 1200 : 800,
         autoPan: true,
+        opacity: offline && !isSelected ? 0.75 : 1,
       }).addTo(map);
       marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -20] });
       bindDragHandlers(marker, code);
@@ -372,31 +374,37 @@ function renderHubBoats(hubBoats) {
       marker.setIcon(boatIcon(heading, { drag: isSelected }));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 800);
+      marker.setOpacity(offline && !isSelected ? 0.75 : 1);
       marker.setTooltipContent(tip);
       if (isSelected) bindDragHandlers(marker, code);
     }
   }
 
-  // Tàu đang chọn / vừa pin nhưng hub offline → giữ marker tại chỗ thả (không tạo lại giữa map).
+  // Tàu đang chọn / vừa pin nhưng chưa có trong hub → giữ marker tại chỗ thả (không nhảy center).
   if (selected && !seen.has(selected)) {
     const pin = pinnedFor(selected);
     let marker = hubMarkers.get(selected);
-    if (!marker) {
-      const center = pin || map.getCenter();
-      const lat = Number(center.lat);
-      const lng = Number(center.lng);
-      marker = L.marker([lat, lng], {
+    if (!marker && pin) {
+      marker = L.marker([pin.lat, pin.lng], {
         icon: boatIcon(0, { drag: true }),
         draggable: true,
         zIndexOffset: 1200,
       }).addTo(map);
-      marker.bindTooltip(
-        pin ? `${selected} · đã thả · giữ vị trí` : `${selected} · kéo tới bến`,
-        { permanent: true, direction: 'top', offset: [0, -20] },
-      );
+      marker.bindTooltip(`${selected} · đã thả · giữ vị trí`, { permanent: true, direction: 'top', offset: [0, -20] });
       bindDragHandlers(marker, selected);
       hubMarkers.set(selected, marker);
-      coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+      coordStatusEl.textContent = `${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`;
+    } else if (!marker) {
+      const center = map.getCenter();
+      marker = L.marker(center, {
+        icon: boatIcon(0, { drag: true }),
+        draggable: true,
+        zIndexOffset: 1200,
+      }).addTo(map);
+      marker.bindTooltip(`${selected} · kéo tới bến`, { permanent: true, direction: 'top', offset: [0, -20] });
+      bindDragHandlers(marker, selected);
+      hubMarkers.set(selected, marker);
+      coordStatusEl.textContent = `${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}`;
     }
     seen.add(selected);
   }
