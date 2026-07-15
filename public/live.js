@@ -46,10 +46,14 @@ const sendNowBtn = document.querySelector('#sendNowBtn');
 const incidentBtn = document.querySelector('#incidentBtn');
 const refreshBtn = document.querySelector('#refreshBtn');
 const toastHost = document.querySelector('#toastHost');
+const boatContextMenuEl = document.querySelector('#boatContextMenu');
+const boatCtxTitleEl = document.querySelector('#boatCtxTitle');
+const boatCtxDragBtn = document.querySelector('#boatCtxDrag');
 
 let latest = null;
 let eventsSource = null;
 let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
+let contextMenuBoatCode = '';
 let sending = false;
 let dragging = false;
 let hasFitRoutes = false;
@@ -739,7 +743,7 @@ function renderHubBoats(hubBoats) {
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 700 + index);
       marker.setPopupContent(popupHtml);
-      if (isSelected) bindDragHandlers(marker, code);
+      bindDragHandlers(marker, code);
       if (openPopupCode.has(code) && !marker.isPopupOpen()) marker.openPopup();
     }
   }
@@ -774,12 +778,58 @@ function renderHubBoats(hubBoats) {
   syncBoatControls();
 }
 
+function hideBoatContextMenu() {
+  if (!boatContextMenuEl) return;
+  boatContextMenuEl.hidden = true;
+  contextMenuBoatCode = '';
+}
+
+function showBoatContextMenu(code, clientX, clientY) {
+  if (!boatContextMenuEl) return;
+  contextMenuBoatCode = code;
+  if (boatCtxTitleEl) boatCtxTitleEl.textContent = boatDisplayName(code) || code;
+  boatContextMenuEl.hidden = false;
+  const pad = 8;
+  const { offsetWidth: w, offsetHeight: h } = boatContextMenuEl;
+  const x = Math.min(Math.max(pad, clientX), window.innerWidth - w - pad);
+  const y = Math.min(Math.max(pad, clientY), window.innerHeight - h - pad);
+  boatContextMenuEl.style.left = `${x}px`;
+  boatContextMenuEl.style.top = `${y}px`;
+}
+
+function selectBoatForDrag(code, { toastMessage = true } = {}) {
+  const key = String(code || '').trim();
+  if (!key) return;
+  selectedBoatCode = key;
+  localStorage.setItem('liveGpsBoatCode', key);
+  if (boatSelectEl) boatSelectEl.value = key;
+  updateDeviceHint();
+  syncBoatControls();
+  if (latest) renderHubBoats(latest.hubBoats);
+  const marker = hubMarkers.get(key);
+  if (marker) {
+    marker.dragging?.enable?.();
+    marker.setZIndexOffset(1200);
+    bindDragHandlers(marker, key);
+    map.panTo(marker.getLatLng(), { animate: true });
+  }
+  if (toastMessage) toast(`${boatDisplayName(key)} — kéo để di chuyển`, 'ok');
+}
+
 function bindDragHandlers(marker, code) {
   marker.off('dragstart');
   marker.off('drag');
   marker.off('dragend');
+  marker.off('contextmenu');
+  marker.on('contextmenu', (event) => {
+    L.DomEvent.preventDefault(event);
+    L.DomEvent.stop(event);
+    const oe = event.originalEvent || event;
+    showBoatContextMenu(code, oe.clientX, oe.clientY);
+  });
   marker.on('dragstart', () => {
     if (code !== selectedBoatCode) return;
+    hideBoatContextMenu();
     dragging = true;
   });
   marker.on('drag', () => {
@@ -945,6 +995,7 @@ function connectEvents() {
 }
 
 boatSelectEl.addEventListener('change', () => {
+  hideBoatContextMenu();
   selectedBoatCode = boatSelectEl.value.trim();
   if (selectedBoatCode) localStorage.setItem('liveGpsBoatCode', selectedBoatCode);
   else localStorage.removeItem('liveGpsBoatCode');
@@ -956,6 +1007,26 @@ boatSelectEl.addEventListener('change', () => {
     map.panTo(marker.getLatLng(), { animate: true });
   }
 });
+
+boatCtxDragBtn?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  const code = contextMenuBoatCode;
+  hideBoatContextMenu();
+  if (code) selectBoatForDrag(code);
+});
+
+document.addEventListener('click', (event) => {
+  if (!boatContextMenuEl || boatContextMenuEl.hidden) return;
+  if (boatContextMenuEl.contains(event.target)) return;
+  hideBoatContextMenu();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') hideBoatContextMenu();
+});
+
+map.on('movestart zoomstart click contextmenu', hideBoatContextMenu);
 
 speedInputEl?.addEventListener('change', () => {
   if (!selectedBoatCode) return;

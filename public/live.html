@@ -14,6 +14,10 @@
   </head>
   <body class="live-page">
     <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
+    <div id="boatContextMenu" class="live-ctx-menu" hidden>
+      <p class="live-ctx-title" id="boatCtxTitle">Tàu</p>
+      <button type="button" id="boatCtxDrag">Kéo tàu này</button>
+    </div>
 
     <div class="live-shell">
       <div id="map" class="live-map"></div>
@@ -22,7 +26,7 @@
         <header class="live-brand">
           <p class="live-eyebrow">Saigon Waterbus</p>
           <h1>Live GPS</h1>
-          <p class="live-lead">Click tàu để xem tên. Chấm xanh = tín hiệu. Heartbeat GPS liên tục; kéo tàu chọn để đổi vị trí.</p>
+          <p class="live-lead">Click tàu xem tên. Chuột phải → Kéo tàu này. Chấm xanh = tín hiệu.</p>
         </header>
 
         <nav class="live-nav">
