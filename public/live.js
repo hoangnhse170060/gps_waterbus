@@ -168,21 +168,31 @@ function toast(message, type = 'ok', ms = 3200) {
 }
 
 function catalogBoats(data = latest) {
-  const fromBoats = (data?.boats || []).filter((boat) => (
-    boat.boatCode && !String(boat.boatId || '').startsWith('collector-') && boat.boatId !== 'fallback-boat'
-  ));
-  const byCode = new Map(fromBoats.map((b) => [String(b.boatCode).trim(), b]));
-  const deviceCodes = Object.keys(data?.config?.gpsDevices || {});
-  for (const code of [...deviceCodes, ...FALLBACK_BOAT_CODES]) {
-    const key = String(code).trim();
-    if (!key || byCode.has(key)) continue;
-    byCode.set(key, { boatCode: key, boatName: key, maxSpeedKmh: null });
-  }
-  return [...byCode.values()].sort((a, b) => String(a.boatCode).localeCompare(String(b.boatCode)));
+  // Chỉ tàu Active từ DB — không fallback thêm WB_006/007 gây nhảy dropdown.
+  return (data?.boats || [])
+    .filter((boat) => {
+      if (!boat.boatCode) return false;
+      if (String(boat.boatId || '').startsWith('collector-')) return false;
+      if (boat.boatId === 'fallback-boat') return false;
+      const status = String(boat.dbStatus || boat.status || '').trim().toLowerCase();
+      return !status || status === 'active';
+    })
+    .slice()
+    .sort((a, b) => String(a.boatCode).localeCompare(String(b.boatCode)));
+}
+
+function catalogFingerprint(boats) {
+  return (boats || [])
+    .map((b) => `${b.boatCode}:${b.boatName || ''}:${b.maxSpeedKmh || ''}`)
+    .join('|');
 }
 
 function deviceForBoat(code, data = latest) {
   const mapDevices = data?.config?.gpsDevices || {};
+  if (Array.isArray(mapDevices)) {
+    const hit = mapDevices.find((row) => String(row.boatCode || '') === String(code));
+    return hit?.deviceId || data?.config?.surveyDeviceId || '';
+  }
   return mapDevices[code] || data?.config?.surveyDeviceId || '';
 }
 
@@ -425,9 +435,25 @@ function resolveUniqueSeed(code, lat, lng, occupied) {
   return { lat: outLat, lng: outLng };
 }
 
+let lastBoatOptionsFp = '';
+
 function renderBoatOptions(data) {
   const boats = catalogBoats(data);
+  const fp = catalogFingerprint(boats);
   const previous = selectedBoatCode || boatSelectEl.value;
+
+  // Tránh rebuild options mỗi SSE → dropdown khỏi nhảy.
+  if (fp === lastBoatOptionsFp) {
+    if (previous && boatSelectEl.value !== previous
+      && [...boatSelectEl.options].some((o) => o.value === previous)) {
+      boatSelectEl.value = previous;
+    }
+    updateDeviceHint();
+    syncBoatControls();
+    return;
+  }
+  lastBoatOptionsFp = fp;
+
   boatSelectEl.innerHTML = [
     '<option value="">Chọn tàu...</option>',
     ...boats.map((boat) => {
@@ -440,6 +466,10 @@ function renderBoatOptions(data) {
   if (previous && [...boatSelectEl.options].some((o) => o.value === previous)) {
     boatSelectEl.value = previous;
     selectedBoatCode = previous;
+  } else if (selectedBoatCode && ![...boatSelectEl.options].some((o) => o.value === selectedBoatCode)) {
+    selectedBoatCode = '';
+    localStorage.removeItem('liveGpsBoatCode');
+    boatSelectEl.value = '';
   }
   updateDeviceHint();
   syncBoatControls();
@@ -606,11 +636,15 @@ function renderHubBoats(hubBoats) {
   }
 
   const catalog = catalogBoats();
-  const codes = [...new Set([
-    ...catalog.map((b) => String(b.boatCode).trim()),
-    ...hubByCode.keys(),
-    ...pinnedPositions.keys(),
-  ].filter(Boolean))].sort();
+  const activeCodes = new Set(catalog.map((b) => String(b.boatCode).trim()).filter(Boolean));
+  // Map + dropdown: chỉ tàu Active. Bỏ pin/hub tàu không còn hoạt động.
+  const codes = [...activeCodes].sort();
+
+  // Dọn pin cũ của tàu không active (WB_006/007 giả…).
+  for (const code of [...pinnedPositions.keys()]) {
+    if (!activeCodes.has(code)) pinnedPositions.delete(code);
+  }
+  persistPins();
 
   const occupied = [];
   let index = 0;
