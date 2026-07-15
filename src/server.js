@@ -1030,7 +1030,8 @@ function pushApiCallLog(entry) {
 }
 
 function formatTargetApiError(data, status) {
-  if (!data || typeof data !== 'object') return `BE tra ${status}`;
+  if (data == null || data === '') return `BE tra ${status} (empty body)`;
+  if (typeof data !== 'object') return String(data).slice(0, 300) || `BE tra ${status}`;
   if (data.errors && typeof data.errors === 'object') {
     const parts = Object.entries(data.errors).flatMap(([field, messages]) => {
       const list = Array.isArray(messages) ? messages : [messages];
@@ -1038,7 +1039,16 @@ function formatTargetApiError(data, status) {
     });
     if (parts.length) return parts.join(' | ');
   }
-  return data.error || data.message || data.title || `BE tra ${status}`;
+  if (Array.isArray(data) && data.length) return data.map(String).join(' | ');
+  return data.error || data.message || data.title || data.detail || `BE tra ${status}`;
+}
+
+/** Azure thường bắt standardTravelMin là int ≥ 1. */
+function azureTravelMinutes(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.max(1, Math.round(n));
 }
 
 async function getFromTargetApi(pathname, deviceId) {
@@ -1161,6 +1171,9 @@ async function saveRouteFromGpsOnTarget(session, body) {
     Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16),
     maxSpeed,
   );
+  // BE thường giới hạn tốc độ/phút nguyên — không gửi 200 km/h hay 0.1 phút.
+  const azureMaxSpeed = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
+  const azureSpeedKmh = Math.min(averageSpeedKmh, azureMaxSpeed);
   const coordinates = resolveSurveyPathCoordinates(session, body, averageSpeedKmh);
 
   const payload = {
@@ -1168,7 +1181,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
     routeName: cleanRouteText(body.routeName || session.routeName || body.routeCode || session.routeCode, 'Route name'),
     description: cleanOptionalText(body.description) || 'Captured from GPS recording session',
     status: cleanOptionalText(body.status) || 'Active',
-    averageSpeedKmh,
+    averageSpeedKmh: azureSpeedKmh,
     coordinates,
   };
   if (session.targetSessionStarted && session.sessionId) {
@@ -1231,7 +1244,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
   }));
   if (stops.length) {
     const snapped = snapCoordinatesToStops(coordinates, stops, detectRadius);
-    stops = attachSegmentTravelMinutes(snapped, stops, averageSpeedKmh).map((stop) => ({
+    stops = attachSegmentTravelMinutes(snapped, stops, azureSpeedKmh).map((stop) => ({
       stationId: stop.stationId,
       stationCode: stop.stationCode || null,
       stationName: stop.stationName || null,
@@ -1240,24 +1253,24 @@ async function saveRouteFromGpsOnTarget(session, body) {
       lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
       isPickupAllowed: stop.isPickupAllowed !== false,
       isDropoffAllowed: stop.isDropoffAllowed !== false,
-      standardTravelMin: stop.standardTravelMin == null ? null : Number(stop.standardTravelMin),
+      standardTravelMin: azureTravelMinutes(stop.standardTravelMin),
       segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
     }));
     payload.stops = stops;
     payload.coordinates = snapped.map((point, index) => ({
       lat: round(Number(point.lat), 7),
       lng: round(Number(point.lng), 7),
-      speedKmh: averageSpeedKmh,
+      speedKmh: azureSpeedKmh,
       sequence: index + 1,
       recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
     }));
     const segmentTotal = sumTravelMinutes(stops);
-    if (segmentTotal > 0) {
-      // BE thường nhận int; từng đoạn vẫn giữ 1 số thập phân trong stops[].
-      payload.estimatedDurationMin = Math.max(1, Math.round(segmentTotal));
-    }
+    payload.estimatedDurationMin = Math.max(
+      1,
+      Math.round(segmentTotal || ((routeLength(snapped) / 1000 / azureSpeedKmh) * 60)),
+    );
     console.log(
-      `[from-gps] ${payload.routeCode} segments:`,
+      `[from-gps] ${payload.routeCode} azureSpeed=${azureSpeedKmh} segments:`,
       stops.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
     );
   }
