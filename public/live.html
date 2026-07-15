@@ -40,15 +40,9 @@
         </label>
 
         <label class="live-field">
-          <span>Trạng thái tàu</span>
-          <select id="phaseSelect" disabled>
-            <option value="prepare">Chuẩn bị đi</option>
-            <option value="departing">Bắt đầu đi</option>
-            <option value="enroute">Đang đi / ETA bến</option>
-            <option value="approaching">Sắp cập bến</option>
-            <option value="arrived">Đã cập bến</option>
-            <option value="incident">Sự cố — dừng</option>
-          </select>
+          <span>Vận tốc (km/h)</span>
+          <input id="speedInput" type="number" min="0" max="80" step="1" value="16" disabled>
+          <small class="live-hint">Mặc định 16 — nhập để tăng/giảm tốc tàu đang chọn (trạng thái do vị trí tàu tự báo).</small>
         </label>
 
         <label class="live-field live-toggle">
@@ -86,7 +80,7 @@
         </section>
 
         <p id="liveHelp" class="live-help">
-          Click marker để xem tên · chấm xanh/đỏ = tín hiệu/sự cố · GPS tự gửi mỗi 5s cho mọi tàu.
+          Trạng thái do vị trí tàu · tốc độ mặc định 16 km/h (đổi ở ô vận tốc) · GPS heartbeat 5s.
         </p>
 
         <footer class="live-legend">

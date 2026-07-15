@@ -14,6 +14,8 @@ const WATERBUS_CORRIDOR_CODES = [
 ];
 const STORAGE_PINS = 'liveGpsBoatPins.v1';
 const STORAGE_STATUS = 'liveGpsBoatStatus.v1';
+const STORAGE_SPEEDS = 'liveGpsBoatSpeeds.v1';
+const DEFAULT_SPEED_KMH = 16;
 const FALLBACK_BOAT_CODES = ['WB_001', 'WB_002', 'WB_003', 'WB_004', 'WB_005'];
 
 const PHASES = {
@@ -34,7 +36,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 const boatSelectEl = document.querySelector('#boatSelect');
 const sendAzureSelectEl = document.querySelector('#sendAzureSelect');
-const phaseSelectEl = document.querySelector('#phaseSelect');
+const speedInputEl = document.querySelector('#speedInput');
 const deviceHintEl = document.querySelector('#deviceHint');
 const hubStatusEl = document.querySelector('#hubStatus');
 const sendStatusEl = document.querySelector('#sendStatus');
@@ -56,6 +58,7 @@ let heartbeatTimer = null;
 let heartbeatBusy = false;
 const pinnedPositions = loadJsonMap(STORAGE_PINS);
 const boatStatuses = loadJsonMap(STORAGE_STATUS);
+const boatSpeeds = loadJsonMap(STORAGE_SPEEDS);
 const lastSignalAt = new Map();
 const openPopupCode = new Set();
 
@@ -439,7 +442,7 @@ function renderBoatOptions(data) {
     selectedBoatCode = previous;
   }
   updateDeviceHint();
-  syncPhaseControls();
+  syncBoatControls();
 }
 
 function updateDeviceHint() {
@@ -459,16 +462,31 @@ function updateDeviceHint() {
   }
 }
 
-function syncPhaseControls() {
+function getBoatSpeedKmh(code) {
+  const key = String(code || '').trim();
+  const stored = Number(boatSpeeds.get(key));
+  if (Number.isFinite(stored) && stored >= 0) return Math.min(80, stored);
+  return DEFAULT_SPEED_KMH;
+}
+
+function setBoatSpeedKmh(code, speed) {
+  const key = String(code || '').trim();
+  if (!key) return;
+  const n = Number(speed);
+  const value = Number.isFinite(n) ? Math.max(0, Math.min(80, n)) : DEFAULT_SPEED_KMH;
+  boatSpeeds.set(key, value);
+  persistMap(STORAGE_SPEEDS, boatSpeeds);
+  return value;
+}
+
+function syncBoatControls() {
   const code = selectedBoatCode;
   const disabled = !code;
   if (incidentBtn) incidentBtn.disabled = disabled;
-  if (phaseSelectEl) {
-    phaseSelectEl.disabled = disabled;
-    if (code) {
-      const st = getStatus(code);
-      phaseSelectEl.value = st.incident ? 'incident' : (st.phase || 'prepare');
-    }
+  if (speedInputEl) {
+    speedInputEl.disabled = disabled;
+    if (code) speedInputEl.value = String(getBoatSpeedKmh(code));
+    else speedInputEl.value = String(DEFAULT_SPEED_KMH);
   }
   updateIncidentButton();
 }
@@ -721,7 +739,7 @@ function renderHubBoats(hubBoats) {
 
   centerBoatBtn.disabled = !selected || !hubMarkers.has(selected);
   if (sendNowBtn) sendNowBtn.disabled = !selected || !hubMarkers.has(selected);
-  syncPhaseControls();
+  syncBoatControls();
 }
 
 function bindDragHandlers(marker, code) {
@@ -768,7 +786,10 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
   pinBoatPosition(boatCode, lat, lng, { user: true });
   const st = getStatus(boatCode);
   const phase = autoPhaseForBoat(boatCode, lat, lng);
-  const status = st.incident ? 'idle' : (phase === 'enroute' || phase === 'departing' ? 'moving' : 'idle');
+  const cruise = getBoatSpeedKmh(boatCode);
+  const moving = !st.incident && (phase === 'enroute' || phase === 'departing' || phase === 'approaching');
+  const status = st.incident ? 'idle' : (moving ? 'moving' : 'idle');
+  const speedKmh = st.incident ? 0 : (moving ? cruise : (phase === 'arrived' || phase === 'prepare' ? 0 : cruise));
   const sendToTarget = sendAzureSelectEl.value === 'on';
   try {
     const response = await fetch('/api/live/gps', {
@@ -778,7 +799,7 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
         boatCode,
         lat,
         lng,
-        speedKmh: status === 'moving' ? 12 : 0,
+        speedKmh,
         status,
         sendToTarget,
       }),
@@ -896,7 +917,7 @@ boatSelectEl.addEventListener('change', () => {
   if (selectedBoatCode) localStorage.setItem('liveGpsBoatCode', selectedBoatCode);
   else localStorage.removeItem('liveGpsBoatCode');
   updateDeviceHint();
-  syncPhaseControls();
+  syncBoatControls();
   if (latest) renderHubBoats(latest.hubBoats);
   const marker = hubMarkers.get(selectedBoatCode);
   if (marker) {
@@ -904,17 +925,16 @@ boatSelectEl.addEventListener('change', () => {
   }
 });
 
-phaseSelectEl?.addEventListener('change', () => {
+speedInputEl?.addEventListener('change', () => {
   if (!selectedBoatCode) return;
-  const phase = phaseSelectEl.value;
-  if (phase === 'incident') {
-    setStatus(selectedBoatCode, { phase: 'incident', incident: true });
-  } else {
-    setStatus(selectedBoatCode, { phase, incident: false });
-  }
-  syncPhaseControls();
-  if (latest) renderHubBoats(latest.hubBoats);
-  toast(`${selectedBoatCode}: ${PHASES[phase] || phase}`, phase === 'incident' ? 'warn' : 'ok');
+  const value = setBoatSpeedKmh(selectedBoatCode, speedInputEl.value);
+  speedInputEl.value = String(value);
+  toast(`${boatDisplayName(selectedBoatCode)} · ${value} km/h`, 'ok');
+});
+
+speedInputEl?.addEventListener('input', () => {
+  if (!selectedBoatCode) return;
+  setBoatSpeedKmh(selectedBoatCode, speedInputEl.value);
 });
 
 incidentBtn?.addEventListener('click', () => {
@@ -925,9 +945,9 @@ incidentBtn?.addEventListener('click', () => {
     incident: next,
     phase: next ? 'incident' : 'prepare',
   });
-  syncPhaseControls();
+  syncBoatControls();
   if (latest) renderHubBoats(latest.hubBoats);
-  toast(next ? `${selectedBoatCode}: báo sự cố — dừng` : `${selectedBoatCode}: hết sự cố`, next ? 'warn' : 'ok');
+  toast(next ? `${boatDisplayName(selectedBoatCode)}: báo sự cố` : `${boatDisplayName(selectedBoatCode)}: hết sự cố`, next ? 'warn' : 'ok');
 });
 
 centerBoatBtn.addEventListener('click', () => {
