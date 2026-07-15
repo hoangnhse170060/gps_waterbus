@@ -560,7 +560,9 @@ async function refreshFromDatabase() {
       }
     }
 
-    if ((!boats.length || !routes.length || !state.boats.size) && parseBool(env.USE_FALLBACK_WHEN_EMPTY ?? 'true')) {
+    // Chỉ dùng tàu demo khi DB thật sự KHÔNG có tàu nào.
+    // Route trống không được xóa tàu thật (tránh hiện WB_01 giả).
+    if (!state.boats.size && parseBool(env.USE_FALLBACK_WHEN_EMPTY ?? 'true')) {
       ensureFallbackData();
       state.dbStatus = {
         ok: true,
