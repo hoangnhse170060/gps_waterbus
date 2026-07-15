@@ -688,6 +688,22 @@ function renderOtherBoatDraftLayers() {
 }
 
 function connectSignalRIfConfigured(config = latest?.config) {
+  // Mặc định: server Node nối Azure hub rồi relay qua SSE (tránh CORS Railway→Azure).
+  if (config?.signalrRelay !== false) {
+    const st = config?.signalrStatus;
+    const hub = st?.hubUrl || 'hub';
+    if (st?.connected) {
+      if (!signalrConnectedOnce) {
+        signalrConnectedOnce = true;
+        notifyOk('SignalR relay đã nối Azure /hubs/tracking.');
+      }
+      if (sendLogEl) sendLogEl.textContent = `SignalR relay OK: ${hub}`;
+    } else if (sendLogEl) {
+      sendLogEl.textContent = `SignalR relay: ${st?.lastError || 'đang nối…'} · ${hub}`;
+    }
+    return;
+  }
+
   const hubUrl = String(config?.signalrHubUrl || '').trim();
   if (!hubUrl || typeof signalR === 'undefined') return;
   if (signalrConnection) return;
@@ -725,7 +741,7 @@ function connectSignalRIfConfigured(config = latest?.config) {
       .catch((error) => {
         console.warn('[signalr] connect failed', error.message);
         if (!signalrConnectedOnce) {
-          notifyWarn(`SignalR chưa nối được (${error.message}). BE cần deploy hub /hubs/tracking.`);
+          notifyWarn(`SignalR browser CORS thất bại (${error.message}). Dùng relay SSE.`);
         }
         signalrConnection = null;
       });
@@ -734,6 +750,11 @@ function connectSignalRIfConfigured(config = latest?.config) {
     notifyWarn(`SignalR lỗi: ${error.message}`);
     signalrConnection = null;
   }
+}
+
+function applyHubBoatsFromSnapshot(hubBoats) {
+  if (!Array.isArray(hubBoats)) return;
+  for (const boat of hubBoats) upsertSignalRBoatLocation(boat);
 }
 
 function upsertSignalRBoatLocation(payload) {
@@ -952,6 +973,8 @@ function render(data) {
     renderRoutes(data.routes);
   }
   renderBoats(SHOW_LIVE_BOATS ? data.boats : []);
+  applyHubBoatsFromSnapshot(data.hubBoats);
+  connectSignalRIfConfigured(data.config);
   renderPanelLive(data);
   renderCollector(data.collector, data.lastCollectorSend, data.recordingSession);
   handleAutoSavedRoute(data.lastAutoSavedRoute);
@@ -2624,7 +2647,6 @@ function renderPanelLive(data) {
     senderBadgeEl.classList.toggle('is-live', Boolean(data.config?.senderEnabled));
   }
   updateSenderToggleChip(data);
-  connectSignalRIfConfigured(data.config);
 
   const catalogFp = catalogBoats(data)
     .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.maxSpeedKmh}`)

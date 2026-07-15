@@ -12,6 +12,7 @@
     "health": "curl -s http://127.0.0.1:${PORT:-5177}/api/health"
   },
   "dependencies": {
+    "@microsoft/signalr": "^8.0.7",
     "pg": "^8.22.0"
   }
 }

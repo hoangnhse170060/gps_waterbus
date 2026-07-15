@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { scheduleTravelMinutes, waterbusSchedulePublic } from './waterbus-schedule.js';
+import { createSignalRRelay } from './signalr-relay.js';
 
 const { Pool } = pg;
 
@@ -43,8 +44,39 @@ const state = {
   apiCallLog: [],
   lastAutoSavedRoute: null,
   gpsDevicesByBoatCode: new Map(),
+  hubBoats: new Map(),
+  signalrStatus: {
+    connected: false,
+    hubUrl: '',
+    lastError: null,
+    lastEventAt: null,
+    transport: null,
+  },
   dbStatus: { ok: false, message: 'Not loaded yet', loadedAt: null },
 };
+
+let hubBroadcastTimer = null;
+const signalrRelay = createSignalRRelay({
+  getHubUrl: () => {
+    const configured = cleanOptionalText(env.SIGNALR_HUB_URL);
+    if (configured) return configured;
+    const root = getTargetApiRoot();
+    return root ? `${root}/hubs/tracking` : '';
+  },
+  onBoatLocation: (payload) => {
+    upsertHubBoat(payload);
+    // Gộp broadcast để không flood SSE khi GPS ping dày.
+    if (hubBroadcastTimer) return;
+    hubBroadcastTimer = setTimeout(() => {
+      hubBroadcastTimer = null;
+      broadcast();
+    }, 200);
+  },
+  onStatus: (status) => {
+    state.signalrStatus = status;
+    broadcast();
+  },
+});
 
 const boatsSql = `
 with default_route as (
@@ -317,7 +349,37 @@ server.on('error', (error) => {
 
 server.listen(port, '0.0.0.0', () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
+  signalrRelay.start().catch((error) => {
+    console.warn(`[signalr-relay] start: ${error.message}`);
+  });
 });
+
+function upsertHubBoat(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const code = String(payload.boatCode || '').trim();
+  const lat = Number(payload.lat);
+  const lng = Number(payload.lng);
+  if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  state.hubBoats.set(code, {
+    boatCode: code,
+    boatName: payload.boatName || null,
+    boatId: payload.boatId || null,
+    deviceId: payload.deviceId || null,
+    routeId: payload.routeId || null,
+    routeCode: payload.routeCode || null,
+    tripId: payload.tripId || null,
+    tripCode: payload.tripCode || null,
+    lat,
+    lng,
+    speedKmh: Number.isFinite(Number(payload.speedKmh)) ? Number(payload.speedKmh) : null,
+    heading: Number.isFinite(Number(payload.heading)) ? Number(payload.heading) : null,
+    recordedAt: payload.recordedAt || null,
+    receivedAt: payload.receivedAt || null,
+    sequence: payload.sequence ?? null,
+    isOnline: payload.isOnline !== false,
+    updatedAt: new Date().toISOString(),
+  });
+}
 
 async function loadEnv() {
   const values = { ...process.env };
@@ -2328,6 +2390,13 @@ function snapshot() {
       heading: round(boat.heading, 0),
       speedKmh: round(boat.speedKmh, 1),
     })),
+    hubBoats: [...state.hubBoats.values()].map((boat) => ({
+      ...boat,
+      lat: round(boat.lat, 7),
+      lng: round(boat.lng, 7),
+      heading: boat.heading == null ? null : round(boat.heading, 0),
+      speedKmh: boat.speedKmh == null ? null : round(boat.speedKmh, 1),
+    })),
     routes: [...state.routes.values()].map((route) => ({
       routeId: route.routeId,
       routeCode: route.routeCode,
@@ -2437,12 +2506,17 @@ function publicConfig() {
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
     surveyDeviceId: surveyDeviceId(),
     gpsDevices: Object.fromEntries(state.gpsDevicesByBoatCode.entries()),
+    // Trình duyệt Railway bị CORS khi nối thẳng Azure hub → FE dùng SSE relay.
+    signalrRelay: parseBool(env.SIGNALR_BROWSER_CONNECT ?? 'false') ? false : true,
     signalrHubUrl: (() => {
+      // Chỉ expose hub URL cho browser khi bật SIGNALR_BROWSER_CONNECT=true.
+      if (!parseBool(env.SIGNALR_BROWSER_CONNECT ?? 'false')) return '';
       const configured = cleanOptionalText(env.SIGNALR_HUB_URL);
       if (configured) return configured;
       const root = getTargetApiRoot();
       return root ? `${root}/hubs/tracking` : '';
     })(),
+    signalrStatus: state.signalrStatus,
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),
