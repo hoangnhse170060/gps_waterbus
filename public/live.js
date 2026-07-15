@@ -660,79 +660,51 @@ function renderHubBoats(hubBoats) {
 
   const catalog = catalogBoats();
   const activeCodes = new Set(catalog.map((b) => String(b.boatCode).trim()).filter(Boolean));
-  // Map + dropdown: chỉ tàu Active. Bỏ pin/hub tàu không còn hoạt động.
-  const codes = [...activeCodes].sort();
 
-  // Dọn pin cũ của tàu không active (WB_006/007 giả…).
+  // Giữ pin ẩn cho heartbeat — không vẽ marker cho tàu chưa chọn.
   for (const code of [...pinnedPositions.keys()]) {
     if (!activeCodes.has(code)) pinnedPositions.delete(code);
   }
-  persistPins();
-
   const occupied = [];
-  let index = 0;
-  for (const code of codes) {
+  let seedIndex = 0;
+  for (const code of [...activeCodes].sort()) {
     const hub = hubByCode.get(code);
-    let seed;
-    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
-      seed = { lat: Number(hub.lat), lng: Number(hub.lng) };
-    } else {
-      seed = fallbackLatLngForBoat(code, index, latest);
-    }
+    const seed = (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng)))
+      ? { lat: Number(hub.lat), lng: Number(hub.lng) }
+      : fallbackLatLngForBoat(code, seedIndex, latest);
     if (!pinnedFor(code)) {
       const unique = resolveUniqueSeed(code, seed.lat, seed.lng, occupied);
       ensureSeedPin(code, unique.lat, unique.lng);
     } else {
       occupied.push(pinnedFor(code));
     }
-    index += 1;
+    seedIndex += 1;
   }
+  persistPins();
 
-  // Cluster offset chỉ để nhìn thấy đủ tàu khi cùng chỗ — vị trí gửi vẫn dùng pin thật.
-  const truePositions = codes.map((code, i) => {
-    const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
-    return { code, ...pin };
-  });
-  const displayPos = new Map();
-  truePositions.forEach((item, i) => {
-    const twins = truePositions
-      .map((p, j) => ({ ...p, j }))
-      .filter((p) => distMeters(p, item) < CLUSTER_M);
-    if (twins.length <= 1 || item.code === selectedBoatCode) {
-      displayPos.set(item.code, { lat: item.lat, lng: item.lng });
-      return;
-    }
-    const myIdx = twins.findIndex((t) => t.code === item.code);
-    const off = displayOffset(myIdx, twins.length);
-    displayPos.set(item.code, { lat: item.lat + off.lat, lng: item.lng + off.lng });
-  });
-
+  const selected = String(selectedBoatCode || '').trim();
+  const showCodes = selected && activeCodes.has(selected) ? [selected] : [];
   const seen = new Set();
-  const selected = selectedBoatCode;
-  index = 0;
 
-  for (const code of codes) {
+  for (const code of showCodes) {
     const hub = hubByCode.get(code);
     const catalogBoat = catalog.find((b) => String(b.boatCode) === code);
-    const fixed = pinnedFor(code) || fallbackLatLngForBoat(code, index, latest);
+    const catalogIndex = catalog.findIndex((b) => String(b.boatCode) === code);
+    const fixed = pinnedFor(code) || fallbackLatLngForBoat(code, Math.max(0, catalogIndex), latest);
     ensureSeedPin(code, fixed.lat, fixed.lng);
     const trueLat = fixed.lat;
     const trueLng = fixed.lng;
-    const show = displayPos.get(code) || fixed;
     seen.add(code);
-    index += 1;
 
-    const isSelected = code === selected;
-    const isDraggingSelected = isSelected && dragging;
+    const isDraggingSelected = dragging;
     const st = getStatus(code);
     const phase = autoPhaseForBoat(code, trueLat, trueLng);
     const signal = hasSignal(code, hub);
     const heading = Number(hub?.heading) || 0;
     const popupHtml = boatPopupHtml(code, catalogBoat, hub, trueLat, trueLng);
-
     const decks = boatDeckCount(code, catalogBoat);
     const iconOpts = {
-      drag: isSelected,
+      drag: true,
       signal: !st.incident && signal,
       incident: st.incident || phase === 'incident',
       phase,
@@ -742,10 +714,10 @@ function renderHubBoats(hubBoats) {
 
     let marker = hubMarkers.get(code);
     if (!marker) {
-      marker = L.marker([show.lat, show.lng], {
+      marker = L.marker([trueLat, trueLng], {
         icon: boatIcon(heading, iconOpts),
-        draggable: isSelected,
-        zIndexOffset: isSelected ? 1200 : 700 + index,
+        draggable: true,
+        zIndexOffset: 1200,
         autoPan: true,
       }).addTo(map);
       marker.bindPopup(popupHtml, {
@@ -762,10 +734,10 @@ function renderHubBoats(hubBoats) {
     } else if (isDraggingSelected) {
       // đang kéo — không đụng popup/icon
     } else {
-      marker.setLatLng([show.lat, show.lng]);
+      marker.setLatLng([trueLat, trueLng]);
       marker.setIcon(boatIcon(heading, iconOpts));
-      marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
-      marker.setZIndexOffset(isSelected ? 1200 : 700 + index);
+      marker.dragging?.enable?.();
+      marker.setZIndexOffset(1200);
       marker.setPopupContent(popupHtml);
       bindDragHandlers(marker, code);
       if (openPopupCode.has(code) && !marker.isPopupOpen()) marker.openPopup();
@@ -774,18 +746,20 @@ function renderHubBoats(hubBoats) {
 
   for (const [code, marker] of hubMarkers) {
     if (!seen.has(code)) {
+      marker.closePopup?.();
       marker.remove();
       hubMarkers.delete(code);
+      openPopupCode.delete(code);
     }
   }
 
   if (selected && hubMarkers.has(selected) && !dragging) {
     const marker = hubMarkers.get(selected);
     marker.dragging?.enable?.();
-    marker.setZIndexOffset(1200);
-    bindDragHandlers(marker, selected);
     const pin = pinnedFor(selected);
     if (pin) coordStatusEl.textContent = `${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`;
+  } else if (!selected) {
+    coordStatusEl.textContent = '—';
   }
 
   if (boatPhaseStatusEl) {
