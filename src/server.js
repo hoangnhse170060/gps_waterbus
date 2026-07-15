@@ -481,33 +481,34 @@ async function refreshFromDatabase() {
     state.routeStops = Array.isArray(routeStops) ? routeStops : [];
 
     const routeList = [...state.routes.values()];
+    // Vị trí mặc định khi tàu chưa có route (trung tâm sông SG) — vẫn hiện tàu thật.
+    const defaultAnchor = state.stations[0]
+      ? { lat: Number(state.stations[0].lat), lng: Number(state.stations[0].lng) }
+      : { lat: 10.776, lng: 106.705 };
     let boatIndex = 0;
     for (const dbBoat of boats) {
       const existing = state.boats.get(dbBoat.boatId);
       const hasOwnRoute = Boolean(dbBoat.routeId && state.routes.has(dbBoat.routeId));
       const route = hasOwnRoute
         ? state.routes.get(dbBoat.routeId)
-        : (routeList[boatIndex % Math.max(routeList.length, 1)] || firstRoute());
-      if (!route) {
-        boatIndex += 1;
-        continue;
-      }
-      const stagger = route.lengthMeters * ((boatIndex * 0.37) % 1);
+        : (routeList[boatIndex % Math.max(routeList.length, 1)] || null);
+      const idx = boatIndex;
       boatIndex += 1;
+      const stagger = route ? route.lengthMeters * ((idx * 0.37) % 1) : 0;
       const maxSpeedKmh = Number(dbBoat.maxSpeedKmh || env.DEFAULT_SPEED_KMH || 16);
       const base = {
         boatId: dbBoat.boatId,
         boatCode: dbBoat.boatCode,
         boatName: dbBoat.boatName,
         dbStatus: dbBoat.status,
-        routeId: route.routeId,
-        routeCode: route.routeCode,
-        routeName: route.routeName,
+        routeId: route ? route.routeId : null,
+        routeCode: route ? route.routeCode : null,
+        routeName: route ? route.routeName : null,
         maxSpeedKmh,
       };
 
       if (existing) {
-        const routeChanged = existing.routeId !== route.routeId;
+        const routeChanged = existing.routeId !== (route ? route.routeId : null);
         Object.assign(existing, base);
         existing.deviceId = deviceIdForBoat(dbBoat);
         if (!existing.manualSpeed) {
@@ -517,23 +518,27 @@ async function refreshFromDatabase() {
           );
         }
         // Spread boats that share a route so many are visible on the map.
-        if (!hasOwnRoute && routeChanged) {
+        if (route && !hasOwnRoute && routeChanged) {
           existing.progressMeters = stagger;
-          existing.direction = boatIndex % 2 === 0 ? 1 : -1;
+          existing.direction = idx % 2 === 0 ? 1 : -1;
           const pos = pointAtDistance(route.coordinates, existing.progressMeters);
           existing.lat = pos.lat;
           existing.lng = pos.lng;
           existing.heading = existing.direction === 1 ? pos.heading : (pos.heading + 180) % 360;
         }
+        if (!route && (!Number.isFinite(Number(existing.lat)) || !Number.isFinite(Number(existing.lng)))) {
+          existing.lat = defaultAnchor.lat;
+          existing.lng = defaultAnchor.lng;
+        }
       } else {
-        const start = pointAtDistance(route.coordinates, stagger);
+        const start = route ? pointAtDistance(route.coordinates, stagger) : { ...defaultAnchor, heading: 0 };
         const deviceId = deviceIdForBoat(dbBoat);
         state.boats.set(dbBoat.boatId, {
           ...base,
           deviceId,
           tripId: dbBoat.tripId || null,
           progressMeters: stagger,
-          direction: boatIndex % 2 === 0 ? 1 : -1,
+          direction: idx % 2 === 0 ? 1 : -1,
           sequence: sequenceState[deviceId] ?? initialSequence(),
           batteryPercent: randomInt(78, 96),
           signalStrength: 4,
@@ -545,12 +550,16 @@ async function refreshFromDatabase() {
           heading: start.heading,
           lat: start.lat,
           lng: start.lng,
-          status: 'moving',
+          status: route ? 'moving' : 'idle',
           paused: false,
           manualSpeed: false,
           updatedAt: new Date().toISOString(),
         });
       }
+    }
+    // Bỏ tàu demo khi đã có tàu thật từ DB.
+    if (boats.length && state.boats.has('fallback-boat')) {
+      state.boats.delete('fallback-boat');
     }
 
     const activeBoatIds = new Set(boats.map((boat) => boat.boatId));
