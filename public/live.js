@@ -348,30 +348,42 @@ function boatDeckCount(code, catalogBoat) {
   return 1;
 }
 
-function boatColor({ signal, incident, phase, decks }) {
+function boatColor({ incident, phase, decks }) {
   if (incident || phase === 'incident') return '#dc2626';
-  if (!signal) return '#94a3b8';
-  // 1 tầng teal · 2 tầng cam
+  // 1 tầng teal · 2 tầng cam (màu luôn theo tầng, không phụ thuộc tín hiệu)
   if (Number(decks) >= 2) return '#ea580c';
   return '#0f766e';
+}
+
+function boatShortLabel(code, catalogBoat) {
+  const name = String(catalogBoat?.boatName || code || '').trim();
+  const digits = name.match(/(\d{2,})/);
+  if (digits) return digits[1];
+  return String(code || '').replace(/^WB_?/i, '').slice(0, 4) || '•';
 }
 
 function boatIcon(heading = 0, opts = {}) {
   const deg = Number(heading) || 0;
   const fill = boatColor(opts);
-  const size = opts.drag ? 52 : 44;
+  const tag = escapeHtml(opts.label || '•');
+  const deckTitle = Number(opts.decks) >= 2 ? '2 tầng' : '1 tầng';
+  const w = opts.drag ? 64 : 56;
+  const h = opts.drag ? 70 : 62;
   return L.divIcon({
     className: 'live-boat-wrap',
     html: `
-      <div class="live-boat${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}" style="--heading:${deg}deg;--boat:${fill}">
-        <span class="live-boat-ring"></span>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path fill="${fill}" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
-        </svg>
+      <div class="live-boat-pin${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}" style="--boat:${fill}" title="${escapeHtml(deckTitle)}">
+        <span class="live-boat-tag">${tag}</span>
+        <div class="live-boat" style="--heading:${deg}deg">
+          <span class="live-boat-ring"></span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="${fill}" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
+          </svg>
+        </div>
       </div>
     `,
-    iconSize: [size, size],
-    iconAnchor: [size / 2, size / 2],
+    iconSize: [w, h],
+    iconAnchor: [w / 2, h - 8],
   });
 }
 
@@ -381,9 +393,9 @@ function stationIcon(code) {
     .slice(0, 3)
     .toUpperCase() || '•';
   return L.divIcon({
-    className: '',
+    className: 'live-station-wrap',
     html: `
-      <div class="station-flag">
+      <div class="station-flag live-station-flag">
         <div class="station-flag-pole"></div>
         <div class="station-flag-cloth">${escapeHtml(label)}</div>
       </div>
@@ -725,6 +737,7 @@ function renderHubBoats(hubBoats) {
       incident: st.incident || phase === 'incident',
       phase,
       decks,
+      label: boatShortLabel(code, catalogBoat),
     };
 
     let marker = hubMarkers.get(code);

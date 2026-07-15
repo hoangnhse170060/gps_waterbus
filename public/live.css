@@ -237,27 +237,52 @@
   border: 0 !important;
 }
 
+.live-boat-pin {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  pointer-events: none;
+  filter: drop-shadow(0 3px 6px rgba(15, 23, 42, 0.28));
+}
+
+.live-boat-tag {
+  min-width: 28px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--boat, #0f766e);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.35;
+  letter-spacing: 0.02em;
+  text-align: center;
+  box-shadow: 0 0 0 2px #fff;
+}
+
+.live-boat-pin.is-drag .live-boat-tag {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
 .live-boat {
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   display: grid;
   place-items: center;
   position: relative;
   transform: rotate(var(--heading, 0deg));
-  filter: drop-shadow(0 3px 6px rgba(15, 23, 42, 0.28));
-  pointer-events: none;
 }
 
-.live-boat.is-drag {
-  width: 52px;
-  height: 52px;
+.live-boat-pin.is-drag .live-boat {
+  width: 46px;
+  height: 46px;
 }
 
-.live-boat.has-signal .live-boat-ring {
+.live-boat-pin.has-signal .live-boat-ring {
   position: absolute;
   inset: 6px;
   border-radius: 50%;
-  border: 2px solid color-mix(in srgb, var(--boat, #16a34a) 55%, transparent);
+  border: 2px solid color-mix(in srgb, var(--boat, #0f766e) 55%, transparent);
   animation: mapPulse 1.6s infinite;
 }
 
@@ -266,6 +291,17 @@
   height: 72%;
   position: relative;
   z-index: 1;
+}
+
+/* Bến mờ — tránh nhầm với tàu (TD2/BA/TT…) */
+.live-station-flag .station-flag-pole {
+  background: #94a3b8;
+}
+
+.live-station-flag .station-flag-cloth {
+  background: #64748b;
+  box-shadow: 0 3px 8px rgba(100, 116, 139, 0.28);
+  font-weight: 700;
 }
 
 .live-boat-popup-wrap .leaflet-popup-content-wrapper {
