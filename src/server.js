@@ -161,6 +161,12 @@ where coalesce(d.is_active, true) = true
   and b.boat_code is not null;
 `;
 
+/** Sau khi dừng ghi survey, ignore echo SignalR một lúc để marker không hiện lại. */
+const hubBoatSuppressUntil = new Map();
+let boatsLatestPollBusy = false;
+let boatsLatestLastOkAt = null;
+let boatsLatestLastError = null;
+
 await refreshFromDatabase();
 setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 15000));
 setInterval(tickSimulator, 1000);
@@ -169,12 +175,6 @@ setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(pruneStaleHubBoats, 5000);
 // BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
 setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
-
-/** Sau khi dừng ghi survey, ignore echo SignalR một lúc để marker không hiện lại. */
-const hubBoatSuppressUntil = new Map();
-let boatsLatestPollBusy = false;
-let boatsLatestLastOkAt = null;
-let boatsLatestLastError = null;
 
 const server = createServer(async (req, res) => {
   try {
@@ -244,6 +244,19 @@ const server = createServer(async (req, res) => {
         return sendJson(res, result, 201);
       } catch (error) {
         return sendJson(res, {
+          error: error.message,
+          code: error.code || undefined,
+        }, error.status || 500);
+      }
+    }
+    if (url.pathname === '/api/live/gps' && req.method === 'POST') {
+      const body = await readJson(req);
+      try {
+        const result = await publishLiveGpsPosition(body);
+        return sendJson(res, result, result.ok ? 200 : (result.status || 400));
+      } catch (error) {
+        return sendJson(res, {
+          ok: false,
           error: error.message,
           code: error.code || undefined,
         }, error.status || 500);
@@ -922,6 +935,194 @@ function buildTargetPayload(boat) {
     direction: boat.direction === -1 ? 'backward' : 'forward',
     status: boat.status,
   };
+}
+
+/**
+ * Live GPS drag page: giả lập device POST /api/tracking/locations.
+ * Body: { boatCode, lat, lng, speedKmh?, heading?, status?, sendToTarget? }
+ */
+async function publishLiveGpsPosition(body = {}) {
+  const boatCode = cleanOptionalText(body.boatCode);
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  if (!boatCode) {
+    const err = new Error('Chọn boatCode trước khi gửi GPS.');
+    err.status = 400;
+    throw err;
+  }
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    const err = new Error('lat/lng không hợp lệ.');
+    err.status = 400;
+    throw err;
+  }
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    const err = new Error('lat/lng ngoài phạm vi WGS84.');
+    err.status = 400;
+    throw err;
+  }
+
+  if (state.collector && String(state.collector.boatCode || '').trim() === boatCode) {
+    return {
+      ok: false,
+      status: 409,
+      error: `Tàu ${boatCode} đang ghi GPS survey — không kéo live cùng lúc (tránh đụng sequence).`,
+    };
+  }
+
+  const matched = [...state.boats.values()].find((boat) => (
+    String(boat.boatCode) === boatCode && !String(boat.boatId || '').startsWith('collector-')
+  ));
+  const deviceId = deviceIdForBoat({ boatCode, boatId: matched?.boatId });
+  const prev = state.hubBoats.get(boatCode);
+  const heading = Number.isFinite(Number(body.heading))
+    ? Number(body.heading)
+    : (prev && Number.isFinite(Number(prev.lat))
+      ? bearingDegrees({ lat: Number(prev.lat), lng: Number(prev.lng) }, { lat, lng })
+      : 0);
+  const speedKmh = Number.isFinite(Number(body.speedKmh))
+    ? Number(body.speedKmh)
+    : 0;
+  const status = cleanOptionalText(body.status) || (speedKmh > 0.5 ? 'moving' : 'idle');
+
+  const sequence = bumpDeviceSequence(deviceId, matched || null);
+  const payload = {
+    messageId: randomUUID(),
+    deviceId,
+    boatId: matched?.boatId || body.boatId || null,
+    boatCode,
+    boatName: matched?.boatName || body.boatName || null,
+    tripId: matched?.tripId || null,
+    routeId: matched?.routeId || null,
+    routeCode: matched?.routeCode || null,
+    lat: round(lat, 7),
+    lng: round(lng, 7),
+    speedKmh: round(speedKmh, 1),
+    heading: round(heading, 0),
+    accuracyMeters: randomInt(3, 12),
+    recordedAt: formatRecordedAt(new Date()),
+    sequence,
+    batteryPercent: matched?.batteryPercent || randomInt(70, 95),
+    signalStrength: randomInt(3, 5),
+    gpsFixQuality: 'good',
+    direction: 'forward',
+    status,
+    capturedRoute: null,
+  };
+
+  const sendToTarget = body.sendToTarget !== undefined
+    ? Boolean(body.sendToTarget)
+    : Boolean(state.senderEnabled && getTargetEndpoint());
+
+  // Optimistic local hub marker (SSE) — BE sẽ đồng bộ lại qua SignalR / boats/latest.
+  hubBoatSuppressUntil.delete(boatCode);
+  upsertHubBoat({
+    ...payload,
+    isOnline: true,
+    recordedAt: payload.recordedAt,
+    receivedAt: new Date().toISOString(),
+  });
+  broadcast();
+
+  if (!sendToTarget || !getTargetEndpoint()) {
+    return {
+      ok: true,
+      status: 200,
+      mode: 'local',
+      sequence: payload.sequence,
+      payload,
+      warning: 'Chưa gửi Azure (SEND_TO_TARGET tắt hoặc chưa cấu hình endpoint).',
+    };
+  }
+
+  try {
+    const response = await fetch(getTargetEndpoint(), {
+      method: 'POST',
+      headers: buildGpsHeaders(payload),
+      body: JSON.stringify(payload),
+    });
+    let ok = response.status >= 200 && response.status < 300;
+    let statusCode = response.status;
+    let errorText = null;
+    let responseData = null;
+    const text = await response.text();
+    if (text) {
+      try { responseData = JSON.parse(text); } catch { responseData = { message: text }; }
+    }
+    if (response.status === 409) {
+      const retried = await retryGpsAfterSequenceConflict(payload);
+      ok = retried.ok;
+      statusCode = retried.status;
+      errorText = ok ? null : (retried.error || 'sequence conflict (409)');
+      if (!ok && retried.soft) {
+        pushApiCallLog({
+          method: 'POST',
+          url: getTargetEndpoint(),
+          path: '/api/tracking/locations',
+          ok: false,
+          soft: true,
+          status: 409,
+          error: errorText,
+          at: new Date().toISOString(),
+          request: summarizeApiPayload(payload),
+          response: summarizeApiPayload(responseData),
+          deviceId,
+        });
+        return {
+          ok: true,
+          soft: true,
+          status: 409,
+          sequence: payload.sequence,
+          payload,
+          warning: 'Sequence lệch BE — điểm đã cập nhật local map.',
+        };
+      }
+    }
+    if (!ok) {
+      errorText = formatTargetApiError(responseData, statusCode);
+    }
+    pushApiCallLog({
+      method: 'POST',
+      url: getTargetEndpoint(),
+      path: '/api/tracking/locations',
+      ok,
+      status: statusCode,
+      error: errorText,
+      at: new Date().toISOString(),
+      request: summarizeApiPayload(payload),
+      response: summarizeApiPayload(responseData),
+      deviceId,
+    });
+    return {
+      ok,
+      status: statusCode,
+      mode: 'target',
+      sequence: payload.sequence,
+      payload,
+      error: errorText,
+      data: responseData,
+    };
+  } catch (error) {
+    pushApiCallLog({
+      method: 'POST',
+      url: getTargetEndpoint(),
+      path: '/api/tracking/locations',
+      ok: false,
+      status: 502,
+      error: error.message,
+      at: new Date().toISOString(),
+      request: summarizeApiPayload(payload),
+      response: null,
+      deviceId,
+    });
+    return {
+      ok: false,
+      status: 502,
+      mode: 'target',
+      sequence: payload.sequence,
+      payload,
+      error: error.message,
+    };
+  }
 }
 
 function bumpDeviceSequence(deviceId, boat = null) {

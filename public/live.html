@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Live GPS · Waterbus</title>
+    <link rel="icon" href="/favicon.png" type="image/png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/live.css">
+  </head>
+  <body class="live-page">
+    <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
+
+    <div class="live-shell">
+      <div id="map" class="live-map"></div>
+
+      <aside class="live-panel">
+        <header class="live-brand">
+          <p class="live-eyebrow">Saigon Waterbus</p>
+          <h1>Live GPS</h1>
+          <p class="live-lead">Kéo tàu tới bến để giả lập GPS. Vị trí gửi lên BE rồi hiện lại realtime.</p>
+        </header>
+
+        <nav class="live-nav">
+          <a href="/">Survey</a>
+          <a href="/live.html" aria-current="page">Live GPS</a>
+          <a href="/api-log.html" target="_blank" rel="noopener">Log API</a>
+        </nav>
+
+        <label class="live-field">
+          <span>Tàu GPS</span>
+          <select id="boatSelect">
+            <option value="">Chọn tàu...</option>
+          </select>
+          <small id="deviceHint" class="live-hint">Chọn tàu đã đăng ký device để kéo trên map.</small>
+        </label>
+
+        <label class="live-field live-toggle">
+          <span>Gửi Azure BE</span>
+          <select id="sendAzureSelect">
+            <option value="on">Bật — POST /tracking/locations</option>
+            <option value="off">Tắt — chỉ local map</option>
+          </select>
+        </label>
+
+        <div class="live-actions">
+          <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
+          <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
+        </div>
+
+        <section class="live-status" id="statusCard">
+          <div class="live-status-row">
+            <span>Hub / relay</span>
+            <b id="hubStatus">…</b>
+          </div>
+          <div class="live-status-row">
+            <span>Gửi gần nhất</span>
+            <b id="sendStatus">Chưa gửi</b>
+          </div>
+          <div class="live-status-row">
+            <span>Tọa độ</span>
+            <b id="coordStatus">—</b>
+          </div>
+        </section>
+
+        <p id="liveHelp" class="live-help">
+          1) Chọn tàu · 2) Kéo marker tới bến (tự snap ≤ 60m) · 3) Thả để gửi GPS.
+        </p>
+
+        <footer class="live-legend">
+          <span><i class="leg-station"></i> Bến</span>
+          <span><i class="leg-live"></i> Tàu live</span>
+          <span><i class="leg-drag"></i> Đang kéo</span>
+        </footer>
+      </aside>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
+    <script src="/geo-distance.js"></script>
+    <script src="/live.js"></script>
+  </body>
+</html>
