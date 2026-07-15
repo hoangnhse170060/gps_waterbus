@@ -34,6 +34,10 @@ let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
 let sending = false;
 let dragging = false;
 let hasFitRoutes = false;
+/** Giữ vị trí vừa thả/gửi — tránh SSE/hub kéo marker về tọa độ cũ. */
+const pinnedPositions = new Map();
+const PIN_HOLD_MS = 120_000;
+const PIN_MATCH_M = 80;
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
@@ -287,6 +291,39 @@ function renderRoutes(routes, stations) {
   }
 }
 
+function pinBoatPosition(code, lat, lng) {
+  const key = String(code || '').trim();
+  if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  pinnedPositions.set(key, {
+    lat: Number(lat),
+    lng: Number(lng),
+    at: Date.now(),
+  });
+}
+
+function pinnedFor(code) {
+  const key = String(code || '').trim();
+  const pin = pinnedPositions.get(key);
+  if (!pin) return null;
+  if (Date.now() - pin.at > PIN_HOLD_MS) {
+    pinnedPositions.delete(key);
+    return null;
+  }
+  return pin;
+}
+
+/** Hub mới khớp vị trí vừa thả → bỏ pin; hub lệch (tín hiệu cũ) → giữ pin. */
+function shouldApplyHubPosition(code, lat, lng) {
+  const pin = pinnedFor(code);
+  if (!pin) return true;
+  const d = distMeters(pin, { lat, lng });
+  if (d <= PIN_MATCH_M) {
+    pinnedPositions.delete(String(code).trim());
+    return true;
+  }
+  return false;
+}
+
 function renderHubBoats(hubBoats) {
   const list = Array.isArray(hubBoats) ? hubBoats : [];
   const seen = new Set();
@@ -297,22 +334,27 @@ function renderHubBoats(hubBoats) {
     const lat = Number(boat.lat);
     const lng = Number(boat.lng);
     if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-    if (boat.isOnline === false) continue;
+    // Vẫn giữ marker tàu đang chọn / vừa thả dù hub báo offline.
+    if (boat.isOnline === false && code !== selected && !pinnedFor(code)) continue;
     seen.add(code);
 
     const isSelected = code === selected;
     const isDraggingSelected = isSelected && dragging;
+    const pin = pinnedFor(code);
+    const applyHub = !isDraggingSelected && shouldApplyHubPosition(code, lat, lng);
+    const showLat = applyHub ? lat : (pin ? pin.lat : lat);
+    const showLng = applyHub ? lng : (pin ? pin.lng : lng);
     let marker = hubMarkers.get(code);
     const heading = Number(boat.heading) || 0;
     const tip = [
       code,
       boat.boatName || '',
       Number.isFinite(Number(boat.speedKmh)) ? `${boat.speedKmh} km/h` : '',
-      isSelected ? (dragging ? 'đang kéo' : 'kéo được') : 'live',
+      isSelected ? (dragging ? 'đang kéo' : (pin ? 'đã thả · giữ vị trí' : 'kéo được')) : 'live',
     ].filter(Boolean).join(' · ');
 
     if (!marker) {
-      marker = L.marker([lat, lng], {
+      marker = L.marker([showLat, showLng], {
         icon: boatIcon(heading, { drag: isSelected }),
         draggable: isSelected,
         zIndexOffset: isSelected ? 1200 : 800,
@@ -322,10 +364,11 @@ function renderHubBoats(hubBoats) {
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
     } else if (isDraggingSelected) {
-      // Đang kéo: tuyệt đối không setIcon/setLatLng — nếu không Leaflet mất dragend → không POST BE.
       marker.setTooltipContent(tip);
     } else {
-      marker.setLatLng([lat, lng]);
+      if (applyHub || pin) {
+        marker.setLatLng([showLat, showLng]);
+      }
       marker.setIcon(boatIcon(heading, { drag: isSelected }));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 800);
@@ -334,24 +377,32 @@ function renderHubBoats(hubBoats) {
     }
   }
 
-  // Tàu đang chọn nhưng chưa có hub point → tạo marker kéo được tại trung tâm map.
-  if (selected && !seen.has(selected) && !hubMarkers.has(selected)) {
-    const center = map.getCenter();
-    const marker = L.marker(center, {
-      icon: boatIcon(0, { drag: true }),
-      draggable: true,
-      zIndexOffset: 1200,
-    }).addTo(map);
-    marker.bindTooltip(`${selected} · kéo tới bến`, { permanent: true, direction: 'top', offset: [0, -20] });
-    bindDragHandlers(marker, selected);
-    hubMarkers.set(selected, marker);
+  // Tàu đang chọn / vừa pin nhưng hub offline → giữ marker tại chỗ thả (không tạo lại giữa map).
+  if (selected && !seen.has(selected)) {
+    const pin = pinnedFor(selected);
+    let marker = hubMarkers.get(selected);
+    if (!marker) {
+      const center = pin || map.getCenter();
+      const lat = Number(center.lat);
+      const lng = Number(center.lng);
+      marker = L.marker([lat, lng], {
+        icon: boatIcon(0, { drag: true }),
+        draggable: true,
+        zIndexOffset: 1200,
+      }).addTo(map);
+      marker.bindTooltip(
+        pin ? `${selected} · đã thả · giữ vị trí` : `${selected} · kéo tới bến`,
+        { permanent: true, direction: 'top', offset: [0, -20] },
+      );
+      bindDragHandlers(marker, selected);
+      hubMarkers.set(selected, marker);
+      coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    }
     seen.add(selected);
-    coordStatusEl.textContent = `${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}`;
   }
 
-  // Giữ marker đang chọn (offline hub) — không xóa giữa lúc kéo.
   for (const [code, marker] of hubMarkers) {
-    if (!seen.has(code) && code !== selected) {
+    if (!seen.has(code) && code !== selected && !pinnedFor(code)) {
       marker.remove();
       hubMarkers.delete(code);
     }
@@ -393,6 +444,7 @@ function bindDragHandlers(marker, code) {
       marker.setLatLng([lat, lng]);
       toast(`Snap ${snap.station.stationCode || snap.station.stationName} (${Math.round(snap.dist)} m)`, 'ok');
     }
+    pinBoatPosition(code, lat, lng);
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
     await sendLiveGps(code, lat, lng);
   });
@@ -402,6 +454,7 @@ async function sendLiveGps(boatCode, lat, lng) {
   if (sending) return;
   sending = true;
   sendStatusEl.textContent = 'Đang gửi…';
+  pinBoatPosition(boatCode, lat, lng);
   const sendToTarget = sendAzureSelectEl.value === 'on';
   try {
     const response = await fetch('/api/live/gps', {
@@ -421,12 +474,16 @@ async function sendLiveGps(boatCode, lat, lng) {
       const msg = body.error || `HTTP ${response.status}`;
       sendStatusEl.textContent = `Lỗi ${response.status}`;
       toast(msg, 'err');
+      // Vẫn giữ pin — tàu không nhảy về chỗ cũ dù gửi lỗi.
       return;
     }
+    pinBoatPosition(boatCode, lat, lng);
     const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
     sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
     if (body.warning) toast(body.warning, 'warn');
     else toast(`Đã gửi GPS ${boatCode}`, 'ok');
+    const marker = hubMarkers.get(boatCode);
+    if (marker) marker.setLatLng([lat, lng]);
   } catch (error) {
     sendStatusEl.textContent = 'Lỗi mạng';
     toast(error.message, 'err');
@@ -517,6 +574,7 @@ sendNowBtn?.addEventListener('click', async () => {
     lng = Number(snap.station.lng);
     marker.setLatLng([lat, lng]);
   }
+  pinBoatPosition(selectedBoatCode, lat, lng);
   coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   await sendLiveGps(selectedBoatCode, lat, lng);
 });
