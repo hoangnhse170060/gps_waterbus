@@ -239,34 +239,14 @@
 
 .live-boat-pin {
   display: grid;
-  justify-items: center;
-  gap: 2px;
+  place-items: center;
   pointer-events: none;
   filter: drop-shadow(0 3px 6px rgba(15, 23, 42, 0.28));
 }
 
-.live-boat-tag {
-  min-width: 28px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: var(--boat, #0f766e);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 800;
-  line-height: 1.35;
-  letter-spacing: 0.02em;
-  text-align: center;
-  box-shadow: 0 0 0 2px #fff;
-}
-
-.live-boat-pin.is-drag .live-boat-tag {
-  font-size: 11px;
-  padding: 3px 8px;
-}
-
 .live-boat {
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   display: grid;
   place-items: center;
   position: relative;
@@ -274,8 +254,23 @@
 }
 
 .live-boat-pin.is-drag .live-boat {
-  width: 46px;
-  height: 46px;
+  width: 52px;
+  height: 52px;
+}
+
+.live-boat-hover-tip {
+  background: #0f172a !important;
+  border: 0 !important;
+  border-radius: 8px !important;
+  color: #fff !important;
+  font-weight: 700 !important;
+  font-size: 12px !important;
+  padding: 6px 10px !important;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.28) !important;
+}
+
+.live-boat-hover-tip::before {
+  border-top-color: #0f172a !important;
 }
 
 .live-boat-pin.has-signal .live-boat-ring {
