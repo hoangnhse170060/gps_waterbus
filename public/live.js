@@ -1,11 +1,12 @@
 const SNAP_STATION_M = 60;
 const APPROACH_M = 180;
-const SIGNAL_TTL_MS = 90_000;
+const SIGNAL_TTL_MS = 120_000;
+const HEARTBEAT_MS = 5000;
 const CLUSTER_M = 25;
 const ROUTE_STYLE = {
   color: '#0f766e',
-  weight: 3,
-  opacity: 0.22,
+  weight: 2.5,
+  opacity: 0.14,
   smoothFactor: 0,
 };
 const WATERBUS_CORRIDOR_CODES = [
@@ -21,7 +22,7 @@ const PHASES = {
   enroute: 'Đang đi',
   approaching: 'Sắp cập bến',
   arrived: 'Đã cập bến',
-  incident: 'Sự cố — dừng',
+  incident: '', // chỉ hiện chấm đỏ — không chữ
 };
 
 const map = L.map('map', { zoomControl: false }).setView([10.776, 106.708], 13);
@@ -51,9 +52,12 @@ let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
 let sending = false;
 let dragging = false;
 let hasFitRoutes = false;
+let heartbeatTimer = null;
+let heartbeatBusy = false;
 const pinnedPositions = loadJsonMap(STORAGE_PINS);
 const boatStatuses = loadJsonMap(STORAGE_STATUS);
 const lastSignalAt = new Map();
+const openPopupCode = new Set();
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
@@ -141,12 +145,14 @@ function markSignal(code) {
 }
 
 function hasSignal(code, hub) {
+  // Heartbeat liên tục → mặc định coi là có tín hiệu; chỉ đỏ khi sự cố.
+  const st = getStatus(code);
+  if (st.incident) return false;
   const key = String(code || '').trim();
   const sent = lastSignalAt.get(key) || 0;
   if (Date.now() - sent < SIGNAL_TTL_MS) return true;
   if (hub && hub.isOnline !== false) return true;
-  const pin = pinnedFor(key);
-  return Boolean(pin?.user);
+  return Boolean(pinnedFor(key));
 }
 
 function toast(message, type = 'ok', ms = 3200) {
@@ -269,27 +275,51 @@ function autoPhaseForBoat(code, lat, lng) {
 
 function phaseLabel(code, lat, lng) {
   const phase = autoPhaseForBoat(code, lat, lng);
-  if (phase === 'incident') return PHASES.incident;
+  if (phase === 'incident') return '';
   if (phase === 'enroute' || phase === 'departing') {
     const next = nextStationAlongCorridor({ lat, lng });
     if (next?.to) {
       const eta = next.etaMin != null ? `${next.etaMin} phút` : '…';
-      const name = next.to.stationCode || next.to.stationName || 'bến kế';
+      const name = next.to.stationName || next.to.stationCode || 'bến kế';
       if (phase === 'departing') return `${PHASES.departing} · tới ${name}`;
       return `Còn ${eta} tới ${name}`;
     }
   }
   if (phase === 'approaching') {
     const near = nearestStationAny({ lat, lng }, latest?.stations || []);
-    const name = near?.station?.stationCode || near?.station?.stationName || 'bến';
+    const name = near?.station?.stationName || near?.station?.stationCode || 'bến';
     return `${PHASES.approaching} · ${name}`;
   }
   if (phase === 'arrived') {
     const near = nearestStationAny({ lat, lng }, latest?.stations || []);
-    const name = near?.station?.stationCode || near?.station?.stationName || 'bến';
+    const name = near?.station?.stationName || near?.station?.stationCode || 'bến';
     return `${PHASES.arrived} · ${name}`;
   }
   return PHASES[phase] || PHASES.prepare;
+}
+
+function boatDisplayName(code, catalogBoat, hub) {
+  return String(catalogBoat?.boatName || hub?.boatName || code || '').trim();
+}
+
+function boatPopupHtml(code, catalogBoat, hub, lat, lng) {
+  const st = getStatus(code);
+  const signal = hasSignal(code, hub);
+  const phase = autoPhaseForBoat(code, lat, lng);
+  const name = boatDisplayName(code, catalogBoat, hub);
+  const label = phaseLabel(code, lat, lng);
+  const dotClass = st.incident || phase === 'incident'
+    ? 'is-incident'
+    : (signal ? 'is-ok' : 'is-off');
+  return `
+    <div class="live-boat-popup">
+      <div class="live-boat-popup-title">
+        <i class="live-dot ${dotClass}" aria-hidden="true"></i>
+        <span>${escapeHtml(name)}</span>
+      </div>
+      ${label ? `<div class="live-boat-popup-meta">${escapeHtml(label)}</div>` : ''}
+    </div>
+  `;
 }
 
 function boatColor({ signal, incident, phase, drag }) {
@@ -523,7 +553,7 @@ function renderRoutes(routes, stations) {
         layer = L.polyline(latlngs, {
           ...ROUTE_STYLE,
           dashArray: '10 10',
-          opacity: 0.2,
+          opacity: 0.12,
         }).addTo(map);
         layer.bindTooltip('Hành lang Waterbus (bến DB)');
         routeLayers.set(id, layer);
@@ -623,18 +653,11 @@ function renderHubBoats(hubBoats) {
     const phase = autoPhaseForBoat(code, trueLat, trueLng);
     const signal = hasSignal(code, hub);
     const heading = Number(hub?.heading) || 0;
-    const label = phaseLabel(code, trueLat, trueLng);
-    const tip = [
-      code,
-      catalogBoat?.boatName || hub?.boatName || '',
-      signal ? 'có tín hiệu' : 'mất tín hiệu',
-      label,
-      isSelected ? (dragging ? 'đang kéo' : 'kéo được') : '',
-    ].filter(Boolean).join(' · ');
+    const popupHtml = boatPopupHtml(code, catalogBoat, hub, trueLat, trueLng);
 
     const iconOpts = {
       drag: isSelected,
-      signal,
+      signal: !st.incident && signal,
       incident: st.incident || phase === 'incident',
       phase,
     };
@@ -647,18 +670,27 @@ function renderHubBoats(hubBoats) {
         zIndexOffset: isSelected ? 1200 : 700 + index,
         autoPan: true,
       }).addTo(map);
-      marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -18] });
+      marker.bindPopup(popupHtml, {
+        closeButton: true,
+        autoClose: true,
+        closeOnClick: true,
+        className: 'live-boat-popup-wrap',
+        offset: [0, -12],
+      });
+      marker.on('popupopen', () => openPopupCode.add(code));
+      marker.on('popupclose', () => openPopupCode.delete(code));
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
     } else if (isDraggingSelected) {
-      marker.setTooltipContent(tip);
+      // đang kéo — không đụng popup/icon
     } else {
       marker.setLatLng([show.lat, show.lng]);
       marker.setIcon(boatIcon(heading, iconOpts));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 700 + index);
-      marker.setTooltipContent(tip);
+      marker.setPopupContent(popupHtml);
       if (isSelected) bindDragHandlers(marker, code);
+      if (openPopupCode.has(code) && !marker.isPopupOpen()) marker.openPopup();
     }
   }
 
@@ -727,10 +759,12 @@ function bindDragHandlers(marker, code) {
   });
 }
 
-async function sendLiveGps(boatCode, lat, lng) {
-  if (sending) return;
-  sending = true;
-  sendStatusEl.textContent = 'Đang gửi…';
+async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
+  if (!quiet && sending) return;
+  if (!quiet) {
+    sending = true;
+    sendStatusEl.textContent = 'Đang gửi…';
+  }
   pinBoatPosition(boatCode, lat, lng, { user: true });
   const st = getStatus(boatCode);
   const phase = autoPhaseForBoat(boatCode, lat, lng);
@@ -751,24 +785,64 @@ async function sendLiveGps(boatCode, lat, lng) {
     });
     const body = await response.json();
     if (!response.ok || body.ok === false) {
-      const msg = body.error || `HTTP ${response.status}`;
-      sendStatusEl.textContent = `Lỗi ${response.status}`;
-      toast(msg, 'err');
-      return;
+      if (!quiet) {
+        const msg = body.error || `HTTP ${response.status}`;
+        sendStatusEl.textContent = `Lỗi ${response.status}`;
+        toast(msg, 'err');
+      }
+      return false;
     }
     markSignal(boatCode);
     pinBoatPosition(boatCode, lat, lng, { user: true });
-    const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
-    sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
-    if (body.warning) toast(body.warning, 'warn');
-    else toast(`Đã gửi GPS ${boatCode}`, 'ok');
-    if (latest) renderHubBoats(latest.hubBoats);
+    if (!quiet) {
+      const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
+      sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
+      if (body.warning) toast(body.warning, 'warn');
+      else toast(`Đã gửi GPS ${boatDisplayName(boatCode)}`, 'ok');
+      if (latest) renderHubBoats(latest.hubBoats);
+    } else {
+      sendStatusEl.textContent = `Heartbeat · ${boatDisplayName(boatCode)} · ${body.status || 200}`;
+    }
+    return true;
   } catch (error) {
-    sendStatusEl.textContent = 'Lỗi mạng';
-    toast(error.message, 'err');
+    if (!quiet) {
+      sendStatusEl.textContent = 'Lỗi mạng';
+      toast(error.message, 'err');
+    }
+    return false;
   } finally {
-    sending = false;
+    if (!quiet) sending = false;
   }
+}
+
+async function heartbeatAllBoats() {
+  if (heartbeatBusy || dragging || sending) return;
+  if (sendAzureSelectEl?.value !== 'on') return;
+  heartbeatBusy = true;
+  try {
+    const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
+    for (let i = 0; i < codes.length; i += 1) {
+      const code = codes[i];
+      const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
+      ensureSeedPin(code, pin.lat, pin.lng);
+      const fixed = pinnedFor(code) || pin;
+      await sendLiveGps(code, fixed.lat, fixed.lng, { quiet: true });
+      // Nhịp nhẹ tránh đụng sequence cùng lúc.
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    if (latest) renderHubBoats(latest.hubBoats);
+  } finally {
+    heartbeatBusy = false;
+  }
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    heartbeatAllBoats().catch(() => {});
+  }, HEARTBEAT_MS);
+  // Gửi ngay vòng đầu sau khi có dữ liệu.
+  setTimeout(() => heartbeatAllBoats().catch(() => {}), 800);
 }
 
 function renderStatus(data) {
@@ -892,3 +966,4 @@ refreshBtn.addEventListener('click', async () => {
 });
 
 connectEvents();
+startHeartbeat();
