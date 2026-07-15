@@ -167,9 +167,14 @@ setInterval(tickSimulator, 1000);
 setInterval(publishGpsPositions, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(pruneStaleHubBoats, 5000);
+// BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
+setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
 
 /** Sau khi dừng ghi survey, ignore echo SignalR một lúc để marker không hiện lại. */
 const hubBoatSuppressUntil = new Map();
+let boatsLatestPollBusy = false;
+let boatsLatestLastOkAt = null;
+let boatsLatestLastError = null;
 
 const server = createServer(async (req, res) => {
   try {
@@ -358,6 +363,10 @@ server.listen(port, '0.0.0.0', () => {
   signalrRelay.start().catch((error) => {
     console.warn(`[signalr-relay] start: ${error.message}`);
   });
+  // BE: GET /api/tracking/boats/latest lần đầu rồi poll (fallback khi hub chưa có).
+  pollLatestBoatLocations({ force: true }).catch((error) => {
+    console.warn(`[boats-latest] seed: ${error.message}`);
+  });
 });
 
 function upsertHubBoat(payload) {
@@ -413,6 +422,79 @@ function pruneStaleHubBoats() {
     }
   }
   if (changed) broadcast();
+}
+
+/**
+ * FE/admin BE contract:
+ * 1) GET /api/tracking/boats/latest — seed marker
+ * 2) SignalR boatLocation — realtime
+ * 3) Poll lại latest mỗi vài giây nếu hub disconnect / chưa deploy
+ */
+async function pollLatestBoatLocations({ force = false } = {}) {
+  if (boatsLatestPollBusy) return;
+  if (!getTargetApiRoot()) return;
+  // Hub đang connected → poll thưa hơn (chỉ catch-up), vẫn seed nếu force.
+  const hubOk = Boolean(state.signalrStatus?.connected);
+  if (!force && hubOk) {
+    const last = boatsLatestLastOkAt ? Date.parse(boatsLatestLastOkAt) : 0;
+    if (Number.isFinite(last) && Date.now() - last < 15_000) return;
+  }
+
+  boatsLatestPollBusy = true;
+  try {
+    const deviceId = surveyDeviceId();
+    const result = await getFromTargetApi('/api/tracking/boats/latest', deviceId, { silent: true });
+    if (!result.ok) {
+      boatsLatestLastError = result.error || `HTTP ${result.status}`;
+      return;
+    }
+    const rows = normalizeLatestBoatRows(result.data);
+    let changed = false;
+    for (const row of rows) {
+      const before = state.hubBoats.get(String(row.boatCode || '').trim());
+      upsertHubBoat(row);
+      const after = state.hubBoats.get(String(row.boatCode || '').trim());
+      if (after && (!before || before.lat !== after.lat || before.lng !== after.lng || before.updatedAt !== after.updatedAt)) {
+        changed = true;
+      }
+    }
+    boatsLatestLastOkAt = new Date().toISOString();
+    boatsLatestLastError = null;
+    if (changed || force) broadcast();
+  } catch (error) {
+    boatsLatestLastError = error.message;
+    console.warn(`[boats-latest] ${error.message}`);
+  } finally {
+    boatsLatestPollBusy = false;
+  }
+}
+
+function normalizeLatestBoatRows(data) {
+  const list = Array.isArray(data)
+    ? data
+    : (Array.isArray(data?.items) ? data.items
+      : Array.isArray(data?.data) ? data.data
+        : Array.isArray(data?.boats) ? data.boats
+          : Array.isArray(data?.results) ? data.results
+            : []);
+  return list.map((row) => ({
+    boatCode: row.boatCode || row.BoatCode || row.boat_code,
+    boatName: row.boatName || row.BoatName || row.boat_name || null,
+    boatId: row.boatId || row.BoatId || row.boat_id || null,
+    deviceId: row.deviceId || row.DeviceId || row.device_id || null,
+    routeId: row.routeId || row.RouteId || null,
+    routeCode: row.routeCode || row.RouteCode || null,
+    tripId: row.tripId || row.TripId || null,
+    tripCode: row.tripCode || row.TripCode || null,
+    lat: row.lat ?? row.latitude ?? row.Latitude,
+    lng: row.lng ?? row.lon ?? row.longitude ?? row.Longitude,
+    speedKmh: row.speedKmh ?? row.SpeedKmh ?? row.speed_kmh,
+    heading: row.heading ?? row.Heading,
+    recordedAt: row.recordedAt || row.RecordedAt || row.recorded_at || null,
+    receivedAt: row.receivedAt || row.ReceivedAt || null,
+    sequence: row.sequence ?? row.Sequence ?? null,
+    isOnline: row.isOnline ?? row.IsOnline ?? row.is_online ?? true,
+  })).filter((row) => String(row.boatCode || '').trim());
 }
 
 async function loadEnv() {
@@ -1063,11 +1145,11 @@ function azureTravelMinutes(value) {
   return Math.max(1, Math.round(n));
 }
 
-async function getFromTargetApi(pathname, deviceId) {
+async function getFromTargetApi(pathname, deviceId, { silent = false } = {}) {
   const url = targetApiUrl(pathname);
   if (!url) {
     const result = { ok: false, error: 'Chua cau hinh TARGET_GPS_ENDPOINT', status: 400, at: new Date().toISOString(), path: pathname };
-    pushApiCallLog({ method: 'GET', ...result, request: null, url: null });
+    if (!silent) pushApiCallLog({ method: 'GET', ...result, request: null, url: null });
     return result;
   }
   try {
@@ -1091,33 +1173,37 @@ async function getFromTargetApi(pathname, deviceId) {
     if (!result.ok) {
       result.error = data?.error || data?.message || data?.title || `BE tra ${response.status}`;
     }
-    pushApiCallLog({
-      method: 'GET',
-      url,
-      path: pathname,
-      ok: result.ok,
-      status: result.status,
-      error: result.error,
-      at: result.at,
-      request: null,
-      response: summarizeApiPayload(data),
-      deviceId: deviceId || null,
-    });
+    if (!silent) {
+      pushApiCallLog({
+        method: 'GET',
+        url,
+        path: pathname,
+        ok: result.ok,
+        status: result.status,
+        error: result.error,
+        at: result.at,
+        request: null,
+        response: summarizeApiPayload(data),
+        deviceId: deviceId || null,
+      });
+    }
     return result;
   } catch (error) {
     const result = { ok: false, status: 502, data: null, error: error.message, at: new Date().toISOString(), path: pathname };
-    pushApiCallLog({
-      method: 'GET',
-      url,
-      path: pathname,
-      ok: false,
-      status: 502,
-      error: error.message,
-      at: result.at,
-      request: null,
-      response: null,
-      deviceId: deviceId || null,
-    });
+    if (!silent) {
+      pushApiCallLog({
+        method: 'GET',
+        url,
+        path: pathname,
+        ok: false,
+        status: 502,
+        error: error.message,
+        at: result.at,
+        request: null,
+        response: null,
+        deviceId: deviceId || null,
+      });
+    }
     return result;
   }
 }
@@ -2559,7 +2645,11 @@ function publicConfig() {
       const root = getTargetApiRoot();
       return root ? `${root}/hubs/tracking` : '';
     })(),
-    signalrStatus: state.signalrStatus,
+    signalrStatus: {
+      ...state.signalrStatus,
+      boatsLatestOkAt: boatsLatestLastOkAt,
+      boatsLatestError: boatsLatestLastError,
+    },
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),
