@@ -16,7 +16,7 @@
       <div>
         <a class="api-log-back" href="/">← GPS Survey</a>
         <h1>Log API đẩy lên BE</h1>
-        <p>Xem request / response Azure. Riêng bản sao chiều về: badge “ĐÃ TẠO / CHƯA LÊN BE” hiện ngay trên từng dòng from-gps.</p>
+        <p>Xem request / response Azure. Log lỗi <b>mặc định mở</b>; auto-refresh không đóng dòng đang xem.</p>
       </div>
       <div class="api-log-actions">
         <label class="api-log-filter">
@@ -28,6 +28,10 @@
             <option value="reverse">Chiếu về / bản sao</option>
             <option value="session">tracking session</option>
           </select>
+        </label>
+        <label class="api-log-autorefresh" title="Tắt nếu muốn đứng yên khi đọc">
+          <input id="autoRefresh" type="checkbox" checked>
+          <span>Auto làm mới</span>
         </label>
         <button id="refreshBtn" type="button">Làm mới</button>
         <button id="clearBtn" type="button" class="secondary">Xóa log</button>

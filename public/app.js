@@ -2431,7 +2431,7 @@ function renderRouteResult(body) {
         : (body.createReverseRoute
           ? '<p class="meta">Đã gửi createReverseRoute nhưng BE chưa trả reverseRoute.</p>'
           : ''))}
-    <p class="meta"><a href="/api-log.html">Xem log API đẩy BE →</a></p>
+    <p class="meta"><a href="/api-log.html" target="_blank" rel="noopener">Xem log API đẩy BE →</a></p>
   `;
   routeResultEl.classList.remove('hidden');
 }

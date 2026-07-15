@@ -3,16 +3,24 @@ const summaryEl = document.querySelector('#summary');
 const filterSelectEl = document.querySelector('#filterSelect');
 const refreshBtn = document.querySelector('#refreshBtn');
 const clearBtn = document.querySelector('#clearBtn');
+const autoRefreshEl = document.querySelector('#autoRefresh');
 
 let calls = [];
+/** Giữ các log đang mở — tránh auto-refresh đóng request body đang xem. */
+const openIds = new Set();
+let autoRefresh = true;
 
-async function loadCalls() {
-  summaryEl.textContent = 'Đang tải…';
+async function loadCalls({ silent = false } = {}) {
+  if (!silent) summaryEl.textContent = 'Đang tải…';
   try {
     const response = await fetch('/api/debug/calls');
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || 'Không tải được log');
     calls = Array.isArray(body.calls) ? body.calls : [];
+    // Lần đầu / log lỗi mới → mặc định mở để xem (không tự đóng).
+    for (const call of calls) {
+      if (call?.id && call.ok === false) openIds.add(call.id);
+    }
     render();
   } catch (error) {
     summaryEl.textContent = `Lỗi: ${error.message}`;
@@ -103,7 +111,17 @@ function reversePanelHtml(call) {
   `;
 }
 
+function captureOpenState() {
+  for (const el of listEl.querySelectorAll('.api-call')) {
+    const id = el.dataset.id;
+    if (!id) continue;
+    if (el.classList.contains('is-open')) openIds.add(id);
+    else openIds.delete(id);
+  }
+}
+
 function render() {
+  captureOpenState();
   const filter = filterSelectEl.value;
   const visible = calls.filter((call) => matchesFilter(call, filter));
   const errors = calls.filter((call) => !call.ok).length;
@@ -120,6 +138,7 @@ function render() {
     <span>Gửi chiều về: <b>${reverseAsked}</b></span>
     <span>BE tạo bản sao: <b>${reverseCreated}</b></span>
     ${sessionFails ? `<span class="api-sum-warn">session start lỗi: <b>${sessionFails}</b> → from-gps/chiều về chưa chạy</span>` : ''}
+    <span class="api-sum-hint">${autoRefresh ? 'Auto-refresh: bật (giữ dòng đang mở)' : 'Auto-refresh: tắt'}</span>
   `;
 
   if (!visible.length) {
@@ -133,8 +152,9 @@ function render() {
     const time = formatTime(call.at);
     const err = call.error ? `<div class="api-error-line">${escapeHtml(call.error)}</div>` : '';
     const reverseBadge = reverseBadgeHtml(call);
+    const isOpen = openIds.has(call.id);
     return `
-      <article class="api-call${!call.ok ? ' is-error' : ''}" data-id="${escapeHtml(call.id)}">
+      <article class="api-call${!call.ok ? ' is-error' : ''}${isOpen ? ' is-open' : ''}" data-id="${escapeHtml(call.id)}">
         <div class="api-call-head">
           <span class="api-badge ${okClass}">${okLabel} ${call.status ?? ''}</span>
           <span class="api-method">${escapeHtml(call.method || 'POST')}</span>
@@ -161,7 +181,12 @@ function render() {
 
   for (const head of listEl.querySelectorAll('.api-call-head')) {
     head.addEventListener('click', () => {
-      head.parentElement.classList.toggle('is-open');
+      const article = head.parentElement;
+      article.classList.toggle('is-open');
+      const id = article.dataset.id;
+      if (!id) return;
+      if (article.classList.contains('is-open')) openIds.add(id);
+      else openIds.delete(id);
     });
   }
 }
@@ -192,13 +217,21 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;');
 }
 
-refreshBtn.addEventListener('click', loadCalls);
+refreshBtn.addEventListener('click', () => loadCalls());
 filterSelectEl.addEventListener('change', render);
 clearBtn.addEventListener('click', async () => {
   if (!confirm('Xóa toàn bộ log API trong bộ nhớ server?')) return;
+  openIds.clear();
   await fetch('/api/debug/calls', { method: 'DELETE' });
   await loadCalls();
 });
 
+autoRefreshEl?.addEventListener('change', () => {
+  autoRefresh = Boolean(autoRefreshEl.checked);
+  render();
+});
+
 loadCalls();
-setInterval(loadCalls, 5000);
+setInterval(() => {
+  if (autoRefresh) loadCalls({ silent: true });
+}, 5000);
