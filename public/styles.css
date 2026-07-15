@@ -271,6 +271,11 @@ input[type="number"][readonly] {
   white-space: nowrap;
 }
 
+.stop-seg.is-schedule {
+  background: #ecfdf5;
+  color: #0f766e;
+}
+
 .stop-seg.is-missing {
   background: #f3f4f6;
   color: #6b7280;

@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { scheduleTravelMinutes, waterbusSchedulePublic } from './waterbus-schedule.js';
 
 const { Pool } = pg;
 
@@ -1127,7 +1128,8 @@ async function saveRouteFromGpsOnTarget(session, body) {
     }));
     const segmentTotal = sumTravelMinutes(stops);
     if (segmentTotal > 0) {
-      payload.estimatedDurationMin = segmentTotal;
+      // BE thường nhận int; từng đoạn vẫn giữ 1 số thập phân trong stops[].
+      payload.estimatedDurationMin = Math.max(1, Math.round(segmentTotal));
     }
     console.log(
       `[from-gps] ${payload.routeCode} segments:`,
@@ -1442,10 +1444,11 @@ async function createCapturedRoute(body) {
   // phút = (km / tốc_độ_chạy) × 60 · tốc độ ≤ max đăng ký
   const baseDistanceKm = round(lengthMeters / 1000, 3);
   const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh);
-  const estimatedDurationMin = Math.max(
-    1,
-    sumTravelMinutes(stopsWithTravel) || Math.round((baseDistanceKm / averageSpeedKmh) * 60),
+  const estimatedDurationExact = Number(
+    (sumTravelMinutes(stopsWithTravel) || ((baseDistanceKm / averageSpeedKmh) * 60)).toFixed(1),
   );
+  // Cột DB estimated_duration_min là int — làm tròn cận số đúng, không ép floor = 1 cho đoạn ngắn.
+  const estimatedDurationMin = Math.max(1, Math.round(estimatedDurationExact));
   const pointSql = points
     .map((point) => `ST_MakePoint(${point.lng}, ${point.lat})::geometry`)
     .join(', ');
@@ -2079,9 +2082,9 @@ function nearestPathProbe(path, stop) {
 }
 
 /**
- * Gắn standardTravelMin = phút chạy theo ĐƯỜNG GPS thực giữa 2 bến liên tiếp.
- * Không bịa bằng khoảng cách thẳng bến↔bến khi đường không đi qua đoạn đó.
- * A→B→C: A=null; B/C chỉ có phút nếu path thật sự có đoạn length > 0 giữa 2 điểm gắn bến.
+ * Gắn standardTravelMin:
+ * 1) nếu cặp bến có trong lịch Waterbus → lấy phút lịch (chuẩn đời thực)
+ * 2) không thì phút = (km đường GPS ÷ tốc độ) × 60 (1 số thập phân)
  */
 function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
   const path = Array.isArray(coordinates)
@@ -2090,12 +2093,14 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
   const list = Array.isArray(stops) ? stops.map((s) => ({ ...s })) : [];
   const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
   const nearM = Number(env.STOP_DETECT_RADIUS_M || 200);
+  const preferSchedule = parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true');
   if (!list.length) return [];
   if (list.length === 1 || path.length < 2) {
-    return list.map((stop, index) => ({
+    return list.map((stop) => ({
       ...stop,
       standardTravelMin: null,
       segmentDistanceKm: null,
+      travelSource: null,
     }));
   }
 
@@ -2105,7 +2110,6 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
       : { index: 0, alongMeters: 0, distToPath: Infinity }
   ));
 
-  // Ép chỉ số tăng dần dọc path (không lùi), nhưng không bịa tỉ lệ thẳng.
   for (let i = 1; i < probes.length; i += 1) {
     if (probes[i].alongMeters < probes[i - 1].alongMeters) {
       probes[i] = {
@@ -2118,24 +2122,36 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
 
   return list.map((stop, index) => {
     if (index === 0) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
+    const prevStop = list[index - 1];
     const prev = probes[index - 1];
     const cur = probes[index];
-    // Bến không nằm gần đường vẽ → không gán phút đoạn (không có “nối” thật).
     if (prev.distToPath > nearM || cur.distToPath > nearM) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
     const meters = cur.alongMeters - prev.alongMeters;
     if (!(meters > 5)) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
     const km = meters / 1000;
-    const minutes = Math.max(1, Math.round((km / speed) * 60));
+    const scheduled = preferSchedule
+      ? scheduleTravelMinutes(prevStop.stationCode, stop.stationCode)
+      : null;
+    if (scheduled != null) {
+      return {
+        ...stop,
+        standardTravelMin: scheduled,
+        segmentDistanceKm: round(km, 3),
+        travelSource: 'schedule',
+      };
+    }
+    const minutes = Number(((km / speed) * 60).toFixed(1));
     return {
       ...stop,
-      standardTravelMin: minutes,
+      standardTravelMin: minutes > 0 ? minutes : null,
       segmentDistanceKm: round(km, 3),
+      travelSource: 'gps',
     };
   });
 }
@@ -2352,6 +2368,9 @@ function publicConfig() {
     targetApiRoot: getTargetApiRoot(),
     hasApiKey: Boolean(state.targetApiKey),
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
+    // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
+    preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
+    waterbusSchedule: waterbusSchedulePublic(),
   };
 }
 

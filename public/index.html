@@ -200,7 +200,7 @@
               <select id="collectorBoatCode">
                 <option value="">Chọn tàu...</option>
               </select>
-              <small id="boatSpeedHint" class="field-hint">Vận tốc đăng ký = mức tối đa; nhập tốc độ chạy thực tế (≤ tối đa).</small>
+              <small id="boatSpeedHint" class="field-hint">Cặp bến có lịch Waterbus (vd Thanh Đa↔Thảo Điền = 12p) → lấy phút lịch. Tốc độ chỉ dùng cho đoạn chưa có lịch (mặc định 16 km/h ≈ đời thực).</small>
             </label>
             <div class="field-row">
               <label>
@@ -209,7 +209,7 @@
               </label>
               <label>
                 <span>Tốc độ chạy (km/h)</span>
-                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16" title="Tốc độ mô phỏng / tính thời gian; không vượt max đăng ký">
+                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16" title="Chỉ dùng khi đoạn không có trong lịch Waterbus; ≤ max đăng ký">
               </label>
             </div>
           </div>

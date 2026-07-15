@@ -817,6 +817,19 @@ function nearestPathIndexFe(path, stop) {
 }
 
 /** Phút chạy chỉ khi đường vẽ thật sự có đoạn giữa 2 bến (không bịa nối thẳng). */
+function scheduleTravelMinutesFe(fromCode, toCode) {
+  const segments = latest?.config?.waterbusSchedule?.segments || {};
+  const from = String(fromCode || '').trim().toUpperCase();
+  const to = String(toCode || '').trim().toUpperCase();
+  if (!from || !to) return null;
+  const value = segments[`${from}|${to}`];
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function preferWaterbusScheduleFe() {
+  return latest?.config?.preferWaterbusSchedule !== false;
+}
+
 function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
   const path = Array.isArray(coordinates)
     ? coordinates.filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
@@ -825,7 +838,7 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
   const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
   if (!list.length) return [];
   if (list.length === 1 || path.length < 2) {
-    return list.map((stop) => ({ ...stop, standardTravelMin: null, segmentDistanceKm: null }));
+    return list.map((stop) => ({ ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null }));
   }
 
   const probes = list.map((stop) => (
@@ -844,17 +857,34 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
   }
 
   return list.map((stop, index) => {
-    if (index === 0) return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    if (index === 0) return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
+    const prevStop = list[index - 1];
     const prev = probes[index - 1];
     const cur = probes[index];
     if (prev.distToPath > STOP_DETECT_RADIUS_M || cur.distToPath > STOP_DETECT_RADIUS_M) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
     const meters = cur.alongMeters - prev.alongMeters;
-    if (!(meters > 5)) return { ...stop, standardTravelMin: null, segmentDistanceKm: null };
+    if (!(meters > 5)) return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     const km = meters / 1000;
-    const minutes = Math.max(1, Math.round((km / speed) * 60));
-    return { ...stop, standardTravelMin: minutes, segmentDistanceKm: roundNumber(km, 3) };
+    const scheduled = preferWaterbusScheduleFe()
+      ? scheduleTravelMinutesFe(prevStop.stationCode, stop.stationCode)
+      : null;
+    if (scheduled != null) {
+      return {
+        ...stop,
+        standardTravelMin: scheduled,
+        segmentDistanceKm: roundNumber(km, 3),
+        travelSource: 'schedule',
+      };
+    }
+    const minutes = Number(((km / speed) * 60).toFixed(1));
+    return {
+      ...stop,
+      standardTravelMin: minutes > 0 ? minutes : null,
+      segmentDistanceKm: roundNumber(km, 3),
+      travelSource: 'gps',
+    };
   });
 }
 
@@ -893,11 +923,12 @@ function updateStopChainPreview(orderedInput) {
   const parts = [];
   withTravel.forEach((stop, index) => {
     if (index > 0) {
+      const src = stop.travelSource === 'schedule' ? ' lịch' : (stop.travelSource === 'gps' ? ' GPS' : '');
       const min = stop.standardTravelMin != null
-        ? `${stop.standardTravelMin} phút`
+        ? `${stop.standardTravelMin} phút${src}`
         : 'chưa đo';
       const km = stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : '';
-      parts.push(`<span class="stop-seg${stop.standardTravelMin == null ? ' is-missing' : ''}">${escapeHtml(min)}${escapeHtml(km)}</span>`);
+      parts.push(`<span class="stop-seg${stop.standardTravelMin == null ? ' is-missing' : ''}${stop.travelSource === 'schedule' ? ' is-schedule' : ''}">${escapeHtml(min)}${escapeHtml(km)}</span>`);
       parts.push('<span class="stop-sep">→</span>');
     }
     const tag = stop.isFirst ? 'Đầu' : (stop.isLast ? 'Cuối' : (stop.source === 'path-near' ? 'Đi qua' : `Giữa ${index}`));
@@ -1698,8 +1729,10 @@ function updateDrawStats() {
   const formulaEl = document.querySelector('#estimateFormula');
   if (formulaEl) {
     formulaEl.textContent = meters > 0
-      ? `(${km.toFixed(3)} km ÷ ${speed} km/h chạy) × 60 = ${minutesExact.toFixed(2)} phút · từng đoạn A→B tính riêng`
-      : 'phút = (km ÷ tốc độ chạy) × 60 · mỗi đoạn A→B tính riêng';
+      ? (preferWaterbusScheduleFe()
+        ? `Ưu tiên phút lịch Waterbus nếu khớp cặp bến; không có lịch → (${km.toFixed(3)} km ÷ ${speed} km/h) × 60 = ${minutesExact.toFixed(2)} phút`
+        : `(${km.toFixed(3)} km ÷ ${speed} km/h chạy) × 60 = ${minutesExact.toFixed(2)} phút · từng đoạn A→B tính riêng`)
+      : 'Ưu tiên lịch Waterbus khi khớp cặp bến; còn lại phút = (km ÷ tốc độ) × 60';
   }
   updateStopChainPreview();
 }
@@ -2044,7 +2077,7 @@ function renderRouteResult(body) {
       const prev = arr[index - 1];
       const segment = index > 0
         ? (stop.standardTravelMin != null
-          ? `<div class="route-result-seg">← ${stop.standardTravelMin} phút${stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : ''} trên đường GPS từ ${escapeHtml(prev?.stationName || prev?.stationCode || `bến ${order - 1}`)}</div>`
+          ? `<div class="route-result-seg">← ${stop.standardTravelMin} phút${stop.travelSource === 'schedule' ? ' (lịch Waterbus)' : ' (GPS×tốc độ)'}${stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : ''} từ ${escapeHtml(prev?.stationName || prev?.stationCode || `bến ${order - 1}`)}</div>`
           : `<div class="route-result-seg is-missing">← chưa đo được đoạn (đường không nối qua bến này)</div>`)
         : '';
       return `<li><strong>#${order}</strong> ${escapeHtml(stop.stationName || stop.stationCode || `Bến ${order}`)}${escapeHtml(code)}${segment}</li>`;
