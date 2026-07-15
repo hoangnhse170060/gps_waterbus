@@ -185,7 +185,7 @@ function catalogBoats(data = latest) {
 
 function catalogFingerprint(boats) {
   return (boats || [])
-    .map((b) => `${b.boatCode}:${b.boatName || ''}:${b.maxSpeedKmh || ''}`)
+    .map((b) => `${b.boatCode}:${b.boatName || ''}:${b.maxSpeedKmh || ''}:${b.numberOfDecks || ''}`)
     .join('|');
 }
 
@@ -323,6 +323,8 @@ function boatPopupHtml(code, catalogBoat, hub, lat, lng) {
   const phase = autoPhaseForBoat(code, lat, lng);
   const name = boatDisplayName(code, catalogBoat, hub);
   const label = phaseLabel(code, lat, lng);
+  const decks = boatDeckCount(code, catalogBoat);
+  const deckText = decks >= 2 ? '2 tầng' : '1 tầng';
   const dotClass = st.incident || phase === 'incident'
     ? 'is-incident'
     : (signal ? 'is-ok' : 'is-off');
@@ -332,19 +334,26 @@ function boatPopupHtml(code, catalogBoat, hub, lat, lng) {
         <i class="live-dot ${dotClass}" aria-hidden="true"></i>
         <span>${escapeHtml(name)}</span>
       </div>
+      <div class="live-boat-popup-meta">${escapeHtml(deckText)}</div>
       ${label ? `<div class="live-boat-popup-meta">${escapeHtml(label)}</div>` : ''}
     </div>
   `;
 }
 
-function boatColor({ signal, incident, phase, drag }) {
+function boatDeckCount(code, catalogBoat) {
+  const fromCatalog = Number(catalogBoat?.numberOfDecks);
+  if (Number.isFinite(fromCatalog) && fromCatalog > 0) return fromCatalog;
+  const fromLatest = Number((latest?.boats || []).find((b) => String(b.boatCode) === String(code))?.numberOfDecks);
+  if (Number.isFinite(fromLatest) && fromLatest > 0) return fromLatest;
+  return 1;
+}
+
+function boatColor({ signal, incident, phase, decks }) {
   if (incident || phase === 'incident') return '#dc2626';
-  if (drag) return '#0f766e';
   if (!signal) return '#94a3b8';
-  if (phase === 'approaching') return '#f59e0b';
-  if (phase === 'arrived' || phase === 'prepare') return '#16a34a';
-  if (phase === 'departing' || phase === 'enroute') return '#15803d';
-  return '#16a34a';
+  // 1 tầng teal · 2 tầng cam
+  if (Number(decks) >= 2) return '#ea580c';
+  return '#0f766e';
 }
 
 function boatIcon(heading = 0, opts = {}) {
@@ -709,11 +718,13 @@ function renderHubBoats(hubBoats) {
     const heading = Number(hub?.heading) || 0;
     const popupHtml = boatPopupHtml(code, catalogBoat, hub, trueLat, trueLng);
 
+    const decks = boatDeckCount(code, catalogBoat);
     const iconOpts = {
       drag: isSelected,
       signal: !st.incident && signal,
       incident: st.incident || phase === 'incident',
       phase,
+      decks,
     };
 
     let marker = hubMarkers.get(code);

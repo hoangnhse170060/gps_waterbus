@@ -95,6 +95,7 @@ select coalesce(jsonb_agg(jsonb_build_object(
   'boatName', b.boat_name,
   'status', b.status,
   'maxSpeedKmh', b.max_speed_kmh,
+  'numberOfDecks', b.number_of_decks,
   'tripId', t.trip_id,
   'routeId', coalesce(t.route_id, (select route_id from default_route))
 )), '[]'::jsonb)
@@ -596,6 +597,7 @@ async function refreshFromDatabase() {
         boatCode: dbBoat.boatCode,
         boatName: dbBoat.boatName,
         dbStatus: dbBoat.status,
+        numberOfDecks: Number(dbBoat.numberOfDecks) || 1,
         routeId: route ? route.routeId : null,
         routeCode: route ? route.routeCode : null,
         routeName: route ? route.routeName : null,

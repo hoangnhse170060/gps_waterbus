@@ -216,13 +216,12 @@
   vertical-align: 2px;
 }
 
-.leg-signal {
-  background: #16a34a;
-  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.25);
+.leg-deck1 {
+  background: #0f766e;
 }
 
-.leg-warn {
-  background: #f59e0b;
+.leg-deck2 {
+  background: #ea580c;
 }
 
 .leg-incident {
