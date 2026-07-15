@@ -138,6 +138,11 @@ const BOAT_DRAFT_COLORS = ['#0f766e', '#2563eb', '#c2410c', '#7c3aed', '#0891b2'
 let boatDrafts = loadBoatDrafts();
 const otherBoatDraftLayers = new Map();
 let signalrConnection = null;
+const signalrLiveMarkers = new Map();
+let signalrConnectedOnce = false;
+
+/** Bán kính Trái Đất WGS84 mean (mét) — dùng thống nhất FE/BE. */
+const EARTH_RADIUS_M = 6371008.8;
 
 const captureState = {
   enabled: false,
@@ -688,32 +693,76 @@ function connectSignalRIfConfigured(config = latest?.config) {
   if (signalrConnection) return;
   try {
     signalrConnection = new signalR.HubConnectionBuilder()
-      .withUrl(hubUrl)
-      .withAutomaticReconnect()
+      .withUrl(hubUrl, { withCredentials: false })
+      .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
       .build();
-    signalrConnection.on('boatLocation', (payload) => {
-      // Hook sẵn — BE hub đẩy vị trí tàu thì cập nhật marker live.
-      if (!payload?.boatCode) return;
-      console.log('[signalr] boatLocation', payload.boatCode, payload.lat, payload.lng);
+
+    const onBoatLocation = (payload) => {
+      upsertSignalRBoatLocation(payload);
+    };
+    signalrConnection.on('boatLocation', onBoatLocation);
+    signalrConnection.on('BoatLocationUpdated', onBoatLocation);
+
+    signalrConnection.onreconnecting((err) => {
+      if (sendLogEl) sendLogEl.textContent = `SignalR reconnecting… ${err?.message || ''}`.trim();
     });
-    signalrConnection.on('BoatLocationUpdated', (payload) => {
-      if (!payload?.boatCode) return;
-      console.log('[signalr] BoatLocationUpdated', payload.boatCode);
+    signalrConnection.onreconnected(() => {
+      if (sendLogEl) sendLogEl.textContent = `SignalR reconnected: ${hubUrl}`;
+      notifyOk('SignalR đã kết nối lại.');
     });
+    signalrConnection.onclose(() => {
+      signalrConnection = null;
+      signalrConnectedOnce = false;
+      if (sendLogEl) sendLogEl.textContent = 'SignalR disconnected';
+    });
+
     signalrConnection.start()
       .then(() => {
+        signalrConnectedOnce = true;
         if (sendLogEl) sendLogEl.textContent = `SignalR connected: ${hubUrl}`;
-        notifyOk('SignalR đã kết nối.');
+        notifyOk('SignalR đã kết nối /hubs/tracking.');
       })
       .catch((error) => {
         console.warn('[signalr] connect failed', error.message);
-        notifyErr(`SignalR lỗi: ${error.message}`);
+        if (!signalrConnectedOnce) {
+          notifyWarn(`SignalR chưa nối được (${error.message}). BE cần deploy hub /hubs/tracking.`);
+        }
         signalrConnection = null;
       });
   } catch (error) {
     console.warn('[signalr]', error.message);
-    notifyErr(`SignalR lỗi: ${error.message}`);
+    notifyWarn(`SignalR lỗi: ${error.message}`);
     signalrConnection = null;
+  }
+}
+
+function upsertSignalRBoatLocation(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const code = String(payload.boatCode || '').trim();
+  const lat = Number(payload.lat);
+  const lng = Number(payload.lng);
+  if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const heading = Number(payload.heading);
+  const speed = payload.speedKmh != null ? Number(payload.speedKmh) : null;
+  const online = payload.isOnline !== false;
+  let marker = signalrLiveMarkers.get(code);
+  const tip = [
+    code,
+    payload.boatName || '',
+    Number.isFinite(speed) ? `${speed} km/h` : '',
+    online ? 'online' : 'offline',
+  ].filter(Boolean).join(' · ');
+  if (!marker) {
+    marker = L.marker([lat, lng], {
+      icon: boatIcon(Number.isFinite(heading) ? heading : 0),
+      zIndexOffset: 1200,
+    }).addTo(map);
+    marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -18] });
+    signalrLiveMarkers.set(code, marker);
+  } else {
+    marker.setLatLng([lat, lng]);
+    if (Number.isFinite(heading)) marker.setIcon(boatIcon(heading));
+    marker.setTooltipContent(tip);
   }
 }
 
@@ -1875,9 +1924,9 @@ function clearSelectedRouteHighlight() {
 }
 
 function pathLengthMeters(points) {
-  const path = points === captureState.points ? expandPath(points) : points;
+  // Luôn đo trên đường WYSIWYG đã expand (thẳng + cong bezier), không đo đường thẳng bến↔bến.
+  const path = expandPath(Array.isArray(points) ? points : []);
   if (path.length < 2) return 0;
-  // Haversine giống server — km/thời gian FE khớp 1:1 với DB khi lưu.
   let total = 0;
   for (let i = 1; i < path.length; i += 1) {
     total += haversineMeters(path[i - 1], path[i]);
@@ -1886,14 +1935,14 @@ function pathLengthMeters(points) {
 }
 
 function haversineMeters(a, b) {
-  const earth = 6371000;
   const toRad = (value) => (Number(value) * Math.PI) / 180;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
   const lat1 = toRad(a.lat);
   const lat2 = toRad(b.lat);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+  const dLat = lat2 - lat1;
+  const dLng = toRad(Number(b.lng) - Number(a.lng));
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
 }
 
 function estimateTravelMinutes(meters, speedKmh) {

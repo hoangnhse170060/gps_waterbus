@@ -369,7 +369,7 @@ async function refreshFromDatabase() {
           lengthMeters: routeLength(coordinates),
           baseDistanceKm: route.baseDistanceKm != null
             ? Number(route.baseDistanceKm)
-            : round(routeLength(coordinates) / 1000, 2),
+            : round(routeLength(coordinates) / 1000, 3),
           estimatedDurationMin: route.estimatedDurationMin != null
             ? Number(route.estimatedDurationMin)
             : null,
@@ -2129,6 +2129,19 @@ function routeLength(points) {
   return total;
 }
 
+function distanceMeters(a, b) {
+  // WGS84 mean radius — khớp FE haversine (km thực tế dọc polyline GPS).
+  const earth = 6371008.8;
+  const toRad = (value) => (Number(value) * Math.PI) / 180;
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const dLat = lat2 - lat1;
+  const dLng = toRad(Number(b.lng) - Number(a.lng));
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
+}
+
 /** Index điểm trên path gần stop nhất + khoảng cách dọc path tới điểm đó. */
 function nearestPathProbe(path, stop) {
   let bestIdx = 0;
@@ -2243,16 +2256,6 @@ function pointAtDistance(points, targetMeters) {
   const previous = points.at(-2) || points[0];
   const last = points.at(-1);
   return { lat: last.lat, lng: last.lng, heading: bearingDegrees(previous, last) };
-}
-
-function distanceMeters(a, b) {
-  const earth = 6371000;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 
 function bearingDegrees(a, b) {
@@ -2434,7 +2437,12 @@ function publicConfig() {
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
     surveyDeviceId: surveyDeviceId(),
     gpsDevices: Object.fromEntries(state.gpsDevicesByBoatCode.entries()),
-    signalrHubUrl: cleanOptionalText(env.SIGNALR_HUB_URL) || '',
+    signalrHubUrl: (() => {
+      const configured = cleanOptionalText(env.SIGNALR_HUB_URL);
+      if (configured) return configured;
+      const root = getTargetApiRoot();
+      return root ? `${root}/hubs/tracking` : '';
+    })(),
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),

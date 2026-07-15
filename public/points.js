@@ -941,13 +941,14 @@ function pathLengthMeters(points) {
 }
 
 function distanceMeters(a, b) {
-  const earth = 6371000;
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
+  // WGS84 mean radius — khớp app.js / server (km thực tế dọc polyline).
+  const earth = 6371008.8;
+  const dLat = toRad(Number(b.lat) - Number(a.lat));
+  const dLng = toRad(Number(b.lng) - Number(a.lng));
+  const lat1 = toRad(Number(a.lat));
+  const lat2 = toRad(Number(b.lat));
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
 }
 
 function toRad(value) {
