@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { scheduleTravelMinutes, waterbusSchedulePublic } from './waterbus-schedule.js';
 import { createSignalRRelay } from './signalr-relay.js';
+import { distanceMeters, routeLength } from './geo-distance.js';
 
 const { Pool } = pg;
 
@@ -2233,24 +2234,7 @@ function parseRouteCoordinates(geojson) {
   return [];
 }
 
-function routeLength(points) {
-  let total = 0;
-  for (let i = 1; i < points.length; i += 1) total += distanceMeters(points[i - 1], points[i]);
-  return total;
-}
-
-function distanceMeters(a, b) {
-  // WGS84 mean radius — khớp FE haversine (km thực tế dọc polyline GPS).
-  const earth = 6371008.8;
-  const toRad = (value) => (Number(value) * Math.PI) / 180;
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
-  const dLat = lat2 - lat1;
-  const dLng = toRad(Number(b.lng) - Number(a.lng));
-  const h = Math.sin(dLat / 2) ** 2
-    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return 2 * earth * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
-}
+// routeLength / distanceMeters → Turf WGS84 (@/src/geo-distance.js)
 
 /** Index điểm trên path gần stop nhất + khoảng cách dọc path tới điểm đó. */
 function nearestPathProbe(path, stop) {

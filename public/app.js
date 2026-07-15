@@ -1897,17 +1897,17 @@ function clearSelectedRouteHighlight() {
 }
 
 function pathLengthMeters(points) {
-  // Luôn đo trên đường WYSIWYG đã expand (thẳng + cong bezier), không đo đường thẳng bến↔bến.
+  // Turf.js WGS84 dọc polyline WYSIWYG (thẳng + cong đã expand).
   const path = expandPath(Array.isArray(points) ? points : []);
+  if (typeof GeoDistance !== 'undefined') return GeoDistance.pathLengthMeters(path);
   if (path.length < 2) return 0;
   let total = 0;
-  for (let i = 1; i < path.length; i += 1) {
-    total += haversineMeters(path[i - 1], path[i]);
-  }
+  for (let i = 1; i < path.length; i += 1) total += haversineMeters(path[i - 1], path[i]);
   return total;
 }
 
 function haversineMeters(a, b) {
+  if (typeof GeoDistance !== 'undefined') return GeoDistance.distanceMeters(a, b);
   const toRad = (value) => (Number(value) * Math.PI) / 180;
   const lat1 = toRad(a.lat);
   const lat2 = toRad(b.lat);

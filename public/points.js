@@ -933,6 +933,7 @@ function getSegmentExpandedPoints(index) {
 }
 
 function pathLengthMeters(points) {
+  if (typeof GeoDistance !== 'undefined') return GeoDistance.pathLengthMeters(points);
   let total = 0;
   for (let i = 1; i < points.length; i += 1) {
     total += distanceMeters(points[i - 1], points[i]);
@@ -941,7 +942,7 @@ function pathLengthMeters(points) {
 }
 
 function distanceMeters(a, b) {
-  // WGS84 mean radius — khớp app.js / server (km thực tế dọc polyline).
+  if (typeof GeoDistance !== 'undefined') return GeoDistance.distanceMeters(a, b);
   const earth = 6371008.8;
   const dLat = toRad(Number(b.lat) - Number(a.lat));
   const dLng = toRad(Number(b.lng) - Number(a.lng));
