@@ -338,13 +338,19 @@ async function loadEnv() {
 
 async function refreshFromDatabase() {
   try {
-    const [boats, routes, stations, routeStops, gpsDevices] = await Promise.all([
+    let [boats, routes, stations, routeStops, gpsDevices] = await Promise.all([
       queryJson(boatsSql),
       queryJson(routesSql),
       queryJson(stationsSql),
       queryJson(routeStopsSql),
       queryJson(gpsDevicesSql).catch(() => []),
     ]);
+
+    // Tàu mới thêm vào boats → tự insert gps_devices (device_id = gps-{boatcode}).
+    const registeredCount = await ensureGpsDevicesForBoats(boats);
+    if (registeredCount > 0) {
+      gpsDevices = await queryJson(gpsDevicesSql).catch(() => gpsDevices);
+    }
 
     state.gpsDevicesByBoatCode = new Map();
     for (const row of Array.isArray(gpsDevices) ? gpsDevices : []) {
@@ -2042,6 +2048,40 @@ async function queryJson(sql) {
   return value;
 }
 
+/** Tự đăng ký gps_devices cho tàu Active chưa có device (thêm tàu mới vẫn dùng được survey). */
+async function ensureGpsDevicesForBoats(boats) {
+  if (!dbPool || !parseBool(env.AUTO_REGISTER_GPS_DEVICES ?? 'true')) return 0;
+  const list = Array.isArray(boats) ? boats : [];
+  if (!list.length) return 0;
+  let inserted = 0;
+  for (const boat of list) {
+    const boatId = boat.boatId || boat.boat_id;
+    const boatCode = String(boat.boatCode || boat.boat_code || '').trim();
+    if (!boatId || !boatCode) continue;
+    const deviceId = `gps-${boatCode.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+    try {
+      const result = await dbPool.query(
+        `
+        insert into gps_devices (gps_device_id, device_id, boat_id, is_active, created_at, updated_at)
+        select $1::uuid, $2, $3::uuid, true, now(), now()
+        where not exists (
+          select 1 from gps_devices where boat_id = $3::uuid
+        )
+        returning device_id
+        `,
+        [randomUUID(), deviceId, boatId],
+      );
+      if (result.rowCount > 0) {
+        inserted += 1;
+        console.log(`[gps-device] Auto-registered ${boatCode} → ${deviceId}`);
+      }
+    } catch (error) {
+      console.warn(`[gps-device] Auto-register ${boatCode} failed: ${error.message}`);
+    }
+  }
+  return inserted;
+}
+
 function cleanRouteText(value, label) {
   const text = String(value ?? '').trim();
   if (!text) throw userError(`${label} is required`);
@@ -2394,6 +2434,7 @@ function publicConfig() {
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
     surveyDeviceId: surveyDeviceId(),
     gpsDevices: Object.fromEntries(state.gpsDevicesByBoatCode.entries()),
+    signalrHubUrl: cleanOptionalText(env.SIGNALR_HUB_URL) || '',
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),

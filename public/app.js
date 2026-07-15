@@ -39,6 +39,8 @@ const endStationEl = document.querySelector('#endStation');
 const collectorBoatCodeEl = document.querySelector('#collectorBoatCode');
 const collectorSpeedEl = document.querySelector('#collectorSpeed');
 const boatSpeedHintEl = document.querySelector('#boatSpeedHint');
+const boatDraftBarEl = document.querySelector('#boatDraftBar');
+const copyDraftAllBoatsEl = document.querySelector('#copyDraftAllBoats');
 const captureTripIdEl = document.querySelector('#captureTripId');
 const sendIntervalSecEl = document.querySelector('#sendIntervalSec');
 const startCollectorEl = document.querySelector('#startCollector');
@@ -74,6 +76,30 @@ const reverseRouteCodeHintEl = document.querySelector('#reverseRouteCodeHint');
 const stopChainPreviewEl = document.querySelector('#stopChainPreview');
 const workflowStepsEl = document.querySelector('#workflowSteps');
 const routeStopsListEl = document.querySelector('#routeStopsList');
+const toastHostEl = document.querySelector('#toastHost');
+
+function toast(message, type = 'info', ms = 3200) {
+  const text = String(message || '').trim();
+  if (!text) return;
+  if (!toastHostEl) {
+    console.log(`[toast:${type}]`, text);
+    return;
+  }
+  const el = document.createElement('div');
+  el.className = `toast is-${type === 'error' ? 'err' : type}`;
+  el.textContent = text;
+  toastHostEl.appendChild(el);
+  window.setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transition = 'opacity 0.2s ease';
+    window.setTimeout(() => el.remove(), 220);
+  }, Math.max(1600, Number(ms) || 3200));
+}
+
+function notifyOk(message, ms) { toast(message, 'ok', ms); }
+function notifyErr(message, ms) { toast(message, 'err', ms || 4500); }
+function notifyWarn(message, ms) { toast(message, 'warn', ms || 4000); }
+function notifyInfo(message, ms) { toast(message, 'info', ms); }
 
 const markers = new Map();
 const routeLayers = new Map();
@@ -107,6 +133,11 @@ let routeCodeOk = true;
 let selectedStartStationId = '';
 let selectedEndStationId = '';
 let selectedCollectorBoatCode = localStorage.getItem('surveyBoatCode') || '';
+const BOAT_DRAFT_STORAGE_KEY = 'surveyBoatDrafts.v1';
+const BOAT_DRAFT_COLORS = ['#0f766e', '#2563eb', '#c2410c', '#7c3aed', '#0891b2', '#b45309', '#be123c', '#15803d'];
+let boatDrafts = loadBoatDrafts();
+const otherBoatDraftLayers = new Map();
+let signalrConnection = null;
 
 const captureState = {
   enabled: false,
@@ -429,15 +460,262 @@ toolClearEl?.addEventListener('click', () => {
 });
 finishDrawEl?.addEventListener('click', finishDraw);
 collectorBoatCodeEl?.addEventListener('change', () => {
-  selectedCollectorBoatCode = collectorBoatCodeEl.value.trim();
-  if (selectedCollectorBoatCode) localStorage.setItem('surveyBoatCode', selectedCollectorBoatCode);
-  applyBoatSpeedLimits();
-  updateDrawStats();
+  const next = collectorBoatCodeEl.value.trim();
+  switchBoatDraft(next);
+});
+copyDraftAllBoatsEl?.addEventListener('click', () => {
+  copyActiveDraftToAllBoats();
 });
 collectorSpeedEl?.addEventListener('input', () => {
   applyBoatSpeedLimits();
   updateDrawStats();
 });
+
+function loadBoatDrafts() {
+  try {
+    const raw = localStorage.getItem(BOAT_DRAFT_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistBoatDrafts() {
+  try {
+    localStorage.setItem(BOAT_DRAFT_STORAGE_KEY, JSON.stringify(boatDrafts));
+  } catch {
+    // ignore quota
+  }
+}
+
+function boatDraftColor(boatCode, indexHint = 0) {
+  const codes = catalogBoats().map((b) => b.boatCode);
+  const idx = Math.max(0, codes.indexOf(boatCode));
+  return BOAT_DRAFT_COLORS[(idx >= 0 ? idx : indexHint) % BOAT_DRAFT_COLORS.length];
+}
+
+function snapshotActiveDraft() {
+  return {
+    points: captureState.points.map((p) => ({ ...p })),
+    finished: Boolean(captureState.finished),
+    lineMode: captureState.lineMode || 'straight',
+    routeCode: captureRouteCodeEl?.value.trim() || '',
+    routeName: captureRouteNameEl?.value.trim() || '',
+    startStationId: startStationEl?.value || '',
+    endStationId: endStationEl?.value || '',
+    createReverseRoute: Boolean(createReverseRouteEl?.checked),
+    reverseRouteCode: reverseRouteCodeEl?.value.trim() || '',
+    reverseRouteName: reverseRouteNameEl?.value.trim() || '',
+    speedKmh: Number(collectorSpeedEl?.value || 16),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function saveActiveBoatDraft(boatCode = selectedCollectorBoatCode || collectorBoatCodeEl?.value.trim()) {
+  const code = String(boatCode || '').trim();
+  if (!code) return;
+  if (captureState.points.length < 1
+    && !captureRouteCodeEl?.value.trim()
+    && !startStationEl?.value) {
+    // Keep empty? still store meta if existed.
+    if (!boatDrafts[code]) return;
+  }
+  boatDrafts[code] = snapshotActiveDraft();
+  persistBoatDrafts();
+  renderBoatDraftBar();
+  renderOtherBoatDraftLayers();
+}
+
+function applyBoatDraft(draft) {
+  clearCapturePoints();
+  clearPlannedRoute();
+  unlockSurveyPath();
+  const data = draft || {};
+  captureState.finished = Boolean(data.finished);
+  captureState.lineMode = data.lineMode === 'curve' ? 'curve' : 'straight';
+  modeStraightEl?.classList.toggle('is-active', captureState.lineMode === 'straight');
+  modeCurveEl?.classList.toggle('is-active', captureState.lineMode === 'curve');
+  captureState.points = Array.isArray(data.points)
+    ? data.points.map((p) => ({ ...p }))
+    : [];
+  if (captureRouteCodeEl) captureRouteCodeEl.value = data.routeCode || '';
+  if (captureRouteNameEl) captureRouteNameEl.value = data.routeName || '';
+  if (data.startStationId) setStationComboValue('start', data.startStationId, { emitChange: false });
+  else setStationComboValue('start', '', { emitChange: false });
+  if (data.endStationId) {
+    setStationComboValue('end', data.endStationId, { emitChange: false });
+  } else {
+    setStationComboValue('end', '', { emitChange: false });
+  }
+  syncEndStationDisplay();
+  if (createReverseRouteEl) createReverseRouteEl.checked = Boolean(data.createReverseRoute);
+  if (reverseRouteCodeEl) reverseRouteCodeEl.value = data.reverseRouteCode || '';
+  if (reverseRouteNameEl) reverseRouteNameEl.value = data.reverseRouteName || '';
+  if (collectorSpeedEl && Number(data.speedKmh) > 0) collectorSpeedEl.value = String(data.speedKmh);
+  updateReverseRouteUi();
+  rebuildCaptureMarkers();
+  renderCaptureLine();
+  renderCaptureState();
+  updateDrawStats();
+  updateRouteTypeHint();
+}
+
+function switchBoatDraft(nextBoatCode) {
+  const next = String(nextBoatCode || '').trim();
+  if (recordingActive || lockedSurveyPath) {
+    captureStatusEl.textContent = 'Đang ghi GPS — không đổi tàu lúc này.';
+    notifyWarn('Đang ghi GPS — không đổi tàu lúc này.');
+    if (collectorBoatCodeEl) collectorBoatCodeEl.value = selectedCollectorBoatCode || '';
+    return;
+  }
+  if (selectedCollectorBoatCode && selectedCollectorBoatCode !== next) {
+    saveActiveBoatDraft(selectedCollectorBoatCode);
+  }
+  selectedCollectorBoatCode = next;
+  if (collectorBoatCodeEl) collectorBoatCodeEl.value = next;
+  if (next) localStorage.setItem('surveyBoatCode', next);
+  applyBoatDraft(boatDrafts[next] || null);
+  applyBoatSpeedLimits();
+  updateDrawStats();
+  renderBoatDraftBar();
+  renderOtherBoatDraftLayers();
+  const pts = captureState.points.length;
+  captureStatusEl.textContent = next
+    ? (pts ? `Đang vẽ cho ${next} · ${pts} điểm` : `Đang vẽ cho ${next} — chưa có điểm`)
+    : 'Chọn tàu để gán bản vẽ.';
+}
+
+function copyActiveDraftToAllBoats() {
+  if (captureState.points.length < 2) {
+    captureStatusEl.textContent = 'Cần ≥ 2 điểm trước khi nhân bản cho mọi tàu.';
+    notifyWarn('Cần ≥ 2 điểm trước khi nhân bản cho mọi tàu.');
+    return;
+  }
+  saveActiveBoatDraft();
+  const source = snapshotActiveDraft();
+  const boats = catalogBoats();
+  if (!boats.length) {
+    captureStatusEl.textContent = 'Chưa có danh sách tàu để nhân bản.';
+    notifyWarn('Chưa có danh sách tàu để nhân bản.');
+    return;
+  }
+  let count = 0;
+  for (const boat of boats) {
+    const code = boat.boatCode;
+    if (!code) continue;
+    boatDrafts[code] = {
+      ...JSON.parse(JSON.stringify(source)),
+      // Giữ routeCode riêng theo tàu nếu muốn nhanh: thêm suffix khi khác tàu active.
+      routeCode: code === selectedCollectorBoatCode
+        ? source.routeCode
+        : (source.routeCode ? `${source.routeCode}-${code}` : ''),
+      updatedAt: new Date().toISOString(),
+    };
+    count += 1;
+  }
+  persistBoatDrafts();
+  renderBoatDraftBar();
+  renderOtherBoatDraftLayers();
+  captureStatusEl.textContent = `Đã nhân bản đường cho ${count} tàu. Chọn từng tàu để chỉnh/ghi GPS.`;
+  notifyOk(`Đã nhân bản đường cho ${count} tàu.`);
+}
+
+function renderBoatDraftBar() {
+  if (!boatDraftBarEl) return;
+  const boats = catalogBoats();
+  if (!boats.length) {
+    boatDraftBarEl.innerHTML = '';
+    return;
+  }
+  boatDraftBarEl.innerHTML = boats.map((boat) => {
+    const code = boat.boatCode;
+    const draft = boatDrafts[code];
+    const hasDraft = Array.isArray(draft?.points) && draft.points.length >= 2;
+    const active = code === (selectedCollectorBoatCode || collectorBoatCodeEl?.value);
+    const color = boatDraftColor(code);
+    return `<button type="button" class="boat-draft-chip${hasDraft ? ' has-draft' : ''}${active ? ' is-active' : ''}" data-boat="${escapeHtml(code)}" style="--boat-color:${color}" title="${hasDraft ? `${draft.points.length} điểm` : 'Chưa có đường'}">${escapeHtml(code)}${hasDraft ? ' ·' : ''}</button>`;
+  }).join('');
+  for (const btn of boatDraftBarEl.querySelectorAll('[data-boat]')) {
+    btn.addEventListener('click', () => {
+      const code = btn.getAttribute('data-boat') || '';
+      if (collectorBoatCodeEl) collectorBoatCodeEl.value = code;
+      switchBoatDraft(code);
+    });
+  }
+}
+
+function clearOtherBoatDraftLayers() {
+  for (const layer of otherBoatDraftLayers.values()) layer.remove();
+  otherBoatDraftLayers.clear();
+}
+
+function draftPathLatLngs(draft) {
+  const points = Array.isArray(draft?.points) ? draft.points : [];
+  if (points.length < 2) return [];
+  // Dùng polyline thô theo waypoint (không densify) để nhẹ.
+  return points.map((p) => [Number(p.lat), Number(p.lng)]);
+}
+
+function renderOtherBoatDraftLayers() {
+  clearOtherBoatDraftLayers();
+  const active = selectedCollectorBoatCode || collectorBoatCodeEl?.value.trim() || '';
+  Object.entries(boatDrafts).forEach(([code, draft], index) => {
+    if (code === active) return;
+    const latlngs = draftPathLatLngs(draft);
+    if (latlngs.length < 2) return;
+    const color = boatDraftColor(code, index);
+    const layer = L.polyline(latlngs, {
+      color,
+      weight: 4,
+      opacity: 0.45,
+      dashArray: '6 8',
+      smoothFactor: 0,
+      interactive: true,
+    }).addTo(map);
+    layer.bindTooltip(`${code}${draft.routeCode ? ` · ${draft.routeCode}` : ''}`, { sticky: true });
+    layer.on('click', () => {
+      if (collectorBoatCodeEl) collectorBoatCodeEl.value = code;
+      switchBoatDraft(code);
+    });
+    otherBoatDraftLayers.set(code, layer);
+  });
+}
+
+function connectSignalRIfConfigured(config = latest?.config) {
+  const hubUrl = String(config?.signalrHubUrl || '').trim();
+  if (!hubUrl || typeof signalR === 'undefined') return;
+  if (signalrConnection) return;
+  try {
+    signalrConnection = new signalR.HubConnectionBuilder()
+      .withUrl(hubUrl)
+      .withAutomaticReconnect()
+      .build();
+    signalrConnection.on('boatLocation', (payload) => {
+      // Hook sẵn — BE hub đẩy vị trí tàu thì cập nhật marker live.
+      if (!payload?.boatCode) return;
+      console.log('[signalr] boatLocation', payload.boatCode, payload.lat, payload.lng);
+    });
+    signalrConnection.on('BoatLocationUpdated', (payload) => {
+      if (!payload?.boatCode) return;
+      console.log('[signalr] BoatLocationUpdated', payload.boatCode);
+    });
+    signalrConnection.start()
+      .then(() => {
+        if (sendLogEl) sendLogEl.textContent = `SignalR connected: ${hubUrl}`;
+        notifyOk('SignalR đã kết nối.');
+      })
+      .catch((error) => {
+        console.warn('[signalr] connect failed', error.message);
+        notifyErr(`SignalR lỗi: ${error.message}`);
+        signalrConnection = null;
+      });
+  } catch (error) {
+    console.warn('[signalr]', error.message);
+    notifyErr(`SignalR lỗi: ${error.message}`);
+    signalrConnection = null;
+  }
+}
 
 function setDrawTool(tool) {
   captureState.enabled = tool === 'draw';
@@ -1572,6 +1850,10 @@ function renderCaptureState() {
     finishDrawEl.disabled = captureState.points.length < 2 || captureState.finished;
   }
   updateDrawStats();
+  // Auto-lưu bản vẽ theo tàu đang chọn (đổi tàu không mất đường).
+  if (!recordingActive && !lockedSurveyPath) {
+    saveActiveBoatDraft();
+  }
 }
 
 function clearSelectedRouteHighlight() {
@@ -1695,8 +1977,14 @@ function renderCollectorBoatOptions(boats) {
   collectorBoatCodeEl.value = preferred;
   selectedCollectorBoatCode = preferred;
   if (preferred) localStorage.setItem('surveyBoatCode', preferred);
+  // Lần đầu / khi chưa có điểm trên editor → nạp bản vẽ của tàu đang chọn.
+  if (!captureState.points.length && preferred && boatDrafts[preferred]) {
+    applyBoatDraft(boatDrafts[preferred]);
+  }
   applyBoatSpeedLimits();
   updateDrawStats();
+  renderBoatDraftBar();
+  renderOtherBoatDraftLayers();
 }
 
 function updateDrawStats() {
@@ -1872,12 +2160,15 @@ async function startRecording() {
     collectorStatusEl.textContent = `Đang chạy ${body.boatCode} · ${body.deviceId}`;
     gpsStatusEl.textContent = 'Đang ghi GPS';
     ensureSurveyPathVisible();
+    if (body.targetSessionWarning) notifyWarn(`Ghi GPS: ${body.targetSessionWarning}`);
+    else notifyOk(`Bắt đầu ghi GPS · ${body.boatCode} · ${body.deviceId}`);
   } catch (error) {
     recordingActive = false;
     recordingStartedAt = 0;
     lockedSurveyPath = null;
     clearPlannedRoute();
     captureStatusEl.textContent = `Lỗi: ${error.message}`;
+    notifyErr(`Không bắt đầu ghi GPS: ${error.message}`);
     startCollectorEl.disabled = false;
     startCollectorEl.textContent = 'Bắt đầu ghi GPS';
   } finally {
@@ -1984,6 +2275,8 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     updateWorkflow('done');
     gpsStatusEl.textContent = 'Lưu thành công';
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
+    if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
+    else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
     unlockSurveyPath();
     clearPlannedRoute();
     if (silentClear) {
@@ -1999,6 +2292,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     return true;
   } catch (error) {
     captureStatusEl.textContent = `Lỗi: ${error.message}`;
+    notifyErr(`Lưu thất bại: ${error.message}`);
     return false;
   } finally {
     autoSaveInFlight = false;
@@ -2138,6 +2432,7 @@ function handleAutoSavedRoute(autoSaved) {
   if (autoSaved.ok === false || autoSaved.error) {
     captureStatusEl.textContent = `Lỗi tự lưu: ${autoSaved.error || 'Không lưu được'}`;
     gpsStatusEl.textContent = 'Lưu thất bại';
+    notifyErr(`Tự lưu thất bại: ${autoSaved.error || 'Không lưu được'}`);
     updateWorkflow('run');
     return;
   }
@@ -2147,6 +2442,8 @@ function handleAutoSavedRoute(autoSaved) {
   captureStatusEl.textContent = `Đã tự lưu ${autoSaved.routeCode || ''} lên ${where}.${warn}`;
   gpsStatusEl.textContent = 'Lưu thành công';
   sendLogEl.textContent = `Tuyến ${autoSaved.routeCode || ''} đã đẩy lên ${where}.`;
+  if (autoSaved.warning) notifyWarn(`Tự lưu ${autoSaved.routeCode || ''} lên ${where}${warn}`);
+  else notifyOk(`Tự lưu thành công: ${autoSaved.routeCode || ''} → ${where}`);
   renderRouteResult(autoSaved);
   updateWorkflow('done');
   unlockSurveyPath();
@@ -2278,6 +2575,7 @@ function renderPanelLive(data) {
     senderBadgeEl.classList.toggle('is-live', Boolean(data.config?.senderEnabled));
   }
   updateSenderToggleChip(data);
+  connectSignalRIfConfigured(data.config);
 
   const catalogFp = catalogBoats(data)
     .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.maxSpeedKmh}`)

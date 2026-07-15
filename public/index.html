@@ -13,6 +13,7 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+    <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
     <div class="app">
       <section class="map-shell">
         <div id="map"></div>
@@ -200,7 +201,11 @@
               <select id="collectorBoatCode">
                 <option value="">Chọn tàu...</option>
               </select>
-              <small id="boatSpeedHint" class="field-hint">Chọn tàu đã đăng ký gps_devices (WB_005 → gps-wb-005). Cặp bến có lịch → phút lịch.</small>
+              <div class="boat-draft-bar" id="boatDraftBar"></div>
+              <div class="boat-draft-actions">
+                <button id="copyDraftAllBoats" type="button" class="secondary">Nhân bản đường → mọi tàu</button>
+              </div>
+              <small id="boatSpeedHint" class="field-hint">Mỗi tàu một bản vẽ riêng — đổi tàu không mất đường. Tàu mới Active tự đăng ký device.</small>
             </label>
             <div class="field-row">
               <label>
@@ -241,6 +246,7 @@
     </div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
