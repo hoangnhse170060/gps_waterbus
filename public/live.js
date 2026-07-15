@@ -355,13 +355,6 @@ function boatColor({ incident, phase, decks }) {
   return '#0f766e';
 }
 
-function boatShortLabel(code, catalogBoat) {
-  const name = String(catalogBoat?.boatName || code || '').trim();
-  const digits = name.match(/(\d{2,})/);
-  if (digits) return digits[1];
-  return String(code || '').replace(/^WB_?/i, '').slice(0, 4) || '•';
-}
-
 function boatIcon(heading = 0, opts = {}) {
   const deg = Number(heading) || 0;
   const fill = boatColor(opts);
