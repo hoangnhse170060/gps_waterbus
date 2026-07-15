@@ -40,7 +40,6 @@ const collectorBoatCodeEl = document.querySelector('#collectorBoatCode');
 const collectorSpeedEl = document.querySelector('#collectorSpeed');
 const boatSpeedHintEl = document.querySelector('#boatSpeedHint');
 const boatDraftBarEl = document.querySelector('#boatDraftBar');
-const copyDraftAllBoatsEl = document.querySelector('#copyDraftAllBoats');
 const captureTripIdEl = document.querySelector('#captureTripId');
 const sendIntervalSecEl = document.querySelector('#sendIntervalSec');
 const startCollectorEl = document.querySelector('#startCollector');
@@ -468,9 +467,6 @@ collectorBoatCodeEl?.addEventListener('change', () => {
   const next = collectorBoatCodeEl.value.trim();
   switchBoatDraft(next);
 });
-copyDraftAllBoatsEl?.addEventListener('click', () => {
-  copyActiveDraftToAllBoats();
-});
 collectorSpeedEl?.addEventListener('input', () => {
   applyBoatSpeedLimits();
   updateDrawStats();
@@ -589,41 +585,6 @@ function switchBoatDraft(nextBoatCode) {
   captureStatusEl.textContent = next
     ? (pts ? `Đang vẽ cho ${next} · ${pts} điểm` : `Đang vẽ cho ${next} — chưa có điểm`)
     : 'Chọn tàu để gán bản vẽ.';
-}
-
-function copyActiveDraftToAllBoats() {
-  if (captureState.points.length < 2) {
-    captureStatusEl.textContent = 'Cần ≥ 2 điểm trước khi nhân bản cho mọi tàu.';
-    notifyWarn('Cần ≥ 2 điểm trước khi nhân bản cho mọi tàu.');
-    return;
-  }
-  saveActiveBoatDraft();
-  const source = snapshotActiveDraft();
-  const boats = catalogBoats();
-  if (!boats.length) {
-    captureStatusEl.textContent = 'Chưa có danh sách tàu để nhân bản.';
-    notifyWarn('Chưa có danh sách tàu để nhân bản.');
-    return;
-  }
-  let count = 0;
-  for (const boat of boats) {
-    const code = boat.boatCode;
-    if (!code) continue;
-    boatDrafts[code] = {
-      ...JSON.parse(JSON.stringify(source)),
-      // Giữ routeCode riêng theo tàu nếu muốn nhanh: thêm suffix khi khác tàu active.
-      routeCode: code === selectedCollectorBoatCode
-        ? source.routeCode
-        : (source.routeCode ? `${source.routeCode}-${code}` : ''),
-      updatedAt: new Date().toISOString(),
-    };
-    count += 1;
-  }
-  persistBoatDrafts();
-  renderBoatDraftBar();
-  renderOtherBoatDraftLayers();
-  captureStatusEl.textContent = `Đã nhân bản đường cho ${count} tàu. Chọn từng tàu để chỉnh/ghi GPS.`;
-  notifyOk(`Đã nhân bản đường cho ${count} tàu.`);
 }
 
 function renderBoatDraftBar() {
