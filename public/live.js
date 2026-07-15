@@ -16,7 +16,6 @@ const STORAGE_PINS = 'liveGpsBoatPins.v1';
 const STORAGE_STATUS = 'liveGpsBoatStatus.v1';
 const STORAGE_SPEEDS = 'liveGpsBoatSpeeds.v1';
 const DEFAULT_SPEED_KMH = 16;
-const FALLBACK_BOAT_CODES = ['WB_001', 'WB_002', 'WB_003', 'WB_004', 'WB_005'];
 
 const PHASES = {
   prepare: 'Chuẩn bị đi',
