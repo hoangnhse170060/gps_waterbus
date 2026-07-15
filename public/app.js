@@ -1658,10 +1658,14 @@ function applyBoatSpeedLimits() {
     }
   }
   if (boatSpeedHintEl) {
+    const code = boat?.boatCode || '';
+    const registered = latest?.config?.gpsDevices?.[code];
     const surveyDev = latest?.config?.surveyDeviceId || 'gps-wb-001';
     boatSpeedHintEl.textContent = boat
-      ? `Tàu ${boat.boatCode} · Azure dùng device ${surveyDev} (đã đăng ký) · max ${max} km/h · cặp bến có lịch → phút lịch`
-      : `Chọn tàu — survey luôn auth bằng ${surveyDev} để không lỗi đăng ký device`;
+      ? (registered
+        ? `Tàu ${code} · đã đăng ký device ${registered} · max ${max} km/h`
+        : `Tàu ${code} · CHƯA đăng ký gps_devices — tạm dùng ${surveyDev}`)
+      : 'Chọn tàu đã đăng ký trong gps_devices (vd WB_005 → gps-wb-005)';
   }
 }
 

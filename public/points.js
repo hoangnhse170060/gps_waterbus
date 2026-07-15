@@ -714,16 +714,20 @@ function getSelectedBoatCode() {
 }
 
 function deviceIdForBoatCode(boatCode) {
-  // Auth Azure: dùng device survey đã đăng ký (config), không map theo boatCode (tránh 404).
-  return latestSnapshot?.config?.surveyDeviceId
-    || `gps-${String(boatCode || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+  const code = String(boatCode || 'WB_001').trim();
+  return latestSnapshot?.config?.gpsDevices?.[code]
+    || latestSnapshot?.config?.surveyDeviceId
+    || `gps-${code.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 }
 
 function updateBoatDeviceHint() {
   const boatCode = getSelectedBoatCode();
   const deviceId = deviceIdForBoatCode(boatCode);
+  const registered = Boolean(latestSnapshot?.config?.gpsDevices?.[boatCode]);
   localStorage.setItem('surveyBoatCode', boatCode);
-  boatDeviceHintEl.textContent = `boatCode ${boatCode} · Azure device ${deviceId} (SURVEY_DEVICE_ID — mọi tàu dùng chung device đã đăng ký)`;
+  boatDeviceHintEl.textContent = registered
+    ? `boatCode ${boatCode} · device ${deviceId} (đã đăng ký gps_devices)`
+    : `boatCode ${boatCode} · CHƯA đăng ký — tạm ${deviceId}`;
 }
 
 function renderStationOptions() {

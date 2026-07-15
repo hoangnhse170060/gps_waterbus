@@ -42,6 +42,7 @@ const state = {
   lastTrackingApiCall: null,
   apiCallLog: [],
   lastAutoSavedRoute: null,
+  gpsDevicesByBoatCode: new Map(),
   dbStatus: { ok: false, message: 'Not loaded yet', loadedAt: null },
 };
 
@@ -111,6 +112,20 @@ select coalesce(jsonb_agg(jsonb_build_object(
 ) order by s.station_name), '[]'::jsonb)
 from stations s
 where s.latitude is not null and s.longitude is not null;
+`;
+
+const gpsDevicesSql = `
+select coalesce(jsonb_agg(jsonb_build_object(
+  'boatId', b.boat_id,
+  'boatCode', b.boat_code,
+  'deviceId', d.device_id,
+  'isActive', d.is_active
+) order by b.boat_code), '[]'::jsonb)
+from gps_devices d
+join boats b on b.boat_id = d.boat_id
+where coalesce(d.is_active, true) = true
+  and d.device_id is not null
+  and b.boat_code is not null;
 `;
 
 await refreshFromDatabase();
@@ -323,12 +338,20 @@ async function loadEnv() {
 
 async function refreshFromDatabase() {
   try {
-    const [boats, routes, stations, routeStops] = await Promise.all([
+    const [boats, routes, stations, routeStops, gpsDevices] = await Promise.all([
       queryJson(boatsSql),
       queryJson(routesSql),
       queryJson(stationsSql),
       queryJson(routeStopsSql),
+      queryJson(gpsDevicesSql).catch(() => []),
     ]);
+
+    state.gpsDevicesByBoatCode = new Map();
+    for (const row of Array.isArray(gpsDevices) ? gpsDevices : []) {
+      const code = String(row.boatCode || '').trim();
+      const deviceId = String(row.deviceId || '').trim();
+      if (code && deviceId) state.gpsDevicesByBoatCode.set(code, deviceId);
+    }
 
     state.routes.clear();
     for (const route of routes) {
@@ -384,6 +407,7 @@ async function refreshFromDatabase() {
       if (existing) {
         const routeChanged = existing.routeId !== route.routeId;
         Object.assign(existing, base);
+        existing.deviceId = deviceIdForBoat(dbBoat);
         if (!existing.manualSpeed) {
           existing.speedKmh = Math.min(
             Number(existing.speedKmh || env.DEFAULT_SPEED_KMH || 16),
@@ -1897,8 +1921,8 @@ function startCollector(body) {
   const lengthMeters = routeLength(coordinates);
   const start = pointAtDistance(coordinates, 0);
   const boatCode = cleanOptionalText(body.boatCode) || `SURVEY-${routeCode}`;
-  // Azure chỉ chấp nhận device đã đăng ký (thường gps-wb-001). boatCode vẫn là tàu đang chọn.
-  const deviceId = surveyDeviceId();
+  // Dùng device đã đăng ký trong gps_devices cho đúng tàu (vd WB_005 → gps-wb-005).
+  const deviceId = deviceIdForBoat({ boatCode });
   const seedSequence = Math.max(
     Number(sequenceState[deviceId] || 0) + 1,
     Date.now(),
@@ -2369,6 +2393,7 @@ function publicConfig() {
     hasApiKey: Boolean(state.targetApiKey),
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
     surveyDeviceId: surveyDeviceId(),
+    gpsDevices: Object.fromEntries(state.gpsDevicesByBoatCode.entries()),
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),
@@ -2487,14 +2512,23 @@ function parseBool(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
 }
 
-/** Device Azure đã đăng ký (gps_devices) — dùng cho survey để mọi boatCode đều gọi BE được. */
+/** Fallback device khi tàu chưa có dòng gps_devices. */
 function surveyDeviceId() {
   return cleanOptionalText(env.SURVEY_DEVICE_ID) || 'gps-wb-001';
 }
 
-/** deviceId logic gắn theo boatCode (hiển thị / live boat). */
+/** Ưu tiên device_id đã đăng ký trong gps_devices theo boatCode. */
 function deviceIdForBoat(boat) {
-  return `gps-${String(boat.boatCode || boat.boatId || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+  const code = String(boat?.boatCode || boat?.boatId || '').trim();
+  const registered = code ? state.gpsDevicesByBoatCode.get(code) : null;
+  if (registered) return registered;
+  const synthetic = `gps-${String(boat?.boatCode || boat?.boatId || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+  // Nếu chưa đăng ký riêng: fallback device chung (tránh 404), log cảnh báo.
+  if (code && !String(code).startsWith('SURVEY-')) {
+    console.warn(`[gps-device] ${code} chưa có trong gps_devices — dùng fallback ${surveyDeviceId()} (synthetic ${synthetic})`);
+    return surveyDeviceId();
+  }
+  return synthetic;
 }
 
 function randomInt(min, max) {
