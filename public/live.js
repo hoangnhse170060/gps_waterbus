@@ -883,7 +883,17 @@ function bindDragHandlers(marker, code) {
   });
 }
 
+function isCatalogActiveBoat(boatCode, data = latest) {
+  const code = String(boatCode || '').trim();
+  if (!code) return false;
+  return catalogBoats(data).some((boat) => String(boat.boatCode).trim() === code);
+}
+
 async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
+  if (!isCatalogActiveBoat(boatCode)) {
+    if (!quiet) toast('Tàu không hoạt động — không gửi GPS', 'warn');
+    return false;
+  }
   if (!quiet && sending) return;
   if (!quiet) {
     sending = true;
@@ -948,6 +958,11 @@ async function heartbeatAllBoats() {
   heartbeatBusy = true;
   try {
     const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
+    // Dọn pin tàu inactive còn sót localStorage.
+    for (const code of [...pinnedPositions.keys()]) {
+      if (!codes.includes(code)) pinnedPositions.delete(code);
+    }
+    persistPins();
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
       const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);

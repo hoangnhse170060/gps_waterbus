@@ -383,12 +383,29 @@ server.listen(port, '0.0.0.0', () => {
   });
 });
 
+function isActiveBoatCode(boatCode) {
+  const code = String(boatCode || '').trim();
+  if (!code) return false;
+  const boat = [...state.boats.values()].find((row) => (
+    String(row.boatCode || '').trim() === code
+    && !String(row.boatId || '').startsWith('collector-')
+    && row.boatId !== 'fallback-boat'
+  ));
+  if (!boat) return false;
+  return String(boat.dbStatus || '').trim().toLowerCase() === 'active';
+}
+
 function upsertHubBoat(payload) {
   if (!payload || typeof payload !== 'object') return;
   const code = String(payload.boatCode || '').trim();
   const lat = Number(payload.lat);
   const lng = Number(payload.lng);
   if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  // Không hiện / giữ hub cho tàu không Active.
+  if (!isActiveBoatCode(code)) {
+    state.hubBoats.delete(code);
+    return;
+  }
   const suppressUntil = hubBoatSuppressUntil.get(code) || 0;
   if (suppressUntil > Date.now()) return;
   if (suppressUntil) hubBoatSuppressUntil.delete(code);
@@ -429,6 +446,11 @@ function pruneStaleHubBoats() {
   const now = Date.now();
   let changed = false;
   for (const [code, boat] of [...state.hubBoats.entries()]) {
+    if (!isActiveBoatCode(code)) {
+      state.hubBoats.delete(code);
+      changed = true;
+      continue;
+    }
     const updated = Date.parse(boat.updatedAt || '');
     if (!Number.isFinite(updated) || now - updated > ttl) {
       state.hubBoats.delete(code);
@@ -660,10 +682,17 @@ async function refreshFromDatabase() {
     }
 
     const activeBoatIds = new Set(boats.map((boat) => boat.boatId));
+    const activeBoatCodes = new Set(
+      boats.map((boat) => String(boat.boatCode || '').trim()).filter(Boolean),
+    );
     for (const boatId of [...state.boats.keys()]) {
       if (!activeBoatIds.has(boatId) && !String(boatId).startsWith('collector-') && boatId !== 'fallback-boat') {
         state.boats.delete(boatId);
       }
+    }
+    // Tàu Inactive: bỏ hub + không còn gửi/hiện GPS live.
+    for (const code of [...state.hubBoats.keys()]) {
+      if (!activeBoatCodes.has(code)) state.hubBoats.delete(code);
     }
 
     // Chỉ dùng tàu demo khi DB thật sự KHÔNG có tàu nào.
@@ -980,6 +1009,15 @@ async function publishLiveGpsPosition(body = {}) {
     throw err;
   }
 
+  if (!isActiveBoatCode(boatCode)) {
+    state.hubBoats.delete(boatCode);
+    return {
+      ok: false,
+      status: 403,
+      error: `Tàu ${boatCode} không hoạt động (Inactive) — không gửi GPS / không hiện map.`,
+    };
+  }
+
   if (state.collector && String(state.collector.boatCode || '').trim() === boatCode) {
     return {
       ok: false,
@@ -989,7 +1027,9 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   const matched = [...state.boats.values()].find((boat) => (
-    String(boat.boatCode) === boatCode && !String(boat.boatId || '').startsWith('collector-')
+    String(boat.boatCode) === boatCode
+    && !String(boat.boatId || '').startsWith('collector-')
+    && String(boat.dbStatus || '').trim().toLowerCase() === 'active'
   ));
   const deviceId = deviceIdForBoat({ boatCode, boatId: matched?.boatId });
   const prev = state.hubBoats.get(boatCode);
