@@ -24,6 +24,7 @@ const hubStatusEl = document.querySelector('#hubStatus');
 const sendStatusEl = document.querySelector('#sendStatus');
 const coordStatusEl = document.querySelector('#coordStatus');
 const centerBoatBtn = document.querySelector('#centerBoatBtn');
+const sendNowBtn = document.querySelector('#sendNowBtn');
 const refreshBtn = document.querySelector('#refreshBtn');
 const toastHost = document.querySelector('#toastHost');
 
@@ -300,6 +301,7 @@ function renderHubBoats(hubBoats) {
     seen.add(code);
 
     const isSelected = code === selected;
+    const isDraggingSelected = isSelected && dragging;
     let marker = hubMarkers.get(code);
     const heading = Number(boat.heading) || 0;
     const tip = [
@@ -319,15 +321,16 @@ function renderHubBoats(hubBoats) {
       marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -20] });
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
+    } else if (isDraggingSelected) {
+      // Đang kéo: tuyệt đối không setIcon/setLatLng — nếu không Leaflet mất dragend → không POST BE.
+      marker.setTooltipContent(tip);
     } else {
-      // Đừng nhảy vị trí khi user đang kéo.
-      if (!(isSelected && dragging)) {
-        marker.setLatLng([lat, lng]);
-      }
+      marker.setLatLng([lat, lng]);
       marker.setIcon(boatIcon(heading, { drag: isSelected }));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 800);
       marker.setTooltipContent(tip);
+      if (isSelected) bindDragHandlers(marker, code);
     }
   }
 
@@ -346,6 +349,7 @@ function renderHubBoats(hubBoats) {
     coordStatusEl.textContent = `${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}`;
   }
 
+  // Giữ marker đang chọn (offline hub) — không xóa giữa lúc kéo.
   for (const [code, marker] of hubMarkers) {
     if (!seen.has(code) && code !== selected) {
       marker.remove();
@@ -353,15 +357,15 @@ function renderHubBoats(hubBoats) {
     }
   }
 
-  // Đảm bảo selected luôn draggable.
-  if (selected && hubMarkers.has(selected)) {
+  if (selected && hubMarkers.has(selected) && !dragging) {
     const marker = hubMarkers.get(selected);
     marker.dragging?.enable?.();
-    marker.setIcon(boatIcon(Number(marker.options?.rotation || 0) || 0, { drag: true }));
     marker.setZIndexOffset(1200);
+    bindDragHandlers(marker, selected);
   }
 
   centerBoatBtn.disabled = !selected || !hubMarkers.has(selected);
+  if (sendNowBtn) sendNowBtn.disabled = !selected || !hubMarkers.has(selected);
 }
 
 function bindDragHandlers(marker, code) {
@@ -374,6 +378,7 @@ function bindDragHandlers(marker, code) {
   });
   marker.on('drag', () => {
     if (code !== selectedBoatCode) return;
+    dragging = true;
     const { lat, lng } = marker.getLatLng();
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   });
@@ -497,6 +502,23 @@ centerBoatBtn.addEventListener('click', () => {
   const marker = hubMarkers.get(selectedBoatCode);
   if (!marker) return;
   map.setView(marker.getLatLng(), Math.max(map.getZoom(), 15), { animate: true });
+});
+
+sendNowBtn?.addEventListener('click', async () => {
+  const marker = hubMarkers.get(selectedBoatCode);
+  if (!marker || !selectedBoatCode) {
+    toast('Chọn tàu trước', 'warn');
+    return;
+  }
+  let { lat, lng } = marker.getLatLng();
+  const snap = nearestStation({ lat, lng }, latest?.stations || []);
+  if (snap) {
+    lat = Number(snap.station.lat);
+    lng = Number(snap.station.lng);
+    marker.setLatLng([lat, lng]);
+  }
+  coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  await sendLiveGps(selectedBoatCode, lat, lng);
 });
 
 refreshBtn.addEventListener('click', async () => {
