@@ -34,14 +34,86 @@ let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
 let sending = false;
 let dragging = false;
 let hasFitRoutes = false;
-/** Giữ vị trí vừa thả/gửi — tránh SSE/hub kéo marker về tọa độ cũ. */
-const pinnedPositions = new Map();
-const PIN_HOLD_MS = 120_000;
-const PIN_MATCH_M = 80;
+/** Vị trí cố định trên map: chỉ đổi khi user kéo/gửi đúng tàu đó. */
+const STORAGE_PINS = 'liveGpsBoatPins.v1';
+const pinnedPositions = loadPinnedPositions();
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
 const routeLayers = new Map();
+
+function loadPinnedPositions() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_PINS) || '{}');
+    return new Map(
+      Object.entries(raw).filter(([, v]) => (
+        v && Number.isFinite(Number(v.lat)) && Number.isFinite(Number(v.lng))
+      )).map(([code, v]) => [code, {
+        lat: Number(v.lat),
+        lng: Number(v.lng),
+        at: Number(v.at) || Date.now(),
+        user: Boolean(v.user),
+      }]),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function persistPins() {
+  const obj = {};
+  for (const [code, pin] of pinnedPositions) {
+    obj[code] = {
+      lat: pin.lat,
+      lng: pin.lng,
+      at: pin.at,
+      user: Boolean(pin.user),
+    };
+  }
+  localStorage.setItem(STORAGE_PINS, JSON.stringify(obj));
+}
+
+function pinBoatPosition(code, lat, lng, { user = true } = {}) {
+  const key = String(code || '').trim();
+  if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  pinnedPositions.set(key, {
+    lat: Number(lat),
+    lng: Number(lng),
+    at: Date.now(),
+    user: Boolean(user),
+  });
+  persistPins();
+}
+
+function pinnedFor(code) {
+  return pinnedPositions.get(String(code || '').trim()) || null;
+}
+
+/** Lần đầu thấy hub → seed pin; sau đó không bao giờ nhảy theo SSE nếu chưa đụng. */
+function ensureSeedPin(code, lat, lng) {
+  if (pinnedFor(code)) return;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  pinBoatPosition(code, lat, lng, { user: false });
+}
+
+function fallbackLatLngForBoat(code, index, data = latest) {
+  const pin = pinnedFor(code);
+  if (pin) return { lat: pin.lat, lng: pin.lng };
+  const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === code);
+  if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+    return { lat: Number(hub.lat), lng: Number(hub.lng) };
+  }
+  const stations = (data?.stations || []).filter((s) => (
+    Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
+  ));
+  if (stations.length) {
+    const s = stations[index % stations.length];
+    // Lệch nhẹ để 5 tàu không chồng nhau khi chưa có GPS.
+    const jitter = (index - 2) * 0.00035;
+    return { lat: Number(s.lat) + jitter, lng: Number(s.lng) + jitter };
+  }
+  return { lat: 10.776 + index * 0.002, lng: 106.708 };
+}
 
 function toast(message, type = 'ok', ms = 3200) {
   if (!toastHost) return;
@@ -291,76 +363,68 @@ function renderRoutes(routes, stations) {
   }
 }
 
-function pinBoatPosition(code, lat, lng) {
-  const key = String(code || '').trim();
-  if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
-  pinnedPositions.set(key, {
-    lat: Number(lat),
-    lng: Number(lng),
-    at: Date.now(),
-  });
-}
-
-function pinnedFor(code) {
-  const key = String(code || '').trim();
-  const pin = pinnedPositions.get(key);
-  if (!pin) return null;
-  if (Date.now() - pin.at > PIN_HOLD_MS) {
-    pinnedPositions.delete(key);
-    return null;
-  }
-  return pin;
-}
-
-/** Hub mới khớp vị trí vừa thả → bỏ pin; hub lệch (tín hiệu cũ) → giữ pin. */
-function shouldApplyHubPosition(code, lat, lng) {
-  const pin = pinnedFor(code);
-  if (!pin) return true;
-  const d = distMeters(pin, { lat, lng });
-  if (d <= PIN_MATCH_M) {
-    pinnedPositions.delete(String(code).trim());
-    return true;
-  }
-  return false;
-}
-
 function renderHubBoats(hubBoats) {
-  const list = Array.isArray(hubBoats) ? hubBoats : [];
+  const hubByCode = new Map();
+  for (const boat of hubBoats || []) {
+    const code = String(boat.boatCode || '').trim();
+    if (!code) continue;
+    hubByCode.set(code, boat);
+  }
+
+  const catalog = catalogBoats();
+  const codes = new Set([
+    ...catalog.map((b) => String(b.boatCode).trim()),
+    ...hubByCode.keys(),
+    ...pinnedPositions.keys(),
+  ].filter(Boolean));
+
+  // Seed pin lần đầu từ hub — sau đó đứng yên trừ khi user kéo.
+  let index = 0;
+  for (const code of codes) {
+    const hub = hubByCode.get(code);
+    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+      ensureSeedPin(code, Number(hub.lat), Number(hub.lng));
+    } else if (!pinnedFor(code)) {
+      const fb = fallbackLatLngForBoat(code, index, latest);
+      ensureSeedPin(code, fb.lat, fb.lng);
+    }
+    index += 1;
+  }
+
   const seen = new Set();
   const selected = selectedBoatCode;
+  index = 0;
 
-  for (const boat of list) {
-    const code = String(boat.boatCode || '').trim();
-    const lat = Number(boat.lat);
-    const lng = Number(boat.lng);
-    if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-    // Hiện cả offline = last known từ Azure (để vào lại vẫn đúng chỗ đã gửi).
-    const offline = boat.isOnline === false;
+  for (const code of codes) {
+    const hub = hubByCode.get(code);
+    const catalogBoat = catalog.find((b) => String(b.boatCode) === code);
+    const pin = pinnedFor(code) || fallbackLatLngForBoat(code, index, latest);
+    ensureSeedPin(code, pin.lat, pin.lng);
+    const fixed = pinnedFor(code);
+    const lat = fixed.lat;
+    const lng = fixed.lng;
     seen.add(code);
+    index += 1;
 
     const isSelected = code === selected;
     const isDraggingSelected = isSelected && dragging;
-    const pin = pinnedFor(code);
-    const applyHub = !isDraggingSelected && shouldApplyHubPosition(code, lat, lng);
-    const showLat = applyHub ? lat : (pin ? pin.lat : lat);
-    const showLng = applyHub ? lng : (pin ? pin.lng : lng);
-    let marker = hubMarkers.get(code);
-    const heading = Number(boat.heading) || 0;
+    const offline = hub ? hub.isOnline === false : true;
+    const heading = Number(hub?.heading) || 0;
     const tip = [
       code,
-      boat.boatName || '',
-      offline ? 'offline · vị trí đã lưu' : '',
-      Number.isFinite(Number(boat.speedKmh)) && !offline ? `${boat.speedKmh} km/h` : '',
-      isSelected ? (dragging ? 'đang kéo' : (pin ? 'đã thả · giữ vị trí' : 'kéo được')) : (offline ? '' : 'live'),
+      catalogBoat?.boatName || hub?.boatName || '',
+      offline ? 'đứng yên' : 'live',
+      isSelected ? (dragging ? 'đang kéo' : 'kéo được') : '',
     ].filter(Boolean).join(' · ');
 
+    let marker = hubMarkers.get(code);
     if (!marker) {
-      marker = L.marker([showLat, showLng], {
+      marker = L.marker([lat, lng], {
         icon: boatIcon(heading, { drag: isSelected }),
         draggable: isSelected,
         zIndexOffset: isSelected ? 1200 : 800,
         autoPan: true,
-        opacity: offline && !isSelected ? 0.75 : 1,
+        opacity: isSelected ? 1 : 0.85,
       }).addTo(map);
       marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -20] });
       bindDragHandlers(marker, code);
@@ -368,49 +432,19 @@ function renderHubBoats(hubBoats) {
     } else if (isDraggingSelected) {
       marker.setTooltipContent(tip);
     } else {
-      if (applyHub || pin) {
-        marker.setLatLng([showLat, showLng]);
-      }
+      // Không theo hub — chỉ giữ (hoặc đồng bộ) đúng vị trí đã pin.
+      marker.setLatLng([lat, lng]);
       marker.setIcon(boatIcon(heading, { drag: isSelected }));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 800);
-      marker.setOpacity(offline && !isSelected ? 0.75 : 1);
+      marker.setOpacity(isSelected ? 1 : 0.85);
       marker.setTooltipContent(tip);
       if (isSelected) bindDragHandlers(marker, code);
     }
   }
 
-  // Tàu đang chọn / vừa pin nhưng chưa có trong hub → giữ marker tại chỗ thả (không nhảy center).
-  if (selected && !seen.has(selected)) {
-    const pin = pinnedFor(selected);
-    let marker = hubMarkers.get(selected);
-    if (!marker && pin) {
-      marker = L.marker([pin.lat, pin.lng], {
-        icon: boatIcon(0, { drag: true }),
-        draggable: true,
-        zIndexOffset: 1200,
-      }).addTo(map);
-      marker.bindTooltip(`${selected} · đã thả · giữ vị trí`, { permanent: true, direction: 'top', offset: [0, -20] });
-      bindDragHandlers(marker, selected);
-      hubMarkers.set(selected, marker);
-      coordStatusEl.textContent = `${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`;
-    } else if (!marker) {
-      const center = map.getCenter();
-      marker = L.marker(center, {
-        icon: boatIcon(0, { drag: true }),
-        draggable: true,
-        zIndexOffset: 1200,
-      }).addTo(map);
-      marker.bindTooltip(`${selected} · kéo tới bến`, { permanent: true, direction: 'top', offset: [0, -20] });
-      bindDragHandlers(marker, selected);
-      hubMarkers.set(selected, marker);
-      coordStatusEl.textContent = `${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}`;
-    }
-    seen.add(selected);
-  }
-
   for (const [code, marker] of hubMarkers) {
-    if (!seen.has(code) && code !== selected && !pinnedFor(code)) {
+    if (!seen.has(code)) {
       marker.remove();
       hubMarkers.delete(code);
     }
@@ -421,6 +455,8 @@ function renderHubBoats(hubBoats) {
     marker.dragging?.enable?.();
     marker.setZIndexOffset(1200);
     bindDragHandlers(marker, selected);
+    const { lat, lng } = marker.getLatLng();
+    coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   }
 
   centerBoatBtn.disabled = !selected || !hubMarkers.has(selected);
@@ -452,7 +488,7 @@ function bindDragHandlers(marker, code) {
       marker.setLatLng([lat, lng]);
       toast(`Snap ${snap.station.stationCode || snap.station.stationName} (${Math.round(snap.dist)} m)`, 'ok');
     }
-    pinBoatPosition(code, lat, lng);
+    pinBoatPosition(code, lat, lng, { user: true });
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
     await sendLiveGps(code, lat, lng);
   });
@@ -462,7 +498,7 @@ async function sendLiveGps(boatCode, lat, lng) {
   if (sending) return;
   sending = true;
   sendStatusEl.textContent = 'Đang gửi…';
-  pinBoatPosition(boatCode, lat, lng);
+  pinBoatPosition(boatCode, lat, lng, { user: true });
   const sendToTarget = sendAzureSelectEl.value === 'on';
   try {
     const response = await fetch('/api/live/gps', {
@@ -482,10 +518,9 @@ async function sendLiveGps(boatCode, lat, lng) {
       const msg = body.error || `HTTP ${response.status}`;
       sendStatusEl.textContent = `Lỗi ${response.status}`;
       toast(msg, 'err');
-      // Vẫn giữ pin — tàu không nhảy về chỗ cũ dù gửi lỗi.
       return;
     }
-    pinBoatPosition(boatCode, lat, lng);
+    pinBoatPosition(boatCode, lat, lng, { user: true });
     const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
     sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
     if (body.warning) toast(body.warning, 'warn');
