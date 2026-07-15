@@ -1,4 +1,14 @@
 const SNAP_STATION_M = 60;
+const ROUTE_STYLE = {
+  color: '#0f766e',
+  weight: 4,
+  opacity: 0.78,
+  smoothFactor: 0,
+};
+/** Thứ tự tuyến chính BD↔LD khi bảng routes chưa có geometry. */
+const WATERBUS_CORRIDOR_CODES = [
+  'ST-BD', 'ST-TT', 'ST-BA', 'ST-TD2', 'ST-TD', 'ST-HBC', 'ST-LD',
+];
 
 const map = L.map('map', { zoomControl: false }).setView([10.776, 106.708], 13);
 L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -22,9 +32,11 @@ let eventsSource = null;
 let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
 let sending = false;
 let dragging = false;
+let hasFitRoutes = false;
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
+const routeLayers = new Map();
 
 function toast(message, type = 'ok', ms = 3200) {
   if (!toastHost) return;
@@ -73,28 +85,58 @@ function nearestStation(latlng, stations) {
 }
 
 function boatIcon(heading = 0, { drag = false } = {}) {
-  const fill = drag ? '#0f766e' : '#ef4444';
+  const deg = Number(heading) || 0;
+  if (drag) {
+    return L.divIcon({
+      className: '',
+      html: `
+        <div class="collector-marker">
+          <div class="collector-marker-pulse"></div>
+          <div class="collector-marker-inner" style="--heading:${deg}deg">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path fill="#0f766e" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
+            </svg>
+          </div>
+        </div>
+      `,
+      iconSize: [58, 58],
+      iconAnchor: [29, 29],
+    });
+  }
   return L.divIcon({
-    className: 'live-boat-marker',
+    className: '',
     html: `
-      <div class="live-boat-inner${drag ? ' is-drag' : ''}" style="--heading:${Number(heading) || 0}deg">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path fill="${fill}" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
-        </svg>
+      <div class="boat-marker">
+        <div class="boat-marker-pulse"></div>
+        <div class="boat-marker-inner" style="--heading:${deg}deg">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="#ef4444" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
+          </svg>
+        </div>
+        <div class="boat-marker-point"></div>
       </div>
     `,
-    iconSize: drag ? [52, 52] : [44, 44],
-    iconAnchor: drag ? [26, 26] : [22, 22],
+    iconSize: [58, 58],
+    iconAnchor: [29, 29],
   });
 }
 
+/** Cùng cờ bến Survey (styles.css .station-flag). */
 function stationIcon(code) {
-  const label = String(code || '').replace(/^ST-/, '').slice(0, 3);
+  const label = String(code || '')
+    .replace(/^ST-/i, '')
+    .slice(0, 3)
+    .toUpperCase() || '•';
   return L.divIcon({
-    className: 'live-station-marker',
-    html: `<div class="live-station-pin"><span>${escapeHtml(label)}</span></div>`,
-    iconSize: [28, 28],
-    iconAnchor: [14, 26],
+    className: '',
+    html: `
+      <div class="station-flag">
+        <div class="station-flag-pole"></div>
+        <div class="station-flag-cloth">${escapeHtml(label)}</div>
+      </div>
+    `,
+    iconSize: [28, 36],
+    iconAnchor: [5, 36],
   });
 }
 
@@ -159,7 +201,7 @@ function renderStations(stations) {
         zIndexOffset: 200,
         interactive: true,
       }).addTo(map);
-      marker.bindTooltip(tip, { direction: 'top', offset: [0, -16] });
+      marker.bindTooltip(tip, { direction: 'top', offset: [0, -28] });
       stationLayers.set(station.stationId, marker);
     } else {
       marker.setLatLng([station.lat, station.lng]);
@@ -171,6 +213,76 @@ function renderStations(stations) {
       marker.remove();
       stationLayers.delete(id);
     }
+  }
+}
+
+/** Vẽ polyline tuyến từ DB; nếu routes trống thì nối bến DB theo lịch Waterbus. */
+function renderRoutes(routes, stations) {
+  const seen = new Set();
+  const bounds = [];
+
+  for (const route of routes || []) {
+    const id = route.routeId;
+    const latlngs = (route.coordinates || [])
+      .map((p) => [Number(p.lat), Number(p.lng)])
+      .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng));
+    if (!id || latlngs.length < 2) continue;
+    seen.add(id);
+
+    let layer = routeLayers.get(id);
+    const tip = [route.routeCode, route.routeName].filter(Boolean).join(' · ');
+    if (!layer) {
+      layer = L.polyline(latlngs, { ...ROUTE_STYLE }).addTo(map);
+      if (tip) layer.bindTooltip(tip);
+      routeLayers.set(id, layer);
+    } else {
+      layer.setLatLngs(latlngs);
+      if (!map.hasLayer(layer)) layer.addTo(map);
+    }
+    for (const p of latlngs) bounds.push(p);
+  }
+
+  // Fallback: DB chưa có route_geometry → vẽ hành lang bến theo lịch BD↔LD.
+  if (!seen.size) {
+    const byCode = new Map(
+      (stations || [])
+        .filter((s) => s?.stationCode && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)))
+        .map((s) => [String(s.stationCode).toUpperCase(), s]),
+    );
+    const latlngs = WATERBUS_CORRIDOR_CODES
+      .map((code) => byCode.get(code))
+      .filter(Boolean)
+      .map((s) => [Number(s.lat), Number(s.lng)]);
+    const id = '__waterbus-corridor__';
+    if (latlngs.length >= 2) {
+      seen.add(id);
+      let layer = routeLayers.get(id);
+      if (!layer) {
+        layer = L.polyline(latlngs, {
+          ...ROUTE_STYLE,
+          dashArray: '8 6',
+          opacity: 0.65,
+        }).addTo(map);
+        layer.bindTooltip('Hành lang Waterbus (bến DB · chờ geometry tuyến)');
+        routeLayers.set(id, layer);
+      } else {
+        layer.setLatLngs(latlngs);
+        if (!map.hasLayer(layer)) layer.addTo(map);
+      }
+      for (const p of latlngs) bounds.push(p);
+    }
+  }
+
+  for (const [id, layer] of routeLayers) {
+    if (!seen.has(id)) {
+      layer.remove();
+      routeLayers.delete(id);
+    }
+  }
+
+  if (!hasFitRoutes && bounds.length) {
+    hasFitRoutes = true;
+    map.fitBounds(bounds, { padding: [48, 48], maxZoom: 14 });
   }
 }
 
@@ -340,6 +452,7 @@ function renderStatus(data) {
 function render(data) {
   latest = data;
   renderBoatOptions(data);
+  renderRoutes(data.routes, data.stations);
   renderStations(data.stations);
   renderHubBoats(data.hubBoats);
   renderStatus(data);

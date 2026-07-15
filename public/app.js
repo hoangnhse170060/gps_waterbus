@@ -107,8 +107,10 @@ const controlMarkers = [];
 let captureLine = null;
 let helperCurveLine = null;
 let plannedRouteLine = null;
+let completedRouteLine = null; // sau khi chạy xong: chỉ còn đường liền (bỏ điểm số)
 let lockedSurveyPath = null; // giữ đường vẽ suốt lúc tàu chạy — không cho auto-save cũ xóa
 let collectorMarker = null;
+let pendingRevealRoute = null; // { routeId, routeCode } — chọn tuyến vừa lưu trên map
 let routeStopMarkersLayer = null;
 let selectedRouteStops = [];
 let selectedRouteId = '';
@@ -174,11 +176,18 @@ const DRAFT_ROUTE_STYLE = {
   opacity: 0.95,
   dashArray: '10 8',
 };
+/** Đang chạy / đã xong: đường liền (không còn nét đứt + điểm số). */
 const SURVEY_ROUTE_STYLE = {
-  color: '#c2410c',
+  color: '#0f766e',
   weight: 6,
-  opacity: 0.98,
-  dashArray: '14 10',
+  opacity: 0.95,
+  dashArray: null,
+};
+const COMPLETED_ROUTE_STYLE = {
+  color: '#0f766e',
+  weight: 6,
+  opacity: 0.96,
+  dashArray: null,
 };
 
 refreshRoutesEl.addEventListener('click', () => fetch('/api/refresh', { method: 'POST' }));
@@ -432,9 +441,11 @@ saveCapturedRouteEl.addEventListener('click', saveCapturedRoute);
 toolPanEl?.addEventListener('click', () => setDrawTool('pan'));
 toolDrawEl?.addEventListener('click', () => {
   captureState.finished = false;
+  clearCompletedRouteLine();
   setDrawTool('draw');
   captureStatusEl.textContent = 'Đang vẽ: click thêm điểm. Kéo điểm để chỉnh. Thẳng/Cong = đoạn mới (hoặc đoạn đang chọn).';
   updateWorkflow('draw');
+  rebuildCaptureMarkers();
 });
 modeStraightEl?.addEventListener('click', () => setLineMode('straight'));
 modeCurveEl?.addEventListener('click', () => setLineMode('curve'));
@@ -453,6 +464,8 @@ toolClearEl?.addEventListener('click', () => {
   unlockSurveyPath();
   clearCapturePoints();
   clearPlannedRoute();
+  clearCompletedRouteLine();
+  pendingRevealRoute = null;
   captureState.finished = false;
   captureStatusEl.textContent = 'Đã xóa đường trên bản đồ.';
   routeResultEl?.classList.add('hidden');
@@ -791,14 +804,14 @@ function finishDraw() {
   // Giữ đúng hình đang vẽ — không kéo điểm, không ép cong/thẳng lại.
   captureState.finished = true;
   setDrawTool('pan');
+  clearCompletedRouteLine();
   const type = getSurveyRouteType();
   const stopCount = buildSurveyStops().length;
-  captureStatusEl.textContent = `Đã xong (${stopCount} bến, loại ${type}). Kéo điểm số / chốt vàng nếu muốn chỉnh lại, rồi ghi GPS.`;
+  captureStatusEl.textContent = `Đã xong (${stopCount} bến, loại ${type}). Đường liền sẵn sàng — bấm ghi GPS để chạy.`;
   updateWorkflow('run');
   updateRouteTypeHint();
   checkRouteCodeDuplicate();
-  renderCaptureLine();
-  syncControlMarkers();
+  rebuildCaptureMarkers();
 }
 
 function updateWorkflow(step) {
@@ -1704,11 +1717,15 @@ function renderCaptureLine() {
   }
   if (captureState.points.length < 2) return;
   const path = expandPath(captureState.points);
+  const running = hideCaptureWaypointsForRun();
+  const style = (captureState.finished || running)
+    ? { ...SURVEY_ROUTE_STYLE }
+    : { ...DRAFT_ROUTE_STYLE };
   captureLine = L.polyline(
     path.map((p) => [p.lat, p.lng]),
     {
-      ...DRAFT_ROUTE_STYLE,
-      weight: captureState.finished ? 5.5 : 4.5,
+      ...style,
+      weight: (captureState.finished || running) ? 6 : 4.5,
       interactive: false,
       smoothFactor: 0,
     },
@@ -1804,15 +1821,34 @@ function bindCaptureMarkerEvents(marker, index) {
   });
 }
 
+function hideCaptureWaypointsForRun() {
+  // Khi chạy / đã khóa đường: chỉ còn polyline, không còn điểm số.
+  return Boolean(recordingActive || lockedSurveyPath);
+}
+
 function rebuildCaptureMarkers() {
   for (const marker of captureMarkers) marker.remove();
   captureMarkers.length = 0;
   clearControlMarkers();
+
+  if (hideCaptureWaypointsForRun()) {
+    renderCaptureLine();
+    renderCaptureState();
+    return;
+  }
+
+  const last = captureState.points.length - 1;
   captureState.points.forEach((point, index) => {
+    // Đã hoàn thành vẽ: chỉ giữ bến đầu/cuối dạng cờ, ẩn điểm trung gian.
+    const isStation = point.source === 'station'
+      || point.source === 'station-via'
+      || point.source === 'station-end';
+    if (captureState.finished && !isStation && index !== 0 && index !== last) return;
+
     const selected = captureState.selectedWaypointIndex === index;
     const marker = L.marker([point.lat, point.lng], {
       icon: capturePointIcon(index + 1, point.source, selected),
-      draggable: true,
+      draggable: !captureState.finished || isStation || index === 0 || index === last,
       zIndexOffset: 600,
       autoPan: true,
     }).addTo(map);
@@ -1821,7 +1857,7 @@ function rebuildCaptureMarkers() {
     captureMarkers.push(marker);
   });
   renderCaptureLine();
-  syncControlMarkers();
+  if (!captureState.finished) syncControlMarkers();
   renderCaptureState();
 }
 
@@ -1866,6 +1902,7 @@ function renderCaptureState() {
   const canClear = captureState.points.length > 0
     || Boolean(lockedSurveyPath)
     || Boolean(plannedRouteLine)
+    || Boolean(completedRouteLine)
     || Boolean(selectedRouteId);
   if (toolClearEl) toolClearEl.disabled = !canClear;
   if (finishDrawEl) {
@@ -2153,6 +2190,7 @@ async function startRecording() {
   showPlannedRoute(lockedSurveyPath);
   recordingActive = true;
   recordingStartedAt = Date.now();
+  rebuildCaptureMarkers(); // ẩn điểm số — chỉ còn đường khi tàu chạy
   try {
     await fetch('/api/sender', {
       method: 'PATCH',
@@ -2300,10 +2338,17 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
+    // Chuyển điểm số → đường liền trước khi unlock (cần locked path để lấy coords).
+    showCompletedRouteAsPath({
+      ...body,
+      routeCode: body.routeCode || routeCode,
+      routeName: body.routeName || routeName,
+      coordinates: body.coordinates
+        || lockedSurveyPath
+        || (captureState.points.length >= 2 ? getPathCoordinates() : null),
+    });
     unlockSurveyPath();
-    clearPlannedRoute();
     if (silentClear) {
-      clearCapturePoints();
       setDrawTool('pan');
       setLineMode('straight');
       captureRouteCodeEl.value = '';
@@ -2367,6 +2412,66 @@ function clearPlannedRoute() {
     plannedRouteLine.remove();
     plannedRouteLine = null;
   }
+}
+
+function clearCompletedRouteLine() {
+  if (completedRouteLine) {
+    completedRouteLine.remove();
+    completedRouteLine = null;
+  }
+}
+
+/** Sau khi chạy/lưu xong: bỏ điểm số, chỉ hiện đường liền trên map. */
+function showCompletedRouteAsPath(body = {}) {
+  const coords = Array.isArray(body.coordinates) && body.coordinates.length >= 2
+    ? body.coordinates
+    : (lockedSurveyPath?.length >= 2
+      ? lockedSurveyPath
+      : (captureState.points.length >= 2 ? getPathCoordinates() : null));
+  if (!coords || coords.length < 2) return;
+
+  clearCapturePoints();
+  clearPlannedRoute();
+  clearCompletedRouteLine();
+
+  completedRouteLine = L.polyline(
+    coords.map((p) => [Number(p.lat), Number(p.lng)]),
+    { ...COMPLETED_ROUTE_STYLE, interactive: false, smoothFactor: 0 },
+  ).addTo(map);
+  completedRouteLine.bindTooltip(
+    [body.routeCode, body.routeName].filter(Boolean).join(' · ') || 'Tuyến vừa lưu',
+    { sticky: true },
+  );
+
+  pendingRevealRoute = {
+    routeId: body.routeId || body.id || '',
+    routeCode: body.routeCode || '',
+  };
+  showSavedRoutes = true;
+  applySavedRoutesVisibility();
+
+  try {
+    map.fitBounds(completedRouteLine.getBounds(), { padding: [48, 48], maxZoom: 15 });
+  } catch {
+    // ignore
+  }
+}
+
+function tryRevealPendingRoute(routes = []) {
+  if (!pendingRevealRoute) return;
+  const id = String(pendingRevealRoute.routeId || '');
+  const code = String(pendingRevealRoute.routeCode || '');
+  const match = (routes || []).find((r) => (
+    (id && String(r.routeId) === id) || (code && String(r.routeCode) === code)
+  ));
+  if (!match) return;
+  pendingRevealRoute = null;
+  if (mapLegendSelectEl) {
+    mapLegendSelectEl.value = String(match.routeId);
+    mapLegendSelectEl.dispatchEvent(new Event('change'));
+  }
+  // Tuyến đã có trong DB/SSE → bỏ lớp tạm.
+  clearCompletedRouteLine();
 }
 
 function ensureSurveyPathVisible() {
@@ -2469,9 +2574,13 @@ function handleAutoSavedRoute(autoSaved) {
   else notifyOk(`Tự lưu thành công: ${autoSaved.routeCode || ''} → ${where}`);
   renderRouteResult(autoSaved);
   updateWorkflow('done');
+  showCompletedRouteAsPath({
+    ...autoSaved,
+    coordinates: autoSaved.coordinates
+      || lockedSurveyPath
+      || (captureState.points.length >= 2 ? getPathCoordinates() : null),
+  });
   unlockSurveyPath();
-  clearPlannedRoute();
-  clearCapturePoints();
   setDrawTool('pan');
   setLineMode('straight');
   captureRouteCodeEl.value = '';
@@ -2914,6 +3023,8 @@ function renderRoutes(routes) {
     if (showSavedRoutes) showSelectedRouteStops(mapLegendSelectEl.value || '');
     else applySavedRoutesVisibility();
   }
+
+  tryRevealPendingRoute(routes);
 
   if (!hasFitInitialRoutes && bounds.length && !recordingActive && !lockedSurveyPath) {
     hasFitInitialRoutes = true;

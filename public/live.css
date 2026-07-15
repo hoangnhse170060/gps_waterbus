@@ -192,9 +192,17 @@
   vertical-align: -1px;
 }
 
+.leg-route {
+  width: 16px;
+  height: 3px;
+  border-radius: 2px;
+  background: #0f766e;
+  vertical-align: 2px;
+}
+
 .leg-station {
-  background: #16a34a;
-  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.2);
+  background: var(--brand);
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.2);
 }
 
 .leg-live {
@@ -204,51 +212,6 @@
 .leg-drag {
   background: #0f766e;
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.25);
-}
-
-.live-boat-marker,
-.live-station-marker {
-  background: transparent;
-  border: 0;
-}
-
-.live-boat-inner {
-  width: 44px;
-  height: 44px;
-  display: grid;
-  place-items: center;
-  transform: rotate(var(--heading, 0deg));
-  filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.25));
-}
-
-.live-boat-inner.is-drag {
-  width: 52px;
-  height: 52px;
-}
-
-.live-boat-inner svg {
-  width: 100%;
-  height: 100%;
-}
-
-.live-station-pin {
-  width: 28px;
-  height: 28px;
-  border-radius: 50% 50% 50% 0;
-  transform: rotate(-45deg);
-  background: #16a34a;
-  border: 2px solid #fff;
-  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
-  display: grid;
-  place-items: center;
-}
-
-.live-station-pin span {
-  transform: rotate(45deg);
-  color: #fff;
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
 }
 
 .toast-host {
