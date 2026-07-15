@@ -1897,8 +1897,8 @@ function startCollector(body) {
   const lengthMeters = routeLength(coordinates);
   const start = pointAtDistance(coordinates, 0);
   const boatCode = cleanOptionalText(body.boatCode) || `SURVEY-${routeCode}`;
-  // Dùng device đã đăng ký trên Azure (gps-wb-001), tạm dừng POST tàu live khi survey.
-  const deviceId = deviceIdForBoat({ boatCode });
+  // Azure chỉ chấp nhận device đã đăng ký (thường gps-wb-001). boatCode vẫn là tàu đang chọn.
+  const deviceId = surveyDeviceId();
   const seedSequence = Math.max(
     Number(sequenceState[deviceId] || 0) + 1,
     Date.now(),
@@ -2368,6 +2368,7 @@ function publicConfig() {
     targetApiRoot: getTargetApiRoot(),
     hasApiKey: Boolean(state.targetApiKey),
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
+    surveyDeviceId: surveyDeviceId(),
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),
@@ -2486,8 +2487,14 @@ function parseBool(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
 }
 
+/** Device Azure đã đăng ký (gps_devices) — dùng cho survey để mọi boatCode đều gọi BE được. */
+function surveyDeviceId() {
+  return cleanOptionalText(env.SURVEY_DEVICE_ID) || 'gps-wb-001';
+}
+
+/** deviceId logic gắn theo boatCode (hiển thị / live boat). */
 function deviceIdForBoat(boat) {
-  return `gps-${String(boat.boatCode || boat.boatId).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+  return `gps-${String(boat.boatCode || boat.boatId || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 }
 
 function randomInt(min, max) {

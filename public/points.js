@@ -714,14 +714,16 @@ function getSelectedBoatCode() {
 }
 
 function deviceIdForBoatCode(boatCode) {
-  return `gps-${String(boatCode || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+  // Auth Azure: dùng device survey đã đăng ký (config), không map theo boatCode (tránh 404).
+  return latestSnapshot?.config?.surveyDeviceId
+    || `gps-${String(boatCode || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 }
 
 function updateBoatDeviceHint() {
   const boatCode = getSelectedBoatCode();
   const deviceId = deviceIdForBoatCode(boatCode);
   localStorage.setItem('surveyBoatCode', boatCode);
-  boatDeviceHintEl.textContent = `deviceId gui BE: ${deviceId} · BE can dang ky device nay trong gps_devices`;
+  boatDeviceHintEl.textContent = `boatCode ${boatCode} · Azure device ${deviceId} (SURVEY_DEVICE_ID — mọi tàu dùng chung device đã đăng ký)`;
 }
 
 function renderStationOptions() {

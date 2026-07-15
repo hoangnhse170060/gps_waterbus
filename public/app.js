@@ -1658,9 +1658,10 @@ function applyBoatSpeedLimits() {
     }
   }
   if (boatSpeedHintEl) {
+    const surveyDev = latest?.config?.surveyDeviceId || 'gps-wb-001';
     boatSpeedHintEl.textContent = boat
-      ? `Max đăng ký ${max} km/h · nhập tốc độ chạy thực tế (≤ ${max})`
-      : 'Chọn tàu để biết mức tối đa đăng ký; tốc độ chạy nhập riêng.';
+      ? `Tàu ${boat.boatCode} · Azure dùng device ${surveyDev} (đã đăng ký) · max ${max} km/h · cặp bến có lịch → phút lịch`
+      : `Chọn tàu — survey luôn auth bằng ${surveyDev} để không lỗi đăng ký device`;
   }
 }
 
