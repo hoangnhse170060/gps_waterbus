@@ -752,9 +752,61 @@ function connectSignalRIfConfigured(config = latest?.config) {
   }
 }
 
-function applyHubBoatsFromSnapshot(hubBoats) {
-  if (!Array.isArray(hubBoats)) return;
-  for (const boat of hubBoats) upsertSignalRBoatLocation(boat);
+/** Mã tàu đang live GPS thật (hub online) hoặc đang ghi survey trên map. */
+function activeLiveBoatCodes(data = latest) {
+  const codes = new Set();
+  for (const boat of data?.hubBoats || []) {
+    const code = String(boat?.boatCode || '').trim();
+    if (code && boat.isOnline !== false) codes.add(code);
+  }
+  const collectorCode = String(data?.collector?.boatCode || '').trim();
+  const collectorActive = data?.collector
+    && ['running', 'completed', 'paused'].includes(String(data.collector.status || ''));
+  if (collectorCode && collectorActive) codes.add(collectorCode);
+  return codes;
+}
+
+function collectorBoatCodeActive(data = latest) {
+  const code = String(data?.collector?.boatCode || '').trim();
+  if (!code) return '';
+  const status = String(data?.collector?.status || '');
+  return ['running', 'paused', 'completed'].includes(status) ? code : '';
+}
+
+function removeSignalRBoatMarker(code) {
+  const marker = signalrLiveMarkers.get(code);
+  if (!marker) return;
+  marker.remove();
+  signalrLiveMarkers.delete(code);
+}
+
+/**
+ * Hub boats → marker map.
+ * Nếu đang ghi GPS cùng boatCode thì bỏ marker hub (chỉ giữ 1 tàu = collector).
+ * Xóa marker hub không còn trong snapshot.
+ */
+function applyHubBoatsFromSnapshot(hubBoats, data = latest) {
+  const list = Array.isArray(hubBoats) ? hubBoats : [];
+  const keep = new Set();
+  const surveyCode = collectorBoatCodeActive(data);
+  for (const boat of list) {
+    const code = String(boat?.boatCode || '').trim();
+    if (!code) continue;
+    // Đang survey cùng tàu → không vẽ twin từ SignalR (collector đã là vị trí live).
+    if (surveyCode && code === surveyCode) {
+      removeSignalRBoatMarker(code);
+      continue;
+    }
+    if (boat.isOnline === false) {
+      removeSignalRBoatMarker(code);
+      continue;
+    }
+    keep.add(code);
+    upsertSignalRBoatLocation(boat);
+  }
+  for (const code of [...signalrLiveMarkers.keys()]) {
+    if (!keep.has(code)) removeSignalRBoatMarker(code);
+  }
 }
 
 function upsertSignalRBoatLocation(payload) {
@@ -763,15 +815,24 @@ function upsertSignalRBoatLocation(payload) {
   const lat = Number(payload.lat);
   const lng = Number(payload.lng);
   if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  // Trùng mã với tàu đang ghi survey → không vẽ thêm.
+  if (code === collectorBoatCodeActive()) {
+    removeSignalRBoatMarker(code);
+    return;
+  }
   const heading = Number(payload.heading);
   const speed = payload.speedKmh != null ? Number(payload.speedKmh) : null;
   const online = payload.isOnline !== false;
+  if (!online) {
+    removeSignalRBoatMarker(code);
+    return;
+  }
   let marker = signalrLiveMarkers.get(code);
   const tip = [
     code,
     payload.boatName || '',
     Number.isFinite(speed) ? `${speed} km/h` : '',
-    online ? 'online' : 'offline',
+    'live',
   ].filter(Boolean).join(' · ');
   if (!marker) {
     marker = L.marker([lat, lng], {
@@ -972,8 +1033,13 @@ function render(data) {
     lastRoutesFingerprint = routesFp;
     renderRoutes(data.routes);
   }
-  renderBoats(SHOW_LIVE_BOATS ? data.boats : []);
-  applyHubBoatsFromSnapshot(data.hubBoats);
+  // Chỉ vẽ tàu DB/simulator nếu không trùng mã đang live GPS / đang ghi.
+  const liveCodes = activeLiveBoatCodes(data);
+  const dbBoats = SHOW_LIVE_BOATS
+    ? (data.boats || []).filter((boat) => !liveCodes.has(String(boat.boatCode || '').trim()))
+    : [];
+  renderBoats(dbBoats);
+  applyHubBoatsFromSnapshot(data.hubBoats, data);
   connectSignalRIfConfigured(data.config);
   renderPanelLive(data);
   renderCollector(data.collector, data.lastCollectorSend, data.recordingSession);
@@ -2573,12 +2639,16 @@ function renderCollector(collector, lastCollectorSend, session) {
   }
 
   const icon = collectorIcon(collector.heading);
+  const tip = `${collector.boatCode} · live · đang ghi`;
+  // Collector là nguồn live khi survey → bỏ twin SignalR cùng mã.
+  removeSignalRBoatMarker(String(collector.boatCode || '').trim());
   if (!collectorMarker) {
     collectorMarker = L.marker([collector.lat, collector.lng], { icon, zIndexOffset: 800 }).addTo(map);
-    collectorMarker.bindTooltip(collector.boatCode, { permanent: true, direction: 'top', offset: [0, -18] });
+    collectorMarker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -18] });
   } else {
     collectorMarker.setLatLng([collector.lat, collector.lng]);
     collectorMarker.setIcon(icon);
+    collectorMarker.setTooltipContent(tip);
   }
 
   const percent = collector.lengthMeters
@@ -2794,15 +2864,18 @@ async function updatePause(boatId, paused) {
 }
 
 function renderBoats(boats) {
+  // Key theo boatCode — 1 mã tàu = 1 marker (tránh trùng boatId collector/db).
   const seen = new Set();
   for (const boat of boats) {
-    seen.add(boat.boatId);
-    let marker = markers.get(boat.boatId);
+    const key = String(boat.boatCode || boat.boatId || '').trim();
+    if (!key || !Number.isFinite(Number(boat.lat)) || !Number.isFinite(Number(boat.lng))) continue;
+    seen.add(key);
+    let marker = markers.get(key);
     if (!marker) {
       marker = L.marker([boat.lat, boat.lng], { icon: boatIcon(boat.heading) }).addTo(map);
-      marker.bindTooltip(boat.boatCode, { permanent: true, direction: 'top', offset: [0, -18] });
+      marker.bindTooltip(boat.boatCode || key, { permanent: true, direction: 'top', offset: [0, -18] });
       marker._boatState = `${boat.lat},${boat.lng},${boat.heading}`;
-      markers.set(boat.boatId, marker);
+      markers.set(key, marker);
     } else {
       const nextState = `${boat.lat},${boat.lng},${boat.heading}`;
       if (marker._boatState !== nextState) {
