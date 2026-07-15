@@ -121,8 +121,12 @@
 
 .live-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.live-actions-2x2 {
+  grid-template-columns: 1fr 1fr;
 }
 
 .live-actions button {
@@ -137,6 +141,18 @@
 .live-actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.live-actions button.is-danger {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.live-actions button.is-ok {
+  border-color: #99f6e4;
+  background: #ecfdf5;
+  color: #065f46;
 }
 
 .live-status {
@@ -196,22 +212,61 @@
   width: 16px;
   height: 3px;
   border-radius: 2px;
-  background: #0f766e;
+  background: rgba(15, 118, 110, 0.35);
   vertical-align: 2px;
 }
 
-.leg-station {
-  background: var(--brand);
-  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.2);
+.leg-signal {
+  background: #16a34a;
+  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.25);
 }
 
-.leg-live {
-  background: #ef4444;
+.leg-warn {
+  background: #f59e0b;
 }
 
-.leg-drag {
-  background: #0f766e;
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.25);
+.leg-incident {
+  background: #dc2626;
+}
+
+.leg-mute {
+  background: #94a3b8;
+}
+
+.live-boat-wrap {
+  background: transparent !important;
+  border: 0 !important;
+}
+
+.live-boat {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  position: relative;
+  transform: rotate(var(--heading, 0deg));
+  filter: drop-shadow(0 3px 6px rgba(15, 23, 42, 0.28));
+  pointer-events: none;
+}
+
+.live-boat.is-drag {
+  width: 52px;
+  height: 52px;
+}
+
+.live-boat.has-signal .live-boat-ring {
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--boat, #16a34a) 55%, transparent);
+  animation: mapPulse 1.6s infinite;
+}
+
+.live-boat svg {
+  width: 72%;
+  height: 72%;
+  position: relative;
+  z-index: 1;
 }
 
 .toast-host {

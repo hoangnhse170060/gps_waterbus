@@ -1,14 +1,28 @@
 const SNAP_STATION_M = 60;
+const APPROACH_M = 180;
+const SIGNAL_TTL_MS = 90_000;
+const CLUSTER_M = 25;
 const ROUTE_STYLE = {
   color: '#0f766e',
-  weight: 4,
-  opacity: 0.78,
+  weight: 3,
+  opacity: 0.22,
   smoothFactor: 0,
 };
-/** Thứ tự tuyến chính BD↔LD khi bảng routes chưa có geometry. */
 const WATERBUS_CORRIDOR_CODES = [
   'ST-BD', 'ST-TT', 'ST-BA', 'ST-TD2', 'ST-TD', 'ST-HBC', 'ST-LD',
 ];
+const STORAGE_PINS = 'liveGpsBoatPins.v1';
+const STORAGE_STATUS = 'liveGpsBoatStatus.v1';
+const FALLBACK_BOAT_CODES = ['WB_001', 'WB_002', 'WB_003', 'WB_004', 'WB_005'];
+
+const PHASES = {
+  prepare: 'Chuẩn bị đi',
+  departing: 'Bắt đầu đi',
+  enroute: 'Đang đi',
+  approaching: 'Sắp cập bến',
+  arrived: 'Đã cập bến',
+  incident: 'Sự cố — dừng',
+};
 
 const map = L.map('map', { zoomControl: false }).setView([10.776, 106.708], 13);
 L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -19,12 +33,15 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 const boatSelectEl = document.querySelector('#boatSelect');
 const sendAzureSelectEl = document.querySelector('#sendAzureSelect');
+const phaseSelectEl = document.querySelector('#phaseSelect');
 const deviceHintEl = document.querySelector('#deviceHint');
 const hubStatusEl = document.querySelector('#hubStatus');
 const sendStatusEl = document.querySelector('#sendStatus');
 const coordStatusEl = document.querySelector('#coordStatus');
+const boatPhaseStatusEl = document.querySelector('#boatPhaseStatus');
 const centerBoatBtn = document.querySelector('#centerBoatBtn');
 const sendNowBtn = document.querySelector('#sendNowBtn');
+const incidentBtn = document.querySelector('#incidentBtn');
 const refreshBtn = document.querySelector('#refreshBtn');
 const toastHost = document.querySelector('#toastHost');
 
@@ -34,43 +51,35 @@ let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
 let sending = false;
 let dragging = false;
 let hasFitRoutes = false;
-/** Vị trí cố định trên map: chỉ đổi khi user kéo/gửi đúng tàu đó. */
-const STORAGE_PINS = 'liveGpsBoatPins.v1';
-const pinnedPositions = loadPinnedPositions();
+const pinnedPositions = loadJsonMap(STORAGE_PINS);
+const boatStatuses = loadJsonMap(STORAGE_STATUS);
+const lastSignalAt = new Map();
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
 const routeLayers = new Map();
 
-function loadPinnedPositions() {
+function loadJsonMap(key) {
   try {
-    const raw = JSON.parse(localStorage.getItem(STORAGE_PINS) || '{}');
-    return new Map(
-      Object.entries(raw).filter(([, v]) => (
-        v && Number.isFinite(Number(v.lat)) && Number.isFinite(Number(v.lng))
-      )).map(([code, v]) => [code, {
-        lat: Number(v.lat),
-        lng: Number(v.lng),
-        at: Number(v.at) || Date.now(),
-        user: Boolean(v.user),
-      }]),
-    );
+    const raw = JSON.parse(localStorage.getItem(key) || '{}');
+    return new Map(Object.entries(raw || {}));
   } catch {
     return new Map();
   }
 }
 
-function persistPins() {
+function persistMap(key, mapObj) {
   const obj = {};
-  for (const [code, pin] of pinnedPositions) {
-    obj[code] = {
-      lat: pin.lat,
-      lng: pin.lng,
-      at: pin.at,
-      user: Boolean(pin.user),
-    };
-  }
-  localStorage.setItem(STORAGE_PINS, JSON.stringify(obj));
+  for (const [k, v] of mapObj) obj[k] = v;
+  localStorage.setItem(key, JSON.stringify(obj));
+}
+
+function persistPins() {
+  persistMap(STORAGE_PINS, pinnedPositions);
+}
+
+function persistStatuses() {
+  persistMap(STORAGE_STATUS, boatStatuses);
 }
 
 function pinBoatPosition(code, lat, lng, { user = true } = {}) {
@@ -86,33 +95,58 @@ function pinBoatPosition(code, lat, lng, { user = true } = {}) {
 }
 
 function pinnedFor(code) {
-  return pinnedPositions.get(String(code || '').trim()) || null;
+  const pin = pinnedPositions.get(String(code || '').trim());
+  if (!pin) return null;
+  if (!Number.isFinite(Number(pin.lat)) || !Number.isFinite(Number(pin.lng))) return null;
+  return {
+    lat: Number(pin.lat),
+    lng: Number(pin.lng),
+    at: Number(pin.at) || 0,
+    user: Boolean(pin.user),
+  };
 }
 
-/** Lần đầu thấy hub → seed pin; sau đó không bao giờ nhảy theo SSE nếu chưa đụng. */
 function ensureSeedPin(code, lat, lng) {
   if (pinnedFor(code)) return;
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
   pinBoatPosition(code, lat, lng, { user: false });
 }
 
-function fallbackLatLngForBoat(code, index, data = latest) {
-  const pin = pinnedFor(code);
-  if (pin) return { lat: pin.lat, lng: pin.lng };
-  const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === code);
-  if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
-    return { lat: Number(hub.lat), lng: Number(hub.lng) };
-  }
-  const stations = (data?.stations || []).filter((s) => (
-    Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
-  ));
-  if (stations.length) {
-    const s = stations[index % stations.length];
-    // Lệch nhẹ để 5 tàu không chồng nhau khi chưa có GPS.
-    const jitter = (index - 2) * 0.00035;
-    return { lat: Number(s.lat) + jitter, lng: Number(s.lng) + jitter };
-  }
-  return { lat: 10.776 + index * 0.002, lng: 106.708 };
+function getStatus(code) {
+  const key = String(code || '').trim();
+  const cur = boatStatuses.get(key) || {};
+  return {
+    phase: cur.phase || 'prepare',
+    incident: Boolean(cur.incident),
+    updatedAt: Number(cur.updatedAt) || 0,
+  };
+}
+
+function setStatus(code, patch = {}) {
+  const key = String(code || '').trim();
+  if (!key) return;
+  const prev = getStatus(key);
+  boatStatuses.set(key, {
+    ...prev,
+    ...patch,
+    updatedAt: Date.now(),
+  });
+  persistStatuses();
+}
+
+function markSignal(code) {
+  const key = String(code || '').trim();
+  if (!key) return;
+  lastSignalAt.set(key, Date.now());
+}
+
+function hasSignal(code, hub) {
+  const key = String(code || '').trim();
+  const sent = lastSignalAt.get(key) || 0;
+  if (Date.now() - sent < SIGNAL_TTL_MS) return true;
+  if (hub && hub.isOnline !== false) return true;
+  const pin = pinnedFor(key);
+  return Boolean(pin?.user);
 }
 
 function toast(message, type = 'ok', ms = 3200) {
@@ -125,9 +159,17 @@ function toast(message, type = 'ok', ms = 3200) {
 }
 
 function catalogBoats(data = latest) {
-  return (data?.boats || []).filter((boat) => (
+  const fromBoats = (data?.boats || []).filter((boat) => (
     boat.boatCode && !String(boat.boatId || '').startsWith('collector-') && boat.boatId !== 'fallback-boat'
   ));
+  const byCode = new Map(fromBoats.map((b) => [String(b.boatCode).trim(), b]));
+  const deviceCodes = Object.keys(data?.config?.gpsDevices || {});
+  for (const code of [...deviceCodes, ...FALLBACK_BOAT_CODES]) {
+    const key = String(code).trim();
+    if (!key || byCode.has(key)) continue;
+    byCode.set(key, { boatCode: key, boatName: key, maxSpeedKmh: null });
+  }
+  return [...byCode.values()].sort((a, b) => String(a.boatCode).localeCompare(String(b.boatCode)));
 }
 
 function deviceForBoat(code, data = latest) {
@@ -147,7 +189,7 @@ function distMeters(a, b) {
   return 2 * 6371008.8 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
 }
 
-function nearestStation(latlng, stations) {
+function nearestStationAny(latlng, stations) {
   let best = null;
   let bestDist = Infinity;
   for (const station of stations || []) {
@@ -158,47 +200,127 @@ function nearestStation(latlng, stations) {
       best = station;
     }
   }
-  return best && bestDist <= SNAP_STATION_M ? { station: best, dist: bestDist } : null;
+  return best ? { station: best, dist: bestDist } : null;
 }
 
-function boatIcon(heading = 0, { drag = false } = {}) {
-  const deg = Number(heading) || 0;
-  if (drag) {
-    return L.divIcon({
-      className: '',
-      html: `
-        <div class="collector-marker">
-          <div class="collector-marker-pulse"></div>
-          <div class="collector-marker-inner" style="--heading:${deg}deg">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path fill="#0f766e" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
-            </svg>
-          </div>
-        </div>
-      `,
-      iconSize: [58, 58],
-      iconAnchor: [29, 29],
-    });
+function nearestStation(latlng, stations) {
+  const hit = nearestStationAny(latlng, stations);
+  return hit && hit.dist <= SNAP_STATION_M ? hit : null;
+}
+
+function stationByCode(code, stations = latest?.stations) {
+  const key = String(code || '').toUpperCase();
+  return (stations || []).find((s) => String(s.stationCode || '').toUpperCase() === key) || null;
+}
+
+function corridorStations(stations = latest?.stations) {
+  return WATERBUS_CORRIDOR_CODES
+    .map((code) => stationByCode(code, stations))
+    .filter(Boolean);
+}
+
+function scheduleMinutes(fromCode, toCode) {
+  const segments = latest?.config?.waterbusSchedule?.segments || {};
+  const key = `${String(fromCode || '').toUpperCase()}|${String(toCode || '').toUpperCase()}`;
+  const n = Number(segments[key]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function nextStationAlongCorridor(latlng, stations = latest?.stations) {
+  const corridor = corridorStations(stations);
+  if (corridor.length < 2) {
+    const near = nearestStationAny(latlng, stations);
+    return near ? { from: near.station, to: null, distToFrom: near.dist, etaMin: null } : null;
   }
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  corridor.forEach((s, i) => {
+    const d = distMeters(latlng, s);
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  });
+  const from = corridor[bestIdx];
+  const to = corridor[Math.min(bestIdx + 1, corridor.length - 1)];
+  const same = String(from.stationId) === String(to.stationId);
+  const etaMin = same ? 0 : scheduleMinutes(from.stationCode, to.stationCode);
+  return {
+    from,
+    to: same ? null : to,
+    distToFrom: bestDist,
+    distToTo: same ? 0 : distMeters(latlng, to),
+    etaMin,
+  };
+}
+
+function autoPhaseForBoat(code, lat, lng) {
+  const st = getStatus(code);
+  if (st.incident) return 'incident';
+  const near = nearestStationAny({ lat, lng }, latest?.stations || []);
+  if (near && near.dist <= SNAP_STATION_M) return 'arrived';
+  if (near && near.dist <= APPROACH_M) return 'approaching';
+  if (st.phase === 'departing' || st.phase === 'enroute' || st.phase === 'prepare') {
+    if (st.phase === 'prepare' && near && near.dist > APPROACH_M) return 'enroute';
+    return st.phase === 'prepare' ? 'prepare' : (st.phase === 'departing' ? 'departing' : 'enroute');
+  }
+  return near && near.dist > APPROACH_M ? 'enroute' : 'prepare';
+}
+
+function phaseLabel(code, lat, lng) {
+  const phase = autoPhaseForBoat(code, lat, lng);
+  if (phase === 'incident') return PHASES.incident;
+  if (phase === 'enroute' || phase === 'departing') {
+    const next = nextStationAlongCorridor({ lat, lng });
+    if (next?.to) {
+      const eta = next.etaMin != null ? `${next.etaMin} phút` : '…';
+      const name = next.to.stationCode || next.to.stationName || 'bến kế';
+      if (phase === 'departing') return `${PHASES.departing} · tới ${name}`;
+      return `Còn ${eta} tới ${name}`;
+    }
+  }
+  if (phase === 'approaching') {
+    const near = nearestStationAny({ lat, lng }, latest?.stations || []);
+    const name = near?.station?.stationCode || near?.station?.stationName || 'bến';
+    return `${PHASES.approaching} · ${name}`;
+  }
+  if (phase === 'arrived') {
+    const near = nearestStationAny({ lat, lng }, latest?.stations || []);
+    const name = near?.station?.stationCode || near?.station?.stationName || 'bến';
+    return `${PHASES.arrived} · ${name}`;
+  }
+  return PHASES[phase] || PHASES.prepare;
+}
+
+function boatColor({ signal, incident, phase, drag }) {
+  if (incident || phase === 'incident') return '#dc2626';
+  if (drag) return '#0f766e';
+  if (!signal) return '#94a3b8';
+  if (phase === 'approaching') return '#f59e0b';
+  if (phase === 'arrived' || phase === 'prepare') return '#16a34a';
+  if (phase === 'departing' || phase === 'enroute') return '#15803d';
+  return '#16a34a';
+}
+
+function boatIcon(heading = 0, opts = {}) {
+  const deg = Number(heading) || 0;
+  const fill = boatColor(opts);
+  const size = opts.drag ? 52 : 44;
   return L.divIcon({
-    className: '',
+    className: 'live-boat-wrap',
     html: `
-      <div class="boat-marker">
-        <div class="boat-marker-pulse"></div>
-        <div class="boat-marker-inner" style="--heading:${deg}deg">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path fill="#ef4444" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
-          </svg>
-        </div>
-        <div class="boat-marker-point"></div>
+      <div class="live-boat${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}" style="--heading:${deg}deg;--boat:${fill}">
+        <span class="live-boat-ring"></span>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="${fill}" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
+        </svg>
       </div>
     `,
-    iconSize: [58, 58],
-    iconAnchor: [29, 29],
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
   });
 }
 
-/** Cùng cờ bến Survey (styles.css .station-flag). */
 function stationIcon(code) {
   const label = String(code || '')
     .replace(/^ST-/i, '')
@@ -225,6 +347,51 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;');
 }
 
+function displayOffset(index, total) {
+  if (total <= 1) return { lat: 0, lng: 0 };
+  const angle = (index / total) * Math.PI * 2;
+  const r = 0.00028;
+  return { lat: Math.cos(angle) * r, lng: Math.sin(angle) * r };
+}
+
+function fallbackLatLngForBoat(code, index, data = latest) {
+  const pin = pinnedFor(code);
+  if (pin) return { lat: pin.lat, lng: pin.lng };
+  const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === code);
+  if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+    return { lat: Number(hub.lat), lng: Number(hub.lng) };
+  }
+  const corridor = corridorStations(data?.stations);
+  if (corridor.length) {
+    const s = corridor[index % corridor.length];
+    return { lat: Number(s.lat), lng: Number(s.lng) };
+  }
+  const stations = (data?.stations || []).filter((s) => (
+    Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
+  ));
+  if (stations.length) {
+    const s = stations[index % stations.length];
+    return { lat: Number(s.lat), lng: Number(s.lng) };
+  }
+  return { lat: 10.776 + index * 0.0015, lng: 106.708 };
+}
+
+function resolveUniqueSeed(code, lat, lng, occupied) {
+  let outLat = lat;
+  let outLng = lng;
+  let guard = 0;
+  while (guard < 12) {
+    const clash = occupied.some((p) => distMeters(p, { lat: outLat, lng: outLng }) < CLUSTER_M);
+    if (!clash) break;
+    const j = occupied.length + guard;
+    outLat = lat + Math.cos(j) * 0.0004;
+    outLng = lng + Math.sin(j) * 0.0004;
+    guard += 1;
+  }
+  occupied.push({ lat: outLat, lng: outLng, code });
+  return { lat: outLat, lng: outLng };
+}
+
 function renderBoatOptions(data) {
   const boats = catalogBoats(data);
   const previous = selectedBoatCode || boatSelectEl.value;
@@ -237,25 +404,22 @@ function renderBoatOptions(data) {
       return `<option value="${escapeHtml(boat.boatCode)}">${escapeHtml(boat.boatCode)}${escapeHtml(name)}${escapeHtml(maxText)}</option>`;
     }),
   ].join('');
-  const preferred = boats.some((b) => b.boatCode === previous)
-    ? previous
-    : '';
-  boatSelectEl.value = preferred;
-  selectedBoatCode = preferred;
-  if (preferred) localStorage.setItem('liveGpsBoatCode', preferred);
-  else localStorage.removeItem('liveGpsBoatCode');
-  updateDeviceHint(data);
-  centerBoatBtn.disabled = !preferred;
+  if (previous && [...boatSelectEl.options].some((o) => o.value === previous)) {
+    boatSelectEl.value = previous;
+    selectedBoatCode = previous;
+  }
+  updateDeviceHint();
+  syncPhaseControls();
 }
 
-function updateDeviceHint(data = latest) {
-  const code = boatSelectEl.value.trim();
+function updateDeviceHint() {
+  const code = selectedBoatCode || boatSelectEl.value;
   if (!code) {
     deviceHintEl.textContent = 'Chọn tàu đã đăng ký device để kéo trên map.';
     deviceHintEl.className = 'live-hint';
     return;
   }
-  const device = deviceForBoat(code, data);
+  const device = deviceForBoat(code);
   if (device) {
     deviceHintEl.textContent = `${code} · device ${device} · kéo marker rồi thả để gửi GPS.`;
     deviceHintEl.className = 'live-hint is-ok';
@@ -263,6 +427,28 @@ function updateDeviceHint(data = latest) {
     deviceHintEl.textContent = `${code} · chưa thấy gps_devices — server sẽ fallback device chung.`;
     deviceHintEl.className = 'live-hint is-warn';
   }
+}
+
+function syncPhaseControls() {
+  const code = selectedBoatCode;
+  const disabled = !code;
+  if (incidentBtn) incidentBtn.disabled = disabled;
+  if (phaseSelectEl) {
+    phaseSelectEl.disabled = disabled;
+    if (code) {
+      const st = getStatus(code);
+      phaseSelectEl.value = st.incident ? 'incident' : (st.phase || 'prepare');
+    }
+  }
+  updateIncidentButton();
+}
+
+function updateIncidentButton() {
+  if (!incidentBtn) return;
+  const st = getStatus(selectedBoatCode);
+  incidentBtn.textContent = st.incident ? 'Hết sự cố' : 'Báo sự cố';
+  incidentBtn.classList.toggle('is-danger', !st.incident);
+  incidentBtn.classList.toggle('is-ok', st.incident);
 }
 
 function renderStations(stations) {
@@ -293,7 +479,6 @@ function renderStations(stations) {
   }
 }
 
-/** Vẽ polyline tuyến từ DB; nếu routes trống thì nối bến DB theo lịch Waterbus. */
 function renderRoutes(routes, stations) {
   const seen = new Set();
   const bounds = [];
@@ -314,12 +499,12 @@ function renderRoutes(routes, stations) {
       routeLayers.set(id, layer);
     } else {
       layer.setLatLngs(latlngs);
+      layer.setStyle({ ...ROUTE_STYLE });
       if (!map.hasLayer(layer)) layer.addTo(map);
     }
     for (const p of latlngs) bounds.push(p);
   }
 
-  // Fallback: DB chưa có route_geometry → vẽ hành lang bến theo lịch BD↔LD.
   if (!seen.size) {
     const byCode = new Map(
       (stations || [])
@@ -337,13 +522,14 @@ function renderRoutes(routes, stations) {
       if (!layer) {
         layer = L.polyline(latlngs, {
           ...ROUTE_STYLE,
-          dashArray: '8 6',
-          opacity: 0.65,
+          dashArray: '10 10',
+          opacity: 0.2,
         }).addTo(map);
-        layer.bindTooltip('Hành lang Waterbus (bến DB · chờ geometry tuyến)');
+        layer.bindTooltip('Hành lang Waterbus (bến DB)');
         routeLayers.set(id, layer);
       } else {
         layer.setLatLngs(latlngs);
+        layer.setStyle({ ...ROUTE_STYLE, dashArray: '10 10', opacity: 0.2 });
         if (!map.hasLayer(layer)) layer.addTo(map);
       }
       for (const p of latlngs) bounds.push(p);
@@ -372,24 +558,49 @@ function renderHubBoats(hubBoats) {
   }
 
   const catalog = catalogBoats();
-  const codes = new Set([
+  const codes = [...new Set([
     ...catalog.map((b) => String(b.boatCode).trim()),
     ...hubByCode.keys(),
     ...pinnedPositions.keys(),
-  ].filter(Boolean));
+  ].filter(Boolean))].sort();
 
-  // Seed pin lần đầu từ hub — sau đó đứng yên trừ khi user kéo.
+  const occupied = [];
   let index = 0;
   for (const code of codes) {
     const hub = hubByCode.get(code);
+    let seed;
     if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
-      ensureSeedPin(code, Number(hub.lat), Number(hub.lng));
-    } else if (!pinnedFor(code)) {
-      const fb = fallbackLatLngForBoat(code, index, latest);
-      ensureSeedPin(code, fb.lat, fb.lng);
+      seed = { lat: Number(hub.lat), lng: Number(hub.lng) };
+    } else {
+      seed = fallbackLatLngForBoat(code, index, latest);
+    }
+    if (!pinnedFor(code)) {
+      const unique = resolveUniqueSeed(code, seed.lat, seed.lng, occupied);
+      ensureSeedPin(code, unique.lat, unique.lng);
+    } else {
+      occupied.push(pinnedFor(code));
     }
     index += 1;
   }
+
+  // Cluster offset chỉ để nhìn thấy đủ tàu khi cùng chỗ — vị trí gửi vẫn dùng pin thật.
+  const truePositions = codes.map((code, i) => {
+    const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
+    return { code, ...pin };
+  });
+  const displayPos = new Map();
+  truePositions.forEach((item, i) => {
+    const twins = truePositions
+      .map((p, j) => ({ ...p, j }))
+      .filter((p) => distMeters(p, item) < CLUSTER_M);
+    if (twins.length <= 1 || item.code === selectedBoatCode) {
+      displayPos.set(item.code, { lat: item.lat, lng: item.lng });
+      return;
+    }
+    const myIdx = twins.findIndex((t) => t.code === item.code);
+    const off = displayOffset(myIdx, twins.length);
+    displayPos.set(item.code, { lat: item.lat + off.lat, lng: item.lng + off.lng });
+  });
 
   const seen = new Set();
   const selected = selectedBoatCode;
@@ -398,46 +609,54 @@ function renderHubBoats(hubBoats) {
   for (const code of codes) {
     const hub = hubByCode.get(code);
     const catalogBoat = catalog.find((b) => String(b.boatCode) === code);
-    const pin = pinnedFor(code) || fallbackLatLngForBoat(code, index, latest);
-    ensureSeedPin(code, pin.lat, pin.lng);
-    const fixed = pinnedFor(code);
-    const lat = fixed.lat;
-    const lng = fixed.lng;
+    const fixed = pinnedFor(code) || fallbackLatLngForBoat(code, index, latest);
+    ensureSeedPin(code, fixed.lat, fixed.lng);
+    const trueLat = fixed.lat;
+    const trueLng = fixed.lng;
+    const show = displayPos.get(code) || fixed;
     seen.add(code);
     index += 1;
 
     const isSelected = code === selected;
     const isDraggingSelected = isSelected && dragging;
-    const offline = hub ? hub.isOnline === false : true;
+    const st = getStatus(code);
+    const phase = autoPhaseForBoat(code, trueLat, trueLng);
+    const signal = hasSignal(code, hub);
     const heading = Number(hub?.heading) || 0;
+    const label = phaseLabel(code, trueLat, trueLng);
     const tip = [
       code,
       catalogBoat?.boatName || hub?.boatName || '',
-      offline ? 'đứng yên' : 'live',
+      signal ? 'có tín hiệu' : 'mất tín hiệu',
+      label,
       isSelected ? (dragging ? 'đang kéo' : 'kéo được') : '',
     ].filter(Boolean).join(' · ');
 
+    const iconOpts = {
+      drag: isSelected,
+      signal,
+      incident: st.incident || phase === 'incident',
+      phase,
+    };
+
     let marker = hubMarkers.get(code);
     if (!marker) {
-      marker = L.marker([lat, lng], {
-        icon: boatIcon(heading, { drag: isSelected }),
+      marker = L.marker([show.lat, show.lng], {
+        icon: boatIcon(heading, iconOpts),
         draggable: isSelected,
-        zIndexOffset: isSelected ? 1200 : 800,
+        zIndexOffset: isSelected ? 1200 : 700 + index,
         autoPan: true,
-        opacity: isSelected ? 1 : 0.85,
       }).addTo(map);
-      marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -20] });
+      marker.bindTooltip(tip, { permanent: true, direction: 'top', offset: [0, -18] });
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
     } else if (isDraggingSelected) {
       marker.setTooltipContent(tip);
     } else {
-      // Không theo hub — chỉ giữ (hoặc đồng bộ) đúng vị trí đã pin.
-      marker.setLatLng([lat, lng]);
-      marker.setIcon(boatIcon(heading, { drag: isSelected }));
+      marker.setLatLng([show.lat, show.lng]);
+      marker.setIcon(boatIcon(heading, iconOpts));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
-      marker.setZIndexOffset(isSelected ? 1200 : 800);
-      marker.setOpacity(isSelected ? 1 : 0.85);
+      marker.setZIndexOffset(isSelected ? 1200 : 700 + index);
       marker.setTooltipContent(tip);
       if (isSelected) bindDragHandlers(marker, code);
     }
@@ -455,12 +674,22 @@ function renderHubBoats(hubBoats) {
     marker.dragging?.enable?.();
     marker.setZIndexOffset(1200);
     bindDragHandlers(marker, selected);
-    const { lat, lng } = marker.getLatLng();
-    coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    const pin = pinnedFor(selected);
+    if (pin) coordStatusEl.textContent = `${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`;
+  }
+
+  if (boatPhaseStatusEl) {
+    if (selected && pinnedFor(selected)) {
+      const pin = pinnedFor(selected);
+      boatPhaseStatusEl.textContent = phaseLabel(selected, pin.lat, pin.lng);
+    } else {
+      boatPhaseStatusEl.textContent = '—';
+    }
   }
 
   centerBoatBtn.disabled = !selected || !hubMarkers.has(selected);
   if (sendNowBtn) sendNowBtn.disabled = !selected || !hubMarkers.has(selected);
+  syncPhaseControls();
 }
 
 function bindDragHandlers(marker, code) {
@@ -487,6 +716,10 @@ function bindDragHandlers(marker, code) {
       lng = Number(snap.station.lng);
       marker.setLatLng([lat, lng]);
       toast(`Snap ${snap.station.stationCode || snap.station.stationName} (${Math.round(snap.dist)} m)`, 'ok');
+      setStatus(code, { phase: 'arrived', incident: false });
+    } else {
+      const st = getStatus(code);
+      if (!st.incident) setStatus(code, { phase: 'enroute' });
     }
     pinBoatPosition(code, lat, lng, { user: true });
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
@@ -499,6 +732,9 @@ async function sendLiveGps(boatCode, lat, lng) {
   sending = true;
   sendStatusEl.textContent = 'Đang gửi…';
   pinBoatPosition(boatCode, lat, lng, { user: true });
+  const st = getStatus(boatCode);
+  const phase = autoPhaseForBoat(boatCode, lat, lng);
+  const status = st.incident ? 'idle' : (phase === 'enroute' || phase === 'departing' ? 'moving' : 'idle');
   const sendToTarget = sendAzureSelectEl.value === 'on';
   try {
     const response = await fetch('/api/live/gps', {
@@ -508,8 +744,8 @@ async function sendLiveGps(boatCode, lat, lng) {
         boatCode,
         lat,
         lng,
-        speedKmh: 0,
-        status: 'idle',
+        speedKmh: status === 'moving' ? 12 : 0,
+        status,
         sendToTarget,
       }),
     });
@@ -520,13 +756,13 @@ async function sendLiveGps(boatCode, lat, lng) {
       toast(msg, 'err');
       return;
     }
+    markSignal(boatCode);
     pinBoatPosition(boatCode, lat, lng, { user: true });
     const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
     sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
     if (body.warning) toast(body.warning, 'warn');
     else toast(`Đã gửi GPS ${boatCode}`, 'ok');
-    const marker = hubMarkers.get(boatCode);
-    if (marker) marker.setLatLng([lat, lng]);
+    if (latest) renderHubBoats(latest.hubBoats);
   } catch (error) {
     sendStatusEl.textContent = 'Lỗi mạng';
     toast(error.message, 'err');
@@ -545,9 +781,6 @@ function renderStatus(data) {
     hubStatusEl.textContent = st.lastError || 'Đang nối…';
   }
 
-  if (data?.config?.senderEnabled === false && sendAzureSelectEl.value === 'on') {
-    // Respect server default but keep user's select for this page.
-  }
   if (sendAzureSelectEl.dataset.seeded !== '1') {
     sendAzureSelectEl.value = data?.config?.senderEnabled === false ? 'off' : 'on';
     sendAzureSelectEl.dataset.seeded = '1';
@@ -589,13 +822,38 @@ boatSelectEl.addEventListener('change', () => {
   if (selectedBoatCode) localStorage.setItem('liveGpsBoatCode', selectedBoatCode);
   else localStorage.removeItem('liveGpsBoatCode');
   updateDeviceHint();
+  syncPhaseControls();
   if (latest) renderHubBoats(latest.hubBoats);
   const marker = hubMarkers.get(selectedBoatCode);
   if (marker) {
-    const { lat, lng } = marker.getLatLng();
-    map.panTo([lat, lng], { animate: true });
-    coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+    map.panTo(marker.getLatLng(), { animate: true });
   }
+});
+
+phaseSelectEl?.addEventListener('change', () => {
+  if (!selectedBoatCode) return;
+  const phase = phaseSelectEl.value;
+  if (phase === 'incident') {
+    setStatus(selectedBoatCode, { phase: 'incident', incident: true });
+  } else {
+    setStatus(selectedBoatCode, { phase, incident: false });
+  }
+  syncPhaseControls();
+  if (latest) renderHubBoats(latest.hubBoats);
+  toast(`${selectedBoatCode}: ${PHASES[phase] || phase}`, phase === 'incident' ? 'warn' : 'ok');
+});
+
+incidentBtn?.addEventListener('click', () => {
+  if (!selectedBoatCode) return;
+  const st = getStatus(selectedBoatCode);
+  const next = !st.incident;
+  setStatus(selectedBoatCode, {
+    incident: next,
+    phase: next ? 'incident' : 'prepare',
+  });
+  syncPhaseControls();
+  if (latest) renderHubBoats(latest.hubBoats);
+  toast(next ? `${selectedBoatCode}: báo sự cố — dừng` : `${selectedBoatCode}: hết sự cố`, next ? 'warn' : 'ok');
 });
 
 centerBoatBtn.addEventListener('click', () => {
@@ -605,19 +863,21 @@ centerBoatBtn.addEventListener('click', () => {
 });
 
 sendNowBtn?.addEventListener('click', async () => {
+  const pin = pinnedFor(selectedBoatCode);
   const marker = hubMarkers.get(selectedBoatCode);
-  if (!marker || !selectedBoatCode) {
+  if (!marker || !selectedBoatCode || !pin) {
     toast('Chọn tàu trước', 'warn');
     return;
   }
-  let { lat, lng } = marker.getLatLng();
+  let { lat, lng } = pin;
   const snap = nearestStation({ lat, lng }, latest?.stations || []);
   if (snap) {
     lat = Number(snap.station.lat);
     lng = Number(snap.station.lng);
     marker.setLatLng([lat, lng]);
+    setStatus(selectedBoatCode, { phase: 'arrived', incident: false });
   }
-  pinBoatPosition(selectedBoatCode, lat, lng);
+  pinBoatPosition(selectedBoatCode, lat, lng, { user: true });
   coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
   await sendLiveGps(selectedBoatCode, lat, lng);
 });

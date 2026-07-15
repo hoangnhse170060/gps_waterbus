@@ -22,7 +22,7 @@
         <header class="live-brand">
           <p class="live-eyebrow">Saigon Waterbus</p>
           <h1>Live GPS</h1>
-          <p class="live-lead">Kéo tàu dọc tuyến (geometry DB hoặc hành lang bến). Thả để gửi GPS lên BE rồi hiện lại realtime.</p>
+          <p class="live-lead">Hiện đủ tàu. Xanh = có tín hiệu. Chỉ tàu bạn đụng mới đổi vị trí.</p>
         </header>
 
         <nav class="live-nav">
@@ -39,6 +39,18 @@
           <small id="deviceHint" class="live-hint">Chọn tàu đã đăng ký device để kéo trên map.</small>
         </label>
 
+        <label class="live-field">
+          <span>Trạng thái tàu</span>
+          <select id="phaseSelect" disabled>
+            <option value="prepare">Chuẩn bị đi</option>
+            <option value="departing">Bắt đầu đi</option>
+            <option value="enroute">Đang đi / ETA bến</option>
+            <option value="approaching">Sắp cập bến</option>
+            <option value="arrived">Đã cập bến</option>
+            <option value="incident">Sự cố — dừng</option>
+          </select>
+        </label>
+
         <label class="live-field live-toggle">
           <span>Gửi Azure BE</span>
           <select id="sendAzureSelect">
@@ -47,9 +59,10 @@
           </select>
         </label>
 
-        <div class="live-actions">
+        <div class="live-actions live-actions-2x2">
           <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
           <button id="sendNowBtn" type="button" class="secondary" disabled>Gửi GPS</button>
+          <button id="incidentBtn" type="button" class="secondary is-danger" disabled>Báo sự cố</button>
           <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
         </div>
 
@@ -66,17 +79,22 @@
             <span>Tọa độ</span>
             <b id="coordStatus">—</b>
           </div>
+          <div class="live-status-row">
+            <span>Trạng thái</span>
+            <b id="boatPhaseStatus">—</b>
+          </div>
         </section>
 
         <p id="liveHelp" class="live-help">
-          Hiện đủ tàu, đứng yên. Chỉ tàu bạn chọn + kéo/thả (hoặc Gửi GPS) mới đổi vị trí &amp; POST BE.
+          Xanh = có tín hiệu · Đỏ = sự cố (bấm Báo sự cố) · ETA bến theo lịch Waterbus khi đang đi.
         </p>
 
         <footer class="live-legend">
-          <span><i class="leg-route"></i> Tuyến / hành lang</span>
-          <span><i class="leg-station"></i> Bến</span>
-          <span><i class="leg-live"></i> Tàu live</span>
-          <span><i class="leg-drag"></i> Đang kéo</span>
+          <span><i class="leg-route"></i> Tuyến mờ</span>
+          <span><i class="leg-signal"></i> Có tín hiệu</span>
+          <span><i class="leg-warn"></i> Sắp cập</span>
+          <span><i class="leg-incident"></i> Sự cố</span>
+          <span><i class="leg-mute"></i> Mất tín hiệu</span>
         </footer>
       </aside>
     </div>
