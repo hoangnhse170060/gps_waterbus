@@ -2491,6 +2491,9 @@ function renderCollector(collector, lastCollectorSend, session) {
       collectorMarker.remove();
       collectorMarker = null;
     }
+    // Ghi GPS xong → ẩn marker live của đúng tàu vừa survey.
+    const finishedCode = String(activeSession?.boatCode || '').trim();
+    if (finishedCode) removeSignalRBoatMarker(finishedCode);
     const count = activeSession?.recordedPoints?.length || activeSession?.recordedCount || 0;
     if (count && !autoSaveInFlight) {
       collectorStatusEl.textContent = `Đã kết thúc ghi: ${count} điểm GPS.`;

@@ -165,6 +165,10 @@ setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 15000));
 setInterval(tickSimulator, 1000);
 setInterval(publishGpsPositions, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
+setInterval(pruneStaleHubBoats, 5000);
+
+/** Sau khi dừng ghi survey, ignore echo SignalR một lúc để marker không hiện lại. */
+const hubBoatSuppressUntil = new Map();
 
 const server = createServer(async (req, res) => {
   try {
@@ -300,6 +304,7 @@ const server = createServer(async (req, res) => {
       }
       state.collector = null;
       state.collectorQueue = [];
+      clearHubBoat(stopped?.boatCode, { suppressMs: 180_000 });
       broadcast();
       return sendJson(res, {
         ok: true,
@@ -360,6 +365,11 @@ function upsertHubBoat(payload) {
   const lat = Number(payload.lat);
   const lng = Number(payload.lng);
   if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const suppressUntil = hubBoatSuppressUntil.get(code) || 0;
+  if (suppressUntil > Date.now()) return;
+  if (suppressUntil) hubBoatSuppressUntil.delete(code);
+  // Đang hoặc vừa survey cùng mã → không giữ twin live trên map (marker collector/route xong sẽ ẩn).
+  if (state.collector && String(state.collector.boatCode || '').trim() === code) return;
   state.hubBoats.set(code, {
     boatCode: code,
     boatName: payload.boatName || null,
@@ -379,6 +389,29 @@ function upsertHubBoat(payload) {
     isOnline: payload.isOnline !== false,
     updatedAt: new Date().toISOString(),
   });
+}
+
+function clearHubBoat(boatCode, { suppressMs = 120_000 } = {}) {
+  const code = String(boatCode || '').trim();
+  if (!code) return false;
+  const had = state.hubBoats.delete(code);
+  if (suppressMs > 0) hubBoatSuppressUntil.set(code, Date.now() + suppressMs);
+  return had;
+}
+
+/** Tàu live không còn ping thì biến mất khỏi map (sau khi ghi GPS xong cũng hết). */
+function pruneStaleHubBoats() {
+  const ttl = Math.max(10_000, Number(env.HUB_BOAT_TTL_MS || 45_000));
+  const now = Date.now();
+  let changed = false;
+  for (const [code, boat] of [...state.hubBoats.entries()]) {
+    const updated = Date.parse(boat.updatedAt || '');
+    if (!Number.isFinite(updated) || now - updated > ttl) {
+      state.hubBoats.delete(code);
+      changed = true;
+    }
+  }
+  if (changed) broadcast();
 }
 
 async function loadEnv() {
@@ -1374,6 +1407,7 @@ async function finalizeCollectorRecording() {
   stopped.finalizeDone = true;
 
   if (!stopped.recordedPoints?.length) {
+    clearHubBoat(stopped.boatCode, { suppressMs: 180_000 });
     state.collector = null;
     state.collectorQueue = [];
     broadcast();
@@ -1401,6 +1435,7 @@ async function finalizeCollectorRecording() {
     stoppedAt: new Date().toISOString(),
     targetSessionStarted: Boolean(stopped.targetSessionStarted),
   };
+  clearHubBoat(stopped.boatCode, { suppressMs: 180_000 });
   state.collector = null;
   state.collectorQueue = [];
   broadcast();
