@@ -722,8 +722,23 @@ function tickCollector() {
   collector.heading = next.heading;
   collector.updatedAt = new Date().toISOString();
   if (collector.progressMeters >= collector.lengthMeters) {
-    collector.status = 'completed';
+    // Dừng đúng điểm cuối (bến đích) — idle cho GPS side FE.
+    const end = pointAtDistance(collector.coordinates, collector.lengthMeters);
+    const endStation = collector.endStationId
+      ? (state.stations || []).find((s) => String(s.stationId) === String(collector.endStationId))
+      : null;
+    if (endStation && Number.isFinite(Number(endStation.lat)) && Number.isFinite(Number(endStation.lng))) {
+      collector.lat = Number(endStation.lat);
+      collector.lng = Number(endStation.lng);
+    } else {
+      collector.lat = end.lat;
+      collector.lng = end.lng;
+    }
+    collector.heading = end.heading;
     collector.progressMeters = collector.lengthMeters;
+    collector.speedKmh = 0;
+    collector.status = 'completed';
+    collector.gpsEndStatus = 'idle';
   } else {
     collector.status = 'moving';
   }
@@ -756,8 +771,9 @@ async function publishGpsPositions() {
 
   for (const payload of pendingPayloads) {
     try {
-      const body = JSON.stringify(payload);
-      const headers = buildGpsHeaders(payload);
+      const azurePayload = sanitizeGpsPayloadForAzure(payload);
+      const body = JSON.stringify(azurePayload);
+      const headers = buildGpsHeaders(azurePayload);
       const response = await fetch(getTargetEndpoint(), {
         method: 'POST',
         headers,
@@ -765,7 +781,7 @@ async function publishGpsPositions() {
       });
       let accepted = response.status >= 200 && response.status < 300;
       if (response.status === 409) {
-        const retried = await retryGpsAfterSequenceConflict(payload);
+        const retried = await retryGpsAfterSequenceConflict(azurePayload);
         accepted = retried.ok;
         results.push({
           boatCode: payload.boatCode,
@@ -839,16 +855,17 @@ async function publishCollectorPosition() {
 
   for (const item of pendingPayloads) {
     try {
+      const azurePayload = sanitizeGpsPayloadForAzure(item);
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: buildGpsHeaders(item),
-        body: JSON.stringify(item),
+        headers: buildGpsHeaders(azurePayload),
+        body: JSON.stringify(azurePayload),
       });
       let ok = response.status >= 200 && response.status < 300;
       let status = response.status;
       let errorText = null;
       if (response.status === 409) {
-        const retried = await retryGpsAfterSequenceConflict(item);
+        const retried = await retryGpsAfterSequenceConflict(azurePayload);
         ok = retried.ok;
         status = retried.status;
         errorText = ok ? null : (retried.error || 'sequence conflict (409)');
@@ -991,9 +1008,9 @@ async function publishLiveGpsPosition(body = {}) {
     boatId: matched?.boatId || body.boatId || null,
     boatCode,
     boatName: matched?.boatName || body.boatName || null,
-    tripId: matched?.tripId || null,
-    routeId: matched?.routeId || null,
-    routeCode: matched?.routeCode || null,
+    tripId: null,
+    routeId: null,
+    routeCode: null,
     lat: round(lat, 7),
     lng: round(lng, 7),
     speedKmh: round(speedKmh, 1),
@@ -1035,10 +1052,11 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   try {
+    const azurePayload = sanitizeGpsPayloadForAzure(payload);
     const response = await fetch(getTargetEndpoint(), {
       method: 'POST',
-      headers: buildGpsHeaders(payload),
-      body: JSON.stringify(payload),
+      headers: buildGpsHeaders(azurePayload),
+      body: JSON.stringify(azurePayload),
     });
     let ok = response.status >= 200 && response.status < 300;
     let statusCode = response.status;
@@ -1049,7 +1067,7 @@ async function publishLiveGpsPosition(body = {}) {
       try { responseData = JSON.parse(text); } catch { responseData = { message: text }; }
     }
     if (response.status === 409) {
-      const retried = await retryGpsAfterSequenceConflict(payload);
+      const retried = await retryGpsAfterSequenceConflict(azurePayload);
       ok = retried.ok;
       statusCode = retried.status;
       errorText = ok ? null : (retried.error || 'sequence conflict (409)');
@@ -1153,10 +1171,11 @@ async function retryGpsAfterSequenceConflict(payload) {
   }
 
   try {
+    const azurePayload = sanitizeGpsPayloadForAzure(payload);
     const response = await fetch(getTargetEndpoint(), {
       method: 'POST',
-      headers: buildGpsHeaders(payload),
-      body: JSON.stringify(payload),
+      headers: buildGpsHeaders(azurePayload),
+      body: JSON.stringify(azurePayload),
     });
     if (response.status >= 200 && response.status < 300) {
       return { ok: true, status: response.status };
@@ -1188,6 +1207,20 @@ function buildGpsHeaders(payload) {
   };
   if (state.targetApiKey) headers['X-Api-Key'] = state.targetApiKey;
   return headers;
+}
+
+/**
+ * BE routes đang trống: gửi routeId/routeCode sẽ 404 → vị trí không cập nhật.
+ * Mặc định luôn null trên POST /tracking/locations (tắt bằng AZURE_GPS_OMIT_ROUTE=false).
+ */
+function sanitizeGpsPayloadForAzure(payload) {
+  const out = { ...payload };
+  if (parseBool(env.AZURE_GPS_OMIT_ROUTE ?? 'true')) {
+    out.routeId = null;
+    out.routeCode = null;
+    out.tripId = null;
+  }
+  return out;
 }
 
 function getTargetEndpoint() {
@@ -1719,7 +1752,20 @@ async function finalizeCollectorRecording() {
   stopped.finalizeDone = true;
 
   if (!stopped.recordedPoints?.length) {
-    clearHubBoat(stopped.boatCode, { suppressMs: 180_000 });
+    // Vẫn giữ vị trí cuối trên hub (không ẩn GPS).
+    hubBoatSuppressUntil.delete(String(stopped.boatCode || '').trim());
+    upsertHubBoat({
+      boatCode: stopped.boatCode,
+      boatName: stopped.boatName,
+      lat: stopped.lat,
+      lng: stopped.lng,
+      heading: stopped.heading,
+      speedKmh: 0,
+      status: 'idle',
+      isOnline: true,
+      recordedAt: formatRecordedAt(new Date()),
+      receivedAt: new Date().toISOString(),
+    });
     state.collector = null;
     state.collectorQueue = [];
     broadcast();
@@ -1747,7 +1793,22 @@ async function finalizeCollectorRecording() {
     stoppedAt: new Date().toISOString(),
     targetSessionStarted: Boolean(stopped.targetSessionStarted),
   };
-  clearHubBoat(stopped.boatCode, { suppressMs: 180_000 });
+  // Giữ marker GPS ở bến đích (không suppress) — FE theo dõi vẫn thấy lat/lng.
+  hubBoatSuppressUntil.delete(String(stopped.boatCode || '').trim());
+  upsertHubBoat({
+    boatCode: stopped.boatCode,
+    boatName: stopped.boatName,
+    boatId: stopped.boatId,
+    deviceId: stopped.deviceId,
+    lat: stopped.lat,
+    lng: stopped.lng,
+    heading: stopped.heading,
+    speedKmh: 0,
+    status: 'idle',
+    isOnline: true,
+    recordedAt: formatRecordedAt(new Date()),
+    receivedAt: new Date().toISOString(),
+  });
   state.collector = null;
   state.collectorQueue = [];
   broadcast();
@@ -1797,10 +1858,19 @@ function buildRecordingPayload(collector) {
     },
   };
 
+  // BE routes=0 → luôn null route trên GPS ping (kể cả khi đang survey mã tuyến local).
+  payload.routeId = null;
+  payload.routeCode = null;
+  payload.tripId = null;
+
+  if (collector.status === 'completed' || collector.gpsEndStatus === 'idle') {
+    payload.status = 'idle';
+    payload.speedKmh = 0;
+  }
+
   if (collector.isNewRouteSurvey) {
-    delete payload.routeCode;
-    delete payload.routeId;
-    delete payload.tripId;
+    delete payload.capturedRoute;
+    payload.capturedRoute = null;
     return payload;
   }
 

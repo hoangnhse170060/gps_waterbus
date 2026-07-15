@@ -2126,6 +2126,31 @@ async function saveCapturedRoute() {
   }
 }
 
+function buildSimpleTwoStationPath() {
+  const start = getSelectedStation();
+  const end = getSelectedEndStation();
+  if (!start || !end) return false;
+  clearCapturePoints();
+  clearCompletedRouteLine();
+  addCapturePoint({ lat: Number(start.lat), lng: Number(start.lng) }, {
+    source: 'station',
+    label: start.stationName,
+    stationId: start.stationId,
+  });
+  addCapturePoint({ lat: Number(end.lat), lng: Number(end.lng) }, {
+    source: 'station-end',
+    label: end.stationName,
+    stationId: end.stationId,
+  });
+  captureState.finished = true;
+  captureState.enabled = false;
+  maybeFillRouteCode();
+  updateRouteTypeHint();
+  renderCaptureLine();
+  rebuildCaptureMarkers();
+  return true;
+}
+
 async function startRecording() {
   const routeCode = captureRouteCodeEl.value.trim();
   const routeName = captureRouteNameEl.value.trim() || routeCode;
@@ -2140,7 +2165,7 @@ async function startRecording() {
     return;
   }
   if (!collectorBoatCodeEl?.value?.trim()) {
-    captureStatusEl.textContent = 'Chọn tàu GPS trước khi ghi.';
+    captureStatusEl.textContent = 'Chọn tàu GPS (WB_001…WB_005) trước khi ghi.';
     collectorBoatCodeEl?.focus();
     return;
   }
@@ -2155,22 +2180,21 @@ async function startRecording() {
     collectorSpeedEl?.focus();
     return;
   }
-  if (captureState.points.length < 2) {
+
+  // Kiểu cũ: 2 bến (đầu → cuối) + 1 trong 5 tàu. Ưu tiên path 2 điểm nếu đủ bến.
+  if (getSelectedStation() && getSelectedEndStation()) {
+    buildSimpleTwoStationPath();
+  } else if (captureState.points.length < 2) {
     if (getSelectedStation() && !captureState.points.length) seedFromStation();
     if (getSelectedEndStation()) seedToEndStation();
     if (captureState.points.length < 2) {
-      captureStatusEl.textContent = 'Cần bến xuất phát + bến kết thúc (hoặc vẽ ≥ 2 điểm).';
+      captureStatusEl.textContent = 'Chọn bến xuất phát + bến kết thúc (2 điểm).';
       return;
     }
   }
-  if (!captureState.finished) {
-    finishDraw();
-  } else {
-    ensureEndStationFromPath();
-  }
-
+  if (!captureState.finished) finishDraw();
   if (!ensureEndStationFromPath({ quiet: true }) && !endStationEl?.value) {
-    captureStatusEl.textContent = 'Cần bến cuối: double-click bến đích hoặc thêm ≥2 bến rồi bấm Xong.';
+    captureStatusEl.textContent = 'Cần bến kết thúc để tàu dừng đúng bến.';
     return;
   }
 
@@ -2338,16 +2362,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
-    // Chuyển điểm số → đường liền trước khi unlock (cần locked path để lấy coords).
-    showCompletedRouteAsPath({
-      ...body,
-      routeCode: body.routeCode || routeCode,
-      routeName: body.routeName || routeName,
-      coordinates: body.coordinates
-        || lockedSurveyPath
-        || (captureState.points.length >= 2 ? getPathCoordinates() : null),
-    });
-    unlockSurveyPath();
+    hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear) {
       setDrawTool('pan');
       setLineMode('straight');
@@ -2421,39 +2436,20 @@ function clearCompletedRouteLine() {
   }
 }
 
-/** Sau khi chạy/lưu xong: bỏ điểm số, chỉ hiện đường liền trên map. */
-function showCompletedRouteAsPath(body = {}) {
-  const coords = Array.isArray(body.coordinates) && body.coordinates.length >= 2
-    ? body.coordinates
-    : (lockedSurveyPath?.length >= 2
-      ? lockedSurveyPath
-      : (captureState.points.length >= 2 ? getPathCoordinates() : null));
-  if (!coords || coords.length < 2) return;
-
+/** Sau khi chạy xong: ẩn đường vẽ, giữ marker GPS (hub) ở bến đích. */
+function hideDrawingKeepGps(body = {}) {
+  const endHint = [
+    body.routeCode || '',
+    'đã tới bến — GPS vẫn hiện',
+  ].filter(Boolean).join(' · ');
+  unlockSurveyPath();
   clearCapturePoints();
   clearPlannedRoute();
   clearCompletedRouteLine();
-
-  completedRouteLine = L.polyline(
-    coords.map((p) => [Number(p.lat), Number(p.lng)]),
-    { ...COMPLETED_ROUTE_STYLE, interactive: false, smoothFactor: 0 },
-  ).addTo(map);
-  completedRouteLine.bindTooltip(
-    [body.routeCode, body.routeName].filter(Boolean).join(' · ') || 'Tuyến vừa lưu',
-    { sticky: true },
-  );
-
-  pendingRevealRoute = {
-    routeId: body.routeId || body.id || '',
-    routeCode: body.routeCode || '',
-  };
-  showSavedRoutes = true;
-  applySavedRoutesVisibility();
-
-  try {
-    map.fitBounds(completedRouteLine.getBounds(), { padding: [48, 48], maxZoom: 15 });
-  } catch {
-    // ignore
+  captureState.finished = false;
+  rebuildCaptureMarkers();
+  if (captureStatusEl) {
+    captureStatusEl.textContent = endHint || 'Đã ẩn đường vẽ. Marker GPS giữ tại bến đích.';
   }
 }
 
@@ -2574,13 +2570,7 @@ function handleAutoSavedRoute(autoSaved) {
   else notifyOk(`Tự lưu thành công: ${autoSaved.routeCode || ''} → ${where}`);
   renderRouteResult(autoSaved);
   updateWorkflow('done');
-  showCompletedRouteAsPath({
-    ...autoSaved,
-    coordinates: autoSaved.coordinates
-      || lockedSurveyPath
-      || (captureState.points.length >= 2 ? getPathCoordinates() : null),
-  });
-  unlockSurveyPath();
+  hideDrawingKeepGps({ routeCode: autoSaved.routeCode || '' });
   setDrawTool('pan');
   setLineMode('straight');
   captureRouteCodeEl.value = '';
@@ -2600,12 +2590,10 @@ function renderCollector(collector, lastCollectorSend, session) {
       collectorMarker.remove();
       collectorMarker = null;
     }
-    // Ghi GPS xong → ẩn marker live của đúng tàu vừa survey.
-    const finishedCode = String(activeSession?.boatCode || '').trim();
-    if (finishedCode) removeSignalRBoatMarker(finishedCode);
+    // Không xóa hub GPS — bên theo dõi vẫn thấy tàu dừng ở bến đích.
     const count = activeSession?.recordedPoints?.length || activeSession?.recordedCount || 0;
     if (count && !autoSaveInFlight) {
-      collectorStatusEl.textContent = `Đã kết thúc ghi: ${count} điểm GPS.`;
+      collectorStatusEl.textContent = `Đã kết thúc ghi: ${count} điểm GPS · tàu dừng tại bến.`;
       stopCollectorEl.disabled = true;
       pauseCollectorEl.disabled = true;
       startCollectorEl.disabled = false;
