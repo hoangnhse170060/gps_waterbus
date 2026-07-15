@@ -167,14 +167,13 @@ function toast(message, type = 'ok', ms = 3200) {
 }
 
 function catalogBoats(data = latest) {
-  // Chỉ tàu Active từ DB — không fallback thêm WB_006/007 gây nhảy dropdown.
+  // Chỉ tàu DB Active — inactive / collector / fallback không hiện.
   return (data?.boats || [])
     .filter((boat) => {
       if (!boat.boatCode) return false;
       if (String(boat.boatId || '').startsWith('collector-')) return false;
       if (boat.boatId === 'fallback-boat') return false;
-      const status = String(boat.dbStatus || boat.status || '').trim().toLowerCase();
-      return !status || status === 'active';
+      return String(boat.dbStatus || '').trim().toLowerCase() === 'active';
     })
     .slice()
     .sort((a, b) => String(a.boatCode).localeCompare(String(b.boatCode)));
