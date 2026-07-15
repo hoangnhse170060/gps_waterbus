@@ -25,6 +25,9 @@ const boatsEl = document.querySelector('#boats');
 const payloadLogEl = document.querySelector('#payloadLog');
 const mapLegendSelectEl = document.querySelector('#mapLegendSelect');
 const mapLegendSwatchEl = document.querySelector('#mapLegendSwatch');
+const mapLegendPanelEl = document.querySelector('#mapLegendPanel');
+const mapLegendToggleEl = document.querySelector('#mapLegendToggle');
+const mapLegendBodyEl = document.querySelector('#mapLegendBody');
 const toggleSavedRoutesEl = document.querySelector('#toggleSavedRoutes');
 const captureCountEl = document.querySelector('#captureCount');
 const captureStatusEl = document.querySelector('#captureStatus');
@@ -85,7 +88,8 @@ let collectorMarker = null;
 let routeStopMarkersLayer = null;
 let selectedRouteStops = [];
 let selectedRouteId = '';
-let showSavedRoutes = true;
+// Mặc định ẩn tuyến DB trên map survey — tránh lẫn với đường đang vẽ (BD-TT…).
+let showSavedRoutes = false;
 let latest = null;
 let hasFitInitialRoutes = false;
 let lastStationsFingerprint = '';
@@ -160,6 +164,13 @@ senderToggleEl?.addEventListener('click', () => {
   senderPanelEl?.classList.toggle('is-collapsed', collapsed);
   if (senderBodyEl) senderBodyEl.hidden = collapsed;
   senderToggleEl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+});
+
+mapLegendToggleEl?.addEventListener('click', () => {
+  const collapsed = !mapLegendPanelEl?.classList.contains('is-collapsed');
+  mapLegendPanelEl?.classList.toggle('is-collapsed', collapsed);
+  if (mapLegendBodyEl) mapLegendBodyEl.hidden = collapsed;
+  mapLegendToggleEl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 });
 
 function updateSenderToggleChip(data = latest) {
@@ -400,14 +411,18 @@ toolUndoEl?.addEventListener('click', () => {
   undoCapturePoint();
 });
 toolClearEl?.addEventListener('click', () => {
-  if (recordingActive || lockedSurveyPath) {
-    captureStatusEl.textContent = 'Đang chạy tàu — không xóa đường lúc này.';
+  // Luôn cho bỏ highlight tuyến cam đã chọn trên legend.
+  clearSelectedRouteHighlight();
+  if (recordingActive) {
+    captureStatusEl.textContent = 'Đã bỏ chọn tuyến. Đang chạy tàu — chưa xóa đường survey.';
+    renderCaptureState();
     return;
   }
+  unlockSurveyPath();
   clearCapturePoints();
   clearPlannedRoute();
   captureState.finished = false;
-  captureStatusEl.textContent = 'Đã xóa đường vẽ.';
+  captureStatusEl.textContent = 'Đã xóa đường trên bản đồ.';
   routeResultEl?.classList.add('hidden');
   updateWorkflow('draw');
   renderCaptureState();
@@ -1517,11 +1532,33 @@ function renderCaptureState() {
   if (clearCaptureEl) clearCaptureEl.disabled = !captureState.points.length;
   if (saveCapturedRouteEl) saveCapturedRouteEl.disabled = captureState.points.length < 2;
   if (toolUndoEl) toolUndoEl.disabled = !captureState.points.length;
-  if (toolClearEl) toolClearEl.disabled = !captureState.points.length;
+  const canClear = captureState.points.length > 0
+    || Boolean(lockedSurveyPath)
+    || Boolean(plannedRouteLine)
+    || Boolean(selectedRouteId);
+  if (toolClearEl) toolClearEl.disabled = !canClear;
   if (finishDrawEl) {
     finishDrawEl.disabled = captureState.points.length < 2 || captureState.finished;
   }
   updateDrawStats();
+}
+
+function clearSelectedRouteHighlight() {
+  if (mapLegendSelectEl) mapLegendSelectEl.value = '';
+  selectedRouteId = '';
+  applySelectedRouteHighlight('');
+  clearRouteStopMarkers();
+  if (routeStopsListEl) {
+    routeStopsListEl.classList.add('is-empty');
+    routeStopsListEl.innerHTML = '<li>Chọn tuyến để xem chuỗi bến đã lưu.</li>';
+  }
+  updateLegendSwatch();
+  // Ẩn luôn tuyến DB trên map để không còn thấy BD-TT… sau khi Xóa/bỏ chọn.
+  if (showSavedRoutes) {
+    showSavedRoutes = false;
+    applySavedRoutesVisibility();
+  }
+  renderCaptureState();
 }
 
 function pathLengthMeters(points) {
@@ -1881,6 +1918,10 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
         description: 'Captured from GPS recording session',
         status: 'Active',
         averageSpeedKmh: getSurveySpeedKmh(),
+        // Gửi lại đúng polyline đã vẽ — tránh BE dựng lại từ mẫu GPS thưa (gãy góc vuông).
+        coordinates: (lockedSurveyPath?.length >= 2
+          ? lockedSurveyPath
+          : (captureState.points.length >= 2 ? getPathCoordinates() : null)),
         ...surveySaveFields(),
       }),
     });
@@ -1960,6 +2001,7 @@ function showPlannedRoute(coordinates) {
       ...style,
       interactive: false,
       pane: 'overlayPane',
+      smoothFactor: 0,
     }).addTo(map);
   }
   plannedRouteLine.bringToFront();
@@ -2425,12 +2467,12 @@ function applySelectedRouteHighlight(routeId = selectedRouteId) {
   for (const [id, layer] of routeLayers) {
     if (!layer) continue;
     if (hasSelection && String(id) === selectedRouteId) {
-      layer.setStyle({ ...SELECTED_ROUTE_STYLE });
+      layer.setStyle({ ...SELECTED_ROUTE_STYLE, smoothFactor: 0 });
       if (typeof layer.bringToFront === 'function') layer.bringToFront();
     } else if (hasSelection) {
-      layer.setStyle({ ...DIMMED_ROUTE_STYLE });
+      layer.setStyle({ ...DIMMED_ROUTE_STYLE, smoothFactor: 0 });
     } else {
-      layer.setStyle({ ...SAVED_ROUTE_STYLE });
+      layer.setStyle({ ...SAVED_ROUTE_STYLE, smoothFactor: 0 });
     }
   }
   if (mapLegendSwatchEl) {
@@ -2456,11 +2498,17 @@ function renderRoutes(routes) {
     let layer = routeLayers.get(route.routeId);
     const latlngs = (route.coordinates || []).map((p) => [p.lat, p.lng]);
     if (!layer) {
-      layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE });
+      layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE, smoothFactor: 0 });
       if (showSavedRoutes) layer.addTo(map);
       layer.bindTooltip(`${route.routeCode} · ${route.routeName}`);
       layer.on('click', () => {
         if (mapLegendSelectEl) {
+          // Mở panel khi click tuyến trên map.
+          if (mapLegendPanelEl?.classList.contains('is-collapsed')) {
+            mapLegendPanelEl.classList.remove('is-collapsed');
+            if (mapLegendBodyEl) mapLegendBodyEl.hidden = false;
+            mapLegendToggleEl?.setAttribute('aria-expanded', 'true');
+          }
           mapLegendSelectEl.value = String(route.routeId);
           mapLegendSelectEl.dispatchEvent(new Event('change'));
         }
@@ -2596,6 +2644,7 @@ mapLegendSelectEl?.addEventListener('change', () => {
   }
   applySelectedRouteHighlight(routeId);
   showSelectedRouteStops(routeId);
+  renderCaptureState();
   if (!routeId) return;
   const layer = routeLayers.get(routeId);
   if (!layer) return;

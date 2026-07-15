@@ -73,27 +73,32 @@
           <span id="drawPoints">0 điểm</span>
         </div>
 
-        <div class="map-legend">
-          <label class="legend-title" for="mapLegendSelect">Tuyến trên bản đồ</label>
-          <div class="legend-select-row">
-            <span class="legend-swatch" id="mapLegendSwatch" aria-hidden="true"></span>
-            <select id="mapLegendSelect">
-              <option value="">Chọn tuyến...</option>
-            </select>
-          </div>
-          <div class="legend-keys">
-            <span class="legend-key is-saved">Đã lưu · nét liền</span>
-            <span class="legend-key is-selected">Đang chọn · nổi bật</span>
-            <span class="legend-key is-draft">Đang vẽ/chạy · nét đứt</span>
-          </div>
-          <button id="toggleSavedRoutes" type="button" class="legend-toggle is-on" title="Ẩn/hiện các tuyến đã lưu trên map">
-            Ẩn tuyến có sẵn
+        <div class="map-legend is-collapsed" id="mapLegendPanel">
+          <button type="button" class="legend-panel-toggle" id="mapLegendToggle" title="Thu nhỏ / mở panel tuyến" aria-expanded="false">
+            <span class="legend-panel-toggle-text">Tuyến trên bản đồ</span>
+            <span class="legend-panel-chevron" aria-hidden="true">▾</span>
           </button>
-          <div class="route-stops-panel" id="routeStopsPanel">
-            <div class="route-stops-title">Thứ tự bến (từ BE)</div>
-            <ol class="route-stops-list is-empty" id="routeStopsList">
-              <li>Chọn tuyến để xem chuỗi bến đã lưu.</li>
-            </ol>
+          <div class="legend-panel-body" id="mapLegendBody" hidden>
+            <div class="legend-select-row">
+              <span class="legend-swatch" id="mapLegendSwatch" aria-hidden="true"></span>
+              <select id="mapLegendSelect" aria-label="Tuyến trên bản đồ">
+                <option value="">Chọn tuyến...</option>
+              </select>
+            </div>
+            <div class="legend-keys">
+              <span class="legend-key is-saved">Đã lưu · nét liền</span>
+              <span class="legend-key is-selected">Đang chọn · nổi bật</span>
+              <span class="legend-key is-draft">Đang vẽ/chạy · nét đứt</span>
+            </div>
+            <button id="toggleSavedRoutes" type="button" class="legend-toggle is-off" title="Ẩn/hiện các tuyến đã lưu trên map">
+              Hiện tuyến có sẵn
+            </button>
+            <div class="route-stops-panel" id="routeStopsPanel">
+              <div class="route-stops-title">Thứ tự bến (từ BE)</div>
+              <ol class="route-stops-list is-empty" id="routeStopsList">
+                <li>Chọn tuyến để xem chuỗi bến đã lưu.</li>
+              </ol>
+            </div>
           </div>
         </div>
       </section>

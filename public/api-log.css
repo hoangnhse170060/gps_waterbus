@@ -160,6 +160,49 @@
   font-weight: 600;
 }
 
+.api-sum-warn {
+  color: #b45309;
+}
+
+.api-reverse-row {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.api-reverse {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.api-reverse.is-ok {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.api-reverse.is-warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.api-reverse.is-err,
+.api-reverse.is-blocked {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.api-reverse.is-off {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.api-reverse-panel pre {
+  border: 1px solid rgba(15, 118, 110, 0.35);
+}
+
 .api-call-body {
   display: none;
   border-top: 1px solid var(--line);

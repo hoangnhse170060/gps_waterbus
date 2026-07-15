@@ -236,6 +236,8 @@ const server = createServer(async (req, res) => {
           tripId: stopped.tripId,
           recordingStatus: 'stopped',
           recordedPoints: stopped.recordedPoints,
+          // Giữ đúng đường user vẽ — không dùng mẫu GPS thưa khi tạo geometry.
+          plannedCoordinates: Array.isArray(stopped.coordinates) ? stopped.coordinates : null,
           startStationId: stopped.startStationId || null,
           endStationId: stopped.endStationId || null,
           routeType: stopped.routeType || null,
@@ -993,14 +995,23 @@ async function stopTrackingSessionOnTarget(collector, recordedPointCount) {
   }, collector.deviceId || deviceIdForBoat({ boatCode: collector.boatCode }));
 }
 
-async function saveRouteFromGpsOnTarget(session, body) {
-  const boatCode = cleanOptionalText(body.boatCode || session.boatCode);
-  const maxSpeed = maxSpeedForBoatCode(boatCode);
-  const averageSpeedKmh = clampSpeedToBoatMax(
-    Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16),
-    maxSpeed,
-  );
-  const coordinates = (session.recordedPoints || [])
+/** Ưu tiên đường vẽ (planned) — recordedPoints chỉ là kênh GPS thưa, dễ làm gãy góc. */
+function resolveSurveyPathCoordinates(session, body, averageSpeedKmh) {
+  const sources = [
+    body?.coordinates,
+    session?.plannedCoordinates,
+    session?.coordinates,
+    session?.recordedPoints,
+  ];
+  let raw = [];
+  let sourceName = 'none';
+  for (const [index, candidate] of sources.entries()) {
+    if (!Array.isArray(candidate) || candidate.length < 2) continue;
+    raw = candidate;
+    sourceName = ['body', 'planned', 'session.coordinates', 'recorded'][index];
+    break;
+  }
+  const coordinates = raw
     .filter((point) => Number.isFinite(Number(point.lat)) && Number.isFinite(Number(point.lng)))
     .map((point, index) => ({
       lat: round(Number(point.lat), 7),
@@ -1009,6 +1020,22 @@ async function saveRouteFromGpsOnTarget(session, body) {
       sequence: Number(point.sequence) || index + 1,
       recordedAt: point.recordedAt || formatRecordedAt(new Date()),
     }));
+  if (sourceName === 'recorded') {
+    console.warn('[from-gps] Using sparse recordedPoints as geometry — corners may look wrong.');
+  } else {
+    console.log(`[from-gps] Geometry source: ${sourceName} (${coordinates.length} pts)`);
+  }
+  return coordinates;
+}
+
+async function saveRouteFromGpsOnTarget(session, body) {
+  const boatCode = cleanOptionalText(body.boatCode || session.boatCode);
+  const maxSpeed = maxSpeedForBoatCode(boatCode);
+  const averageSpeedKmh = clampSpeedToBoatMax(
+    Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16),
+    maxSpeed,
+  );
+  const coordinates = resolveSurveyPathCoordinates(session, body, averageSpeedKmh);
 
   const payload = {
     routeCode: cleanRouteText(body.routeCode || session.routeCode, 'Route code'),
@@ -1126,7 +1153,9 @@ async function persistRecordingSession(body, sessionInput = null) {
   let route = null;
   let savedTo = 'local';
   let warning = null;
-  const hasCoordinates = (session?.recordedPoints?.length || 0) >= 2;
+  const hasCoordinates = (session?.recordedPoints?.length || 0) >= 2
+    || (session?.plannedCoordinates?.length || 0) >= 2
+    || (Array.isArray(body?.coordinates) && body.coordinates.length >= 2);
   // Chỉ gọi Azure from-gps khi session đã start thật trên BE.
   // sessionId local luôn có → nếu cứ gửi sẽ bị "GPS session khong ton tai".
   const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && session?.targetSessionStarted);
@@ -1266,6 +1295,7 @@ async function finalizeCollectorRecording() {
     tripId: stopped.tripId,
     recordingStatus: 'stopped',
     recordedPoints: stopped.recordedPoints,
+    plannedCoordinates: Array.isArray(stopped.coordinates) ? stopped.coordinates : null,
     startStationId: stopped.startStationId || null,
     endStationId: stopped.endStationId || null,
     routeType: stopped.routeType || null,
@@ -1356,8 +1386,11 @@ async function saveRecordedRoute(body) {
         endStationId: state.collector.endStationId,
       }
     : state.lastRecordingSession;
-  if (!session?.recordedPoints?.length) throw userError('Chua co diem GPS nao de luu. Hay bat dau ghi truoc.');
-  const coordinates = session.recordedPoints.map((point) => ({
+  if (!session?.recordedPoints?.length && !(session?.plannedCoordinates?.length >= 2)) {
+    throw userError('Chua co diem GPS nao de luu. Hay bat dau ghi truoc.');
+  }
+  const speed = Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16);
+  const coordinates = resolveSurveyPathCoordinates(session, body, speed).map((point) => ({
     lat: point.lat,
     lng: point.lng,
   }));

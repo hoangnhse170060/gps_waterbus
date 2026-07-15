@@ -20,25 +20,106 @@ async function loadCalls() {
   }
 }
 
+function isFromGps(call) {
+  return String(call.path || '').includes('from-gps');
+}
+
+function isSessionStart(call) {
+  return String(call.path || '').includes('tracking/sessions/start');
+}
+
+function reverseInfo(call) {
+  const req = call?.request && typeof call.request === 'object' ? call.request : {};
+  const res = call?.response && typeof call.response === 'object' ? call.response : {};
+  const asked = Boolean(req.createReverseRoute);
+  const reverseCode = req.reverseRouteCode || null;
+  const reverseName = req.reverseRouteName || null;
+  const created = res.reverseRoute && typeof res.reverseRoute === 'object'
+    ? res.reverseRoute
+    : null;
+  return { asked, reverseCode, reverseName, created };
+}
+
 function matchesFilter(call, filter) {
   if (filter === 'all') return true;
   if (filter === 'error') return !call.ok;
-  if (filter === 'from-gps') return String(call.path || '').includes('from-gps');
+  if (filter === 'from-gps') return isFromGps(call);
+  if (filter === 'reverse') {
+    const info = reverseInfo(call);
+    return isFromGps(call) && (info.asked || info.created);
+  }
   if (filter === 'session') return String(call.path || '').includes('tracking/sessions');
   return true;
+}
+
+function reverseBadgeHtml(call) {
+  if (!isFromGps(call)) {
+    if (isSessionStart(call) && !call.ok) {
+      return '<span class="api-reverse is-blocked">Chiếu về: chưa gọi được — session start lỗi → from-gps bỏ qua</span>';
+    }
+    return '';
+  }
+
+  const info = reverseInfo(call);
+  if (!info.asked && !info.created) {
+    return '<span class="api-reverse is-off">Chiếu về: không gửi createReverseRoute</span>';
+  }
+  if (info.created) {
+    const code = info.created.routeCode || info.created.code || info.reverseCode || '?';
+    const id = info.created.routeId || info.created.id || '';
+    return `<span class="api-reverse is-ok">Bản sao chiều về: ĐÃ TẠO <b>${escapeHtml(code)}</b>${id ? ` · id ${escapeHtml(id)}` : ''}</span>`;
+  }
+  if (call.ok) {
+    return `<span class="api-reverse is-warn">Đã gửi reverse <b>${escapeHtml(info.reverseCode || '?')}</b> nhưng BE không trả reverseRoute</span>`;
+  }
+  return `<span class="api-reverse is-err">Gửi reverse <b>${escapeHtml(info.reverseCode || '?')}</b> — lỗi, bản sao chưa lên BE</span>`;
+}
+
+function reversePanelHtml(call) {
+  if (!isFromGps(call)) return '';
+  const info = reverseInfo(call);
+  if (!info.asked && !info.created) return '';
+
+  const lines = [
+    `createReverseRoute: ${info.asked ? 'true' : 'false'}`,
+    `reverseRouteCode gửi lên: ${info.reverseCode || '(không có)'}`,
+    `reverseRouteName gửi lên: ${info.reverseName || '(không có)'}`,
+  ];
+  if (info.created) {
+    lines.push(`BE trả reverseRoute.routeCode: ${info.created.routeCode || info.created.code || '?'}`);
+    lines.push(`BE trả reverseRoute.routeId: ${info.created.routeId || info.created.id || '?'}`);
+    lines.push('Kết luận: BẢN SAO ĐÃ LÊN BE');
+  } else if (call.ok) {
+    lines.push('Kết luận: gửi reverse nhưng response không có reverseRoute');
+  } else {
+    lines.push(`Kết luận: CHƯA LÊN BE — ${call.error || `HTTP ${call.status}`}`);
+  }
+
+  return `
+    <div class="api-block api-reverse-panel">
+      <h3>Bản sao / chiều về</h3>
+      <pre>${escapeHtml(lines.join('\n'))}</pre>
+    </div>
+  `;
 }
 
 function render() {
   const filter = filterSelectEl.value;
   const visible = calls.filter((call) => matchesFilter(call, filter));
   const errors = calls.filter((call) => !call.ok).length;
-  const fromGps = calls.filter((call) => String(call.path || '').includes('from-gps')).length;
+  const fromGps = calls.filter((call) => isFromGps(call)).length;
+  const reverseAsked = calls.filter((call) => isFromGps(call) && reverseInfo(call).asked).length;
+  const reverseCreated = calls.filter((call) => isFromGps(call) && reverseInfo(call).created).length;
+  const sessionFails = calls.filter((call) => isSessionStart(call) && !call.ok).length;
 
   summaryEl.innerHTML = `
     <span>Tổng: <b>${calls.length}</b></span>
     <span>Đang hiện: <b>${visible.length}</b></span>
     <span>Lỗi: <b>${errors}</b></span>
     <span>from-gps: <b>${fromGps}</b></span>
+    <span>Gửi chiều về: <b>${reverseAsked}</b></span>
+    <span>BE tạo bản sao: <b>${reverseCreated}</b></span>
+    ${sessionFails ? `<span class="api-sum-warn">session start lỗi: <b>${sessionFails}</b> → from-gps/chiều về chưa chạy</span>` : ''}
   `;
 
   if (!visible.length) {
@@ -51,6 +132,7 @@ function render() {
     const okLabel = call.ok ? 'OK' : 'LỖI';
     const time = formatTime(call.at);
     const err = call.error ? `<div class="api-error-line">${escapeHtml(call.error)}</div>` : '';
+    const reverseBadge = reverseBadgeHtml(call);
     return `
       <article class="api-call${!call.ok ? ' is-error' : ''}" data-id="${escapeHtml(call.id)}">
         <div class="api-call-head">
@@ -59,8 +141,10 @@ function render() {
           <span class="api-path">${escapeHtml(call.path || '')}</span>
           <span class="api-time">${escapeHtml(time)}</span>
           ${err}
+          ${reverseBadge ? `<div class="api-reverse-row">${reverseBadge}</div>` : ''}
         </div>
         <div class="api-call-body">
+          ${reversePanelHtml(call)}
           <div class="api-block">
             <h3>Request body (đã rút gọn coordinates)</h3>
             <pre>${escapeHtml(stringify(call.request))}</pre>

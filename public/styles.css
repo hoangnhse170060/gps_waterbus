@@ -551,7 +551,64 @@ button.secondary:hover,
   right: 16px;
   bottom: 22px;
   width: min(260px, calc(100% - 32px));
-  padding: 10px 12px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.legend-panel-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  margin: 0;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.legend-panel-toggle:hover {
+  filter: none;
+  background: rgba(15, 118, 110, 0.06);
+}
+
+.legend-panel-toggle-text {
+  flex: 1;
+  text-align: left;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-panel-chevron {
+  color: var(--muted);
+  font-size: 12px;
+  transition: transform 0.15s ease;
+}
+
+.map-legend:not(.is-collapsed) .legend-panel-chevron {
+  transform: rotate(180deg);
+}
+
+.legend-panel-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 12px 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.legend-panel-body[hidden] {
+  display: none !important;
 }
 
 .map-toolbar {
