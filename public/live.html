@@ -22,77 +22,114 @@
     <div class="live-shell">
       <div id="map" class="live-map"></div>
 
-      <aside class="live-panel">
-        <header class="live-brand">
-          <p class="live-eyebrow">Saigon Waterbus</p>
-          <h1>Live GPS</h1>
-          <p class="live-lead">Tàu hiện trên map (teal = 1 tầng, cam = 2 tầng). Hover mới thấy tên. Chuột phải → Kéo.</p>
-        </header>
+      <aside class="live-panel is-collapsed" id="livePanel">
+        <button
+          type="button"
+          id="panelToggle"
+          class="live-panel-toggle"
+          aria-expanded="false"
+          aria-controls="livePanelBody"
+          title="Mở / thu panel"
+        >
+          <span class="live-panel-toggle-icon" aria-hidden="true">‹</span>
+          <span class="live-panel-peek" id="panelPeek">Live GPS</span>
+        </button>
 
-        <nav class="live-nav">
-          <a href="/">Survey</a>
-          <a href="/live.html" aria-current="page">Live GPS</a>
-          <a href="/api-log.html" target="_blank" rel="noopener">Log API</a>
-        </nav>
+        <div class="live-panel-body" id="livePanelBody">
+          <header class="live-brand">
+            <p class="live-eyebrow">Saigon Waterbus</p>
+            <h1>Live GPS</h1>
+            <p class="live-lead">Hover hoặc click tàu để chọn thông tin. Mở mũi tên để xem chi tiết. Chuột phải → Kéo.</p>
+          </header>
 
-        <label class="live-field">
-          <span>Tàu GPS</span>
-          <select id="boatSelect">
-            <option value="">Chọn tàu...</option>
-          </select>
-          <small id="deviceHint" class="live-hint">Chọn tàu đã đăng ký device để kéo trên map.</small>
-        </label>
+          <nav class="live-nav">
+            <a href="/">Survey</a>
+            <a href="/live.html" aria-current="page">Live GPS</a>
+            <a href="/api-log.html" target="_blank" rel="noopener">Log API</a>
+          </nav>
 
-        <label class="live-field">
-          <span>Vận tốc (km/h)</span>
-          <input id="speedInput" type="number" min="0" max="80" step="1" value="16" disabled>
-          <small class="live-hint">Mặc định 16 — nhập để tăng/giảm tốc tàu đang chọn (trạng thái do vị trí tàu tự báo).</small>
-        </label>
+          <section class="live-boat-info" id="boatInfoCard">
+            <div class="live-status-row">
+              <span>Tàu</span>
+              <b id="infoBoatName">—</b>
+            </div>
+            <div class="live-status-row">
+              <span>Số tầng</span>
+              <b id="infoBoatDecks">—</b>
+            </div>
+            <div class="live-status-row">
+              <span>Trạng thái</span>
+              <b id="infoBoatPhase">—</b>
+            </div>
+            <div class="live-status-row">
+              <span>Tọa độ</span>
+              <b id="infoBoatCoord">—</b>
+            </div>
+            <div class="live-status-row">
+              <span>Tín hiệu</span>
+              <b id="infoBoatSignal">—</b>
+            </div>
+          </section>
 
-        <label class="live-field live-toggle">
-          <span>Gửi Azure BE</span>
-          <select id="sendAzureSelect">
-            <option value="on">Bật — POST /tracking/locations</option>
-            <option value="off">Tắt — chỉ local map</option>
-          </select>
-        </label>
+          <label class="live-field">
+            <span>Tàu GPS</span>
+            <select id="boatSelect">
+              <option value="">Chọn tàu...</option>
+            </select>
+            <small id="deviceHint" class="live-hint">Chọn tàu đã đăng ký device để kéo trên map.</small>
+          </label>
 
-        <div class="live-actions live-actions-2x2">
-          <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
-          <button id="sendNowBtn" type="button" class="secondary" disabled>Gửi GPS</button>
-          <button id="incidentBtn" type="button" class="secondary is-danger" disabled>Báo sự cố</button>
-          <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
+          <label class="live-field">
+            <span>Vận tốc (km/h)</span>
+            <input id="speedInput" type="number" min="0" max="80" step="1" value="16" disabled>
+            <small class="live-hint">Mặc định 16 — nhập để tăng/giảm tốc tàu đang chọn.</small>
+          </label>
+
+          <label class="live-field live-toggle">
+            <span>Gửi Azure BE</span>
+            <select id="sendAzureSelect">
+              <option value="on">Bật — POST /tracking/locations</option>
+              <option value="off">Tắt — chỉ local map</option>
+            </select>
+          </label>
+
+          <div class="live-actions live-actions-2x2">
+            <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
+            <button id="sendNowBtn" type="button" class="secondary" disabled>Gửi GPS</button>
+            <button id="incidentBtn" type="button" class="secondary is-danger" disabled>Báo sự cố</button>
+            <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
+          </div>
+
+          <section class="live-status" id="statusCard">
+            <div class="live-status-row">
+              <span>Hub / relay</span>
+              <b id="hubStatus">…</b>
+            </div>
+            <div class="live-status-row">
+              <span>Gửi gần nhất</span>
+              <b id="sendStatus">Chưa gửi</b>
+            </div>
+            <div class="live-status-row">
+              <span>Tọa độ</span>
+              <b id="coordStatus">—</b>
+            </div>
+            <div class="live-status-row">
+              <span>Trạng thái</span>
+              <b id="boatPhaseStatus">—</b>
+            </div>
+          </section>
+
+          <p id="liveHelp" class="live-help">
+            Hover/click đồng bộ thông tin tàu · mở mũi tên để xem panel · GPS heartbeat 5s.
+          </p>
+
+          <footer class="live-legend">
+            <span><i class="leg-deck1"></i> 1 tầng</span>
+            <span><i class="leg-deck2"></i> 2 tầng</span>
+            <span><i class="leg-mute"></i> Mất tín hiệu</span>
+            <span><i class="leg-incident"></i> Sự cố</span>
+          </footer>
         </div>
-
-        <section class="live-status" id="statusCard">
-          <div class="live-status-row">
-            <span>Hub / relay</span>
-            <b id="hubStatus">…</b>
-          </div>
-          <div class="live-status-row">
-            <span>Gửi gần nhất</span>
-            <b id="sendStatus">Chưa gửi</b>
-          </div>
-          <div class="live-status-row">
-            <span>Tọa độ</span>
-            <b id="coordStatus">—</b>
-          </div>
-          <div class="live-status-row">
-            <span>Trạng thái</span>
-            <b id="boatPhaseStatus">—</b>
-          </div>
-        </section>
-
-        <p id="liveHelp" class="live-help">
-          Trạng thái do vị trí tàu · tốc độ mặc định 16 km/h (đổi ở ô vận tốc) · GPS heartbeat 5s.
-        </p>
-
-        <footer class="live-legend">
-          <span><i class="leg-deck1"></i> 1 tầng</span>
-          <span><i class="leg-deck2"></i> 2 tầng</span>
-          <span><i class="leg-mute"></i> Mất tín hiệu</span>
-          <span><i class="leg-incident"></i> Sự cố</span>
-        </footer>
       </aside>
     </div>
 

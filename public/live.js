@@ -49,10 +49,21 @@ const toastHost = document.querySelector('#toastHost');
 const boatContextMenuEl = document.querySelector('#boatContextMenu');
 const boatCtxTitleEl = document.querySelector('#boatCtxTitle');
 const boatCtxDragBtn = document.querySelector('#boatCtxDrag');
+const livePanelEl = document.querySelector('#livePanel');
+const panelToggleEl = document.querySelector('#panelToggle');
+const panelPeekEl = document.querySelector('#panelPeek');
+const infoBoatNameEl = document.querySelector('#infoBoatName');
+const infoBoatDecksEl = document.querySelector('#infoBoatDecks');
+const infoBoatPhaseEl = document.querySelector('#infoBoatPhase');
+const infoBoatCoordEl = document.querySelector('#infoBoatCoord');
+const infoBoatSignalEl = document.querySelector('#infoBoatSignal');
+
+const STORAGE_PANEL = 'liveGpsPanelOpen.v1';
 
 let latest = null;
 let eventsSource = null;
 let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
+let focusedBoatCode = selectedBoatCode || '';
 let contextMenuBoatCode = '';
 let sending = false;
 let dragging = false;
@@ -63,7 +74,6 @@ const pinnedPositions = loadJsonMap(STORAGE_PINS);
 const boatStatuses = loadJsonMap(STORAGE_STATUS);
 const boatSpeeds = loadJsonMap(STORAGE_SPEEDS);
 const lastSignalAt = new Map();
-const openPopupCode = new Set();
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
@@ -317,27 +327,80 @@ function boatDisplayName(code, catalogBoat, hub) {
   return String(catalogBoat?.boatName || hub?.boatName || code || '').trim();
 }
 
-function boatPopupHtml(code, catalogBoat, hub, lat, lng) {
-  const st = getStatus(code);
-  const signal = hasSignal(code, hub);
-  const phase = autoPhaseForBoat(code, lat, lng);
-  const name = boatDisplayName(code, catalogBoat, hub);
-  const label = phaseLabel(code, lat, lng);
-  const decks = boatDeckCount(code, catalogBoat);
-  const deckText = decks >= 2 ? '2 tầng' : '1 tầng';
-  const dotClass = st.incident || phase === 'incident'
-    ? 'is-incident'
-    : (signal ? 'is-ok' : 'is-off');
-  return `
-    <div class="live-boat-popup">
-      <div class="live-boat-popup-title">
-        <i class="live-dot ${dotClass}" aria-hidden="true"></i>
-        <span>${escapeHtml(name)}</span>
-      </div>
-      <div class="live-boat-popup-meta">${escapeHtml(deckText)}</div>
-      ${label ? `<div class="live-boat-popup-meta">${escapeHtml(label)}</div>` : ''}
-    </div>
-  `;
+function setPanelOpen(open) {
+  if (!livePanelEl || !panelToggleEl) return;
+  livePanelEl.classList.toggle('is-collapsed', !open);
+  panelToggleEl.setAttribute('aria-expanded', open ? 'true' : 'false');
+  localStorage.setItem(STORAGE_PANEL, open ? '1' : '0');
+}
+
+function isPanelOpen() {
+  return Boolean(livePanelEl && !livePanelEl.classList.contains('is-collapsed'));
+}
+
+function renderBoatInfoCard(code = focusedBoatCode) {
+  const key = String(code || '').trim();
+  const catalogBoat = catalogBoats().find((b) => String(b.boatCode) === key);
+  const hub = (latest?.hubBoats || []).find((b) => String(b.boatCode) === key);
+  const pin = pinnedFor(key);
+  const name = key ? boatDisplayName(key, catalogBoat, hub) : '—';
+  if (panelPeekEl) {
+    panelPeekEl.textContent = key ? name : 'Live GPS';
+  }
+  if (!infoBoatNameEl) return;
+  if (!key) {
+    infoBoatNameEl.textContent = '—';
+    if (infoBoatDecksEl) infoBoatDecksEl.textContent = '—';
+    if (infoBoatPhaseEl) infoBoatPhaseEl.textContent = '—';
+    if (infoBoatCoordEl) infoBoatCoordEl.textContent = '—';
+    if (infoBoatSignalEl) infoBoatSignalEl.textContent = '—';
+    return;
+  }
+  const lat = pin?.lat;
+  const lng = pin?.lng;
+  const decks = boatDeckCount(key, catalogBoat);
+  const signal = hasSignal(key, hub);
+  const st = getStatus(key);
+  infoBoatNameEl.textContent = name;
+  if (infoBoatDecksEl) infoBoatDecksEl.textContent = decks >= 2 ? '2 tầng' : '1 tầng';
+  if (infoBoatPhaseEl) {
+    infoBoatPhaseEl.textContent = (Number.isFinite(lat) && Number.isFinite(lng))
+      ? phaseLabel(key, lat, lng)
+      : '—';
+  }
+  if (infoBoatCoordEl) {
+    infoBoatCoordEl.textContent = (Number.isFinite(lat) && Number.isFinite(lng))
+      ? `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+      : '—';
+  }
+  if (infoBoatSignalEl) {
+    infoBoatSignalEl.textContent = st.incident ? 'Sự cố' : (signal ? 'Có tín hiệu' : 'Mất tín hiệu');
+  }
+}
+
+/** Hover và click dùng chung — cập nhật info panel giống nhau. */
+function syncBoatFocus(code, { select = false, toastMessage = false } = {}) {
+  const key = String(code || '').trim();
+  if (!key || !isCatalogActiveBoat(key)) return;
+  focusedBoatCode = key;
+  renderBoatInfoCard(key);
+  if (select) {
+    selectBoatForDrag(key, { toastMessage });
+  }
+}
+
+function bindFocusHandlers(marker, code) {
+  marker.off('mouseover');
+  marker.off('click');
+  marker.on('mouseover', () => {
+    if (dragging) return;
+    syncBoatFocus(code, { select: false });
+  });
+  marker.on('click', (event) => {
+    L.DomEvent.stopPropagation(event);
+    if (dragging) return;
+    syncBoatFocus(code, { select: true, toastMessage: false });
+  });
 }
 
 function boatDeckCount(code, catalogBoat) {
@@ -710,8 +773,6 @@ function renderHubBoats(hubBoats) {
     const phase = autoPhaseForBoat(code, trueLat, trueLng);
     const signal = hasSignal(code, hub);
     const heading = Number(hub?.heading) || 0;
-    const popupHtml = boatPopupHtml(code, catalogBoat, hub, trueLat, trueLng);
-    const hoverTip = `${boatDisplayName(code, catalogBoat, hub)} · ${boatDeckCount(code, catalogBoat) >= 2 ? '2 tầng' : '1 tầng'}`;
     const decks = boatDeckCount(code, catalogBoat);
     const iconOpts = {
       drag: isSelected,
@@ -729,42 +790,20 @@ function renderHubBoats(hubBoats) {
         zIndexOffset: isSelected ? 1200 : 700 + index,
         autoPan: true,
       }).addTo(map);
-      marker.bindPopup(popupHtml, {
-        closeButton: true,
-        autoClose: true,
-        closeOnClick: true,
-        className: 'live-boat-popup-wrap',
-        offset: [0, -12],
-      });
-      marker.bindTooltip(hoverTip, {
-        direction: 'top',
-        offset: [0, -18],
-        opacity: 1,
-        className: 'live-boat-hover-tip',
-      });
-      marker.on('popupopen', () => openPopupCode.add(code));
-      marker.on('popupclose', () => openPopupCode.delete(code));
+      bindFocusHandlers(marker, code);
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
     } else if (isDraggingSelected) {
-      // đang kéo — không đụng popup/icon
+      // đang kéo — không đụng icon
     } else {
       marker.setLatLng([show.lat, show.lng]);
       marker.setIcon(boatIcon(heading, iconOpts));
       marker.dragging?.[isSelected ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 700 + index);
-      marker.setPopupContent(popupHtml);
-      if (marker.getTooltip()) marker.setTooltipContent(hoverTip);
-      else {
-        marker.bindTooltip(hoverTip, {
-          direction: 'top',
-          offset: [0, -18],
-          opacity: 1,
-          className: 'live-boat-hover-tip',
-        });
-      }
+      if (marker.isPopupOpen?.()) marker.closePopup();
+      if (marker.getTooltip?.()) marker.unbindTooltip();
+      bindFocusHandlers(marker, code);
       bindDragHandlers(marker, code);
-      if (openPopupCode.has(code) && !marker.isPopupOpen()) marker.openPopup();
     }
   }
 
@@ -772,9 +811,10 @@ function renderHubBoats(hubBoats) {
     if (!seen.has(code)) {
       marker.remove();
       hubMarkers.delete(code);
-      openPopupCode.delete(code);
     }
   }
+
+  renderBoatInfoCard(focusedBoatCode || selected);
 
   if (selected && hubMarkers.has(selected) && !dragging) {
     const marker = hubMarkers.get(selected);
@@ -822,15 +862,18 @@ function selectBoatForDrag(code, { toastMessage = true } = {}) {
   const key = String(code || '').trim();
   if (!key) return;
   selectedBoatCode = key;
+  focusedBoatCode = key;
   localStorage.setItem('liveGpsBoatCode', key);
   if (boatSelectEl) boatSelectEl.value = key;
   updateDeviceHint();
   syncBoatControls();
+  renderBoatInfoCard(key);
   if (latest) renderHubBoats(latest.hubBoats);
   const marker = hubMarkers.get(key);
   if (marker) {
     marker.dragging?.enable?.();
     marker.setZIndexOffset(1200);
+    bindFocusHandlers(marker, key);
     bindDragHandlers(marker, key);
     map.panTo(marker.getLatLng(), { animate: true });
   }
@@ -1033,16 +1076,28 @@ function connectEvents() {
 boatSelectEl.addEventListener('change', () => {
   hideBoatContextMenu();
   selectedBoatCode = boatSelectEl.value.trim();
+  focusedBoatCode = selectedBoatCode;
   if (selectedBoatCode) localStorage.setItem('liveGpsBoatCode', selectedBoatCode);
   else localStorage.removeItem('liveGpsBoatCode');
   updateDeviceHint();
   syncBoatControls();
+  renderBoatInfoCard(focusedBoatCode);
   if (latest) renderHubBoats(latest.hubBoats);
   const marker = hubMarkers.get(selectedBoatCode);
   if (marker) {
     map.panTo(marker.getLatLng(), { animate: true });
   }
 });
+
+panelToggleEl?.addEventListener('click', (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  setPanelOpen(!isPanelOpen());
+});
+
+// Mặc định thu gọn — mở mũi tên khi muốn xem thông tin.
+setPanelOpen(localStorage.getItem(STORAGE_PANEL) === '1');
+renderBoatInfoCard(focusedBoatCode);
 
 boatCtxDragBtn?.addEventListener('click', (event) => {
   event.preventDefault();
