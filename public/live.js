@@ -48,9 +48,7 @@ const refreshBtn = document.querySelector('#refreshBtn');
 const toastHost = document.querySelector('#toastHost');
 const boatContextMenuEl = document.querySelector('#boatContextMenu');
 const boatCtxTitleEl = document.querySelector('#boatCtxTitle');
-const boatCtxDragBtn = document.querySelector('#boatCtxDrag');
 const boatCtxUnlockBtn = document.querySelector('#boatCtxUnlock');
-const unlockDragBtn = document.querySelector('#unlockDragBtn');
 const livePanelEl = document.querySelector('#livePanel');
 const panelToggleEl = document.querySelector('#panelToggle');
 const panelPeekEl = document.querySelector('#panelPeek');
@@ -67,7 +65,7 @@ let eventsSource = null;
 let selectedBoatCode = localStorage.getItem('liveGpsBoatCode') || '';
 let focusedBoatCode = selectedBoatCode || '';
 let contextMenuBoatCode = '';
-let dragUnlocked = false;
+let unlockedBoatCode = ''; // chỉ tàu mở bằng chuột phải mới kéo được
 let sending = false;
 let dragging = false;
 let hasFitRoutes = false;
@@ -572,39 +570,41 @@ function renderBoatOptions(data) {
 function updateDeviceHint() {
   const code = selectedBoatCode || boatSelectEl.value;
   if (!code) {
-    deviceHintEl.textContent = 'Chọn tàu rồi mở khóa kéo mới di chuyển được.';
+    deviceHintEl.textContent = 'Chuột phải vào tàu → Mở khóa kéo để di chuyển.';
     deviceHintEl.className = 'live-hint';
     return;
   }
   const device = deviceForBoat(code);
-  const lockText = dragUnlocked ? 'đã mở khóa — kéo được' : 'đang khóa — bấm Mở khóa kéo';
+  const unlocked = String(unlockedBoatCode) === String(code);
+  const lockText = unlocked ? 'đã mở khóa — kéo bằng chuột' : 'đang khóa — chuột phải → Mở khóa kéo';
   if (device) {
     deviceHintEl.textContent = `${code} · device ${device} · ${lockText}.`;
-    deviceHintEl.className = `live-hint ${dragUnlocked ? 'is-ok' : 'is-warn'}`;
+    deviceHintEl.className = `live-hint ${unlocked ? 'is-ok' : 'is-warn'}`;
   } else {
     deviceHintEl.textContent = `${code} · chưa thấy gps_devices · ${lockText}.`;
     deviceHintEl.className = 'live-hint is-warn';
   }
 }
 
-function setDragUnlocked(next, { toastMessage = true } = {}) {
-  dragUnlocked = Boolean(next);
-  if (unlockDragBtn) {
-    unlockDragBtn.textContent = dragUnlocked ? 'Khóa kéo' : 'Mở khóa kéo';
-    unlockDragBtn.classList.toggle('is-ok', dragUnlocked);
-  }
-  if (boatCtxUnlockBtn) boatCtxUnlockBtn.hidden = dragUnlocked;
-  if (boatCtxDragBtn) boatCtxDragBtn.hidden = !dragUnlocked;
-  updateDeviceHint();
-  if (latest) renderHubBoats(latest.hubBoats);
-  else applyMarkerDragState();
-  if (toastMessage) {
-    toast(dragUnlocked ? 'Đã mở khóa — kéo tàu đang chọn' : 'Đã khóa kéo', dragUnlocked ? 'ok' : 'warn');
-  }
+function canDragBoat(code) {
+  const key = String(code || '').trim();
+  return Boolean(key) && key === String(unlockedBoatCode || '').trim();
 }
 
-function canDragBoat(code) {
-  return dragUnlocked && String(code || '') === String(selectedBoatCode || '');
+function unlockBoatForDrag(code, { toastMessage = true } = {}) {
+  const key = String(code || '').trim();
+  if (!key || !isCatalogActiveBoat(key)) return;
+  unlockedBoatCode = key;
+  selectBoatForDrag(key, { toastMessage: false });
+  if (toastMessage) toast(`${boatDisplayName(key)} — đã mở khóa, kéo bằng chuột`, 'ok');
+}
+
+function lockBoatDrag({ toastMessage = true } = {}) {
+  unlockedBoatCode = '';
+  applyMarkerDragState();
+  updateDeviceHint();
+  if (latest) renderHubBoats(latest.hubBoats);
+  if (toastMessage) toast('Đã khóa kéo', 'warn');
 }
 
 function applyMarkerDragState() {
@@ -899,8 +899,10 @@ function showBoatContextMenu(code, clientX, clientY) {
   if (!boatContextMenuEl) return;
   contextMenuBoatCode = code;
   if (boatCtxTitleEl) boatCtxTitleEl.textContent = boatDisplayName(code) || code;
-  if (boatCtxUnlockBtn) boatCtxUnlockBtn.hidden = dragUnlocked;
-  if (boatCtxDragBtn) boatCtxDragBtn.hidden = !dragUnlocked;
+  if (boatCtxUnlockBtn) {
+    const unlocked = canDragBoat(code);
+    boatCtxUnlockBtn.textContent = unlocked ? 'Khóa lại' : 'Mở khóa kéo';
+  }
   boatContextMenuEl.hidden = false;
   const pad = 8;
   const { offsetWidth: w, offsetHeight: h } = boatContextMenuEl;
@@ -932,10 +934,10 @@ function selectBoatForDrag(code, { toastMessage = true } = {}) {
   }
   if (toastMessage) {
     toast(
-      dragUnlocked
-        ? `${boatDisplayName(key)} — kéo để di chuyển`
-        : `${boatDisplayName(key)} — đang khóa, bấm Mở khóa kéo`,
-      dragUnlocked ? 'ok' : 'warn',
+      canDragBoat(key)
+        ? `${boatDisplayName(key)} — kéo bằng chuột`
+        : `${boatDisplayName(key)} — chuột phải → Mở khóa kéo`,
+      canDragBoat(key) ? 'ok' : 'warn',
     );
   }
 }
@@ -954,7 +956,7 @@ function bindDragHandlers(marker, code) {
   marker.on('dragstart', () => {
     if (!canDragBoat(code)) {
       marker.dragging?.disable?.();
-      toast('Tàu đang khóa — bấm Mở khóa kéo', 'warn');
+      toast('Tàu đang khóa — chuột phải → Mở khóa kéo', 'warn');
       return;
     }
     hideBoatContextMenu();
@@ -1172,37 +1174,15 @@ panelToggleEl?.addEventListener('click', (event) => {
 setPanelOpen(localStorage.getItem(STORAGE_PANEL) === '1');
 renderBoatInfoCard(focusedBoatCode);
 
-boatCtxDragBtn?.addEventListener('click', (event) => {
-  event.preventDefault();
-  event.stopPropagation();
-  const code = contextMenuBoatCode;
-  hideBoatContextMenu();
-  if (!code) return;
-  if (!dragUnlocked) {
-    toast('Tàu đang khóa — bấm Mở khóa kéo', 'warn');
-    return;
-  }
-  selectBoatForDrag(code);
-});
-
 boatCtxUnlockBtn?.addEventListener('click', (event) => {
   event.preventDefault();
   event.stopPropagation();
   const code = contextMenuBoatCode;
   hideBoatContextMenu();
-  if (code) selectBoatForDrag(code, { toastMessage: false });
-  setDragUnlocked(true);
+  if (!code) return;
+  if (canDragBoat(code)) lockBoatDrag();
+  else unlockBoatForDrag(code);
 });
-
-unlockDragBtn?.addEventListener('click', () => {
-  if (!selectedBoatCode && !dragUnlocked) {
-    toast('Chọn tàu trước khi mở khóa', 'warn');
-    return;
-  }
-  setDragUnlocked(!dragUnlocked);
-});
-
-setDragUnlocked(false, { toastMessage: false });
 
 document.addEventListener('click', (event) => {
   if (!boatContextMenuEl || boatContextMenuEl.hidden) return;
