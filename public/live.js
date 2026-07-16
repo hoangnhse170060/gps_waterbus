@@ -823,6 +823,7 @@ function renderHubBoats(hubBoats) {
     const heading = stableBoatHeading(code, hub, fixed);
     const decks = boatDeckCount(code, catalogBoat);
     const canDrag = canDragBoat(code);
+    const hoverTip = `${boatDisplayName(code, catalogBoat, hub)} · ${decks >= 2 ? '2 tầng' : '1 tầng'}${canDrag ? ' · đã mở khóa' : ''}`;
     const iconOpts = {
       drag: canDrag,
       signal: !st.incident && signal,
@@ -839,6 +840,13 @@ function renderHubBoats(hubBoats) {
         zIndexOffset: isSelected ? 1200 : 700 + index,
         autoPan: true,
       }).addTo(map);
+      marker.bindTooltip(hoverTip, {
+        direction: 'top',
+        offset: [0, -18],
+        opacity: 1,
+        sticky: true,
+        className: 'live-boat-hover-tip',
+      });
       bindFocusHandlers(marker, code);
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
@@ -850,7 +858,16 @@ function renderHubBoats(hubBoats) {
       marker.dragging?.[canDrag ? 'enable' : 'disable']?.();
       marker.setZIndexOffset(isSelected ? 1200 : 700 + index);
       if (marker.isPopupOpen?.()) marker.closePopup();
-      if (marker.getTooltip?.()) marker.unbindTooltip();
+      if (marker.getTooltip()) marker.setTooltipContent(hoverTip);
+      else {
+        marker.bindTooltip(hoverTip, {
+          direction: 'top',
+          offset: [0, -18],
+          opacity: 1,
+          sticky: true,
+          className: 'live-boat-hover-tip',
+        });
+      }
       bindFocusHandlers(marker, code);
       bindDragHandlers(marker, code);
     }
