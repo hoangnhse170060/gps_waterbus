@@ -282,6 +282,10 @@ function autoPhaseForBoat(code, lat, lng) {
 function phaseLabel(code, lat, lng) {
   const phase = autoPhaseForBoat(code, lat, lng);
   if (phase === 'incident') return '';
+  // Live ghim vị trí: đang khóa / không kéo thì không hiện "Đang đi".
+  if ((phase === 'enroute' || phase === 'departing') && !canDragBoat(code)) {
+    return 'Đứng yên · đã ghim vị trí';
+  }
   if (phase === 'enroute' || phase === 'departing') {
     return phase === 'departing' ? PHASES.departing : PHASES.enroute;
   }
@@ -505,6 +509,13 @@ function lockBoat(code) {
   const key = String(code || '').trim();
   if (key && unlockedBoatCode === key) unlockedBoatCode = '';
   else if (!key) unlockedBoatCode = '';
+  // Khóa lại → không còn “Đang đi” giả khi tàu đứng yên trên map.
+  if (key) {
+    const st = getStatus(key);
+    if (!st.incident && (st.phase === 'enroute' || st.phase === 'departing')) {
+      setStatus(key, { phase: 'prepare' });
+    }
+  }
   updateDeviceHint();
   if (latest) renderHubBoats(latest.hubBoats);
   toast(key ? `${boatDisplayName(key)} — đã khóa di chuyển` : 'Đã khóa di chuyển', 'warn');
