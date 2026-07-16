@@ -16,7 +16,8 @@
     <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
     <div id="boatContextMenu" class="live-ctx-menu" hidden>
       <p class="live-ctx-title" id="boatCtxTitle">Tàu</p>
-      <button type="button" id="boatCtxDrag">Kéo tàu này</button>
+      <button type="button" id="boatCtxUnlock">Mở khóa kéo</button>
+      <button type="button" id="boatCtxDrag" hidden>Kéo tàu này</button>
     </div>
 
     <div class="live-shell">
@@ -39,7 +40,7 @@
           <header class="live-brand">
             <p class="live-eyebrow">Saigon Waterbus</p>
             <h1>Live GPS</h1>
-            <p class="live-lead">Hover hoặc click tàu để chọn thông tin. Mở mũi tên để xem chi tiết. Chuột phải → Kéo.</p>
+            <p class="live-lead">Hover/click xem info. Mở khóa mới kéo được tàu. Không hiện ETA khi chưa có chuyến.</p>
           </header>
 
           <nav class="live-nav">
@@ -94,6 +95,7 @@
           </label>
 
           <div class="live-actions live-actions-2x2">
+            <button id="unlockDragBtn" type="button" class="secondary">Mở khóa kéo</button>
             <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
             <button id="sendNowBtn" type="button" class="secondary" disabled>Gửi GPS</button>
             <button id="incidentBtn" type="button" class="secondary is-danger" disabled>Báo sự cố</button>
