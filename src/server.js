@@ -1033,14 +1033,16 @@ async function publishLiveGpsPosition(body = {}) {
   ));
   const deviceId = deviceIdForBoat({ boatCode, boatId: matched?.boatId });
   const prev = state.hubBoats.get(boatCode);
-  const heading = Number.isFinite(Number(body.heading))
-    ? Number(body.heading)
-    : (prev && Number.isFinite(Number(prev.lat))
-      ? bearingDegrees({ lat: Number(prev.lat), lng: Number(prev.lng) }, { lat, lng })
-      : 0);
   const speedKmh = Number.isFinite(Number(body.speedKmh))
     ? Number(body.speedKmh)
     : 0;
+  const heading = resolveStableHeading({
+    requested: body.heading,
+    prev,
+    lat,
+    lng,
+    speedKmh,
+  });
   const status = cleanOptionalText(body.status) || (speedKmh > 0.5 ? 'moving' : 'idle');
 
   const sequence = bumpDeviceSequence(deviceId, matched || null);
@@ -2769,6 +2771,28 @@ function bearingDegrees(a, b) {
   const y = Math.sin(dLng) * Math.cos(lat2);
   const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
   return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+/** Heartbeat cùng chỗ / nhiễu GPS → không tính bearing mới (tránh mũi tên quay lung tung). */
+function resolveStableHeading({ requested, prev, lat, lng, speedKmh }) {
+  if (Number.isFinite(Number(requested))) return Number(requested);
+  const prevHeading = Number(prev?.heading);
+  const hasPrevPos = prev
+    && Number.isFinite(Number(prev.lat))
+    && Number.isFinite(Number(prev.lng));
+  if (!hasPrevPos) return Number.isFinite(prevHeading) ? prevHeading : 0;
+
+  const moved = distanceMeters(
+    { lat: Number(prev.lat), lng: Number(prev.lng) },
+    { lat: Number(lat), lng: Number(lng) },
+  );
+  if (!Number.isFinite(moved) || moved < 8 || Number(speedKmh) < 0.5) {
+    return Number.isFinite(prevHeading) ? prevHeading : 0;
+  }
+  return bearingDegrees(
+    { lat: Number(prev.lat), lng: Number(prev.lng) },
+    { lat: Number(lat), lng: Number(lng) },
+  );
 }
 
 function toRad(value) {

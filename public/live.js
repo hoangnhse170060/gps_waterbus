@@ -74,6 +74,7 @@ const pinnedPositions = loadJsonMap(STORAGE_PINS);
 const boatStatuses = loadJsonMap(STORAGE_STATUS);
 const boatSpeeds = loadJsonMap(STORAGE_SPEEDS);
 const lastSignalAt = new Map();
+const stickyHeadings = new Map(); // boatCode → degrees — tránh mũi tên quay khi đứng yên
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
@@ -218,6 +219,16 @@ function distMeters(a, b) {
   const h = Math.sin(dLat / 2) ** 2
     + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 2 * 6371008.8 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
+}
+
+function bearingDeg(a, b) {
+  const toRad = (v) => (Number(v) * Math.PI) / 180;
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const dLng = toRad(Number(b.lng) - Number(a.lng));
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
 function nearestStationAny(latlng, stations) {
@@ -411,11 +422,31 @@ function boatDeckCount(code, catalogBoat) {
   return 1;
 }
 
-function boatColor({ incident, phase, decks }) {
-  if (incident || phase === 'incident') return '#dc2626';
-  // 1 tầng teal · 2 tầng cam (màu luôn theo tầng, không phụ thuộc tín hiệu)
-  if (Number(decks) >= 2) return '#ea580c';
-  return '#0f766e';
+function stableBoatHeading(code, hub, pin) {
+  const key = String(code || '').trim();
+  const hubHeading = Number(hub?.heading);
+  const prev = stickyHeadings.get(key);
+  const hubLat = Number(hub?.lat);
+  const hubLng = Number(hub?.lng);
+  const pinLat = Number(pin?.lat);
+  const pinLng = Number(pin?.lng);
+
+  // Chỉ nhận heading mới khi hub thật sự dịch chuyển so với pin hiện tại.
+  const movedFromPin = (
+    Number.isFinite(hubLat) && Number.isFinite(hubLng)
+    && Number.isFinite(pinLat) && Number.isFinite(pinLng)
+  ) ? distMeters({ lat: hubLat, lng: hubLng }, { lat: pinLat, lng: pinLng }) : 0;
+
+  if (Number.isFinite(hubHeading) && movedFromPin >= 8) {
+    stickyHeadings.set(key, hubHeading);
+    return hubHeading;
+  }
+  if (Number.isFinite(prev)) return prev;
+  if (Number.isFinite(hubHeading)) {
+    stickyHeadings.set(key, hubHeading);
+    return hubHeading;
+  }
+  return 0;
 }
 
 function boatIcon(heading = 0, opts = {}) {
@@ -772,7 +803,7 @@ function renderHubBoats(hubBoats) {
     const st = getStatus(code);
     const phase = autoPhaseForBoat(code, trueLat, trueLng);
     const signal = hasSignal(code, hub);
-    const heading = Number(hub?.heading) || 0;
+    const heading = stableBoatHeading(code, hub, fixed);
     const decks = boatDeckCount(code, catalogBoat);
     const iconOpts = {
       drag: isSelected,
@@ -905,6 +936,7 @@ function bindDragHandlers(marker, code) {
   marker.on('dragend', async () => {
     if (code !== selectedBoatCode) return;
     dragging = false;
+    const from = pinnedFor(code);
     let { lat, lng } = marker.getLatLng();
     const snap = nearestStation({ lat, lng }, latest?.stations || []);
     if (snap) {
@@ -916,6 +948,9 @@ function bindDragHandlers(marker, code) {
     } else {
       const st = getStatus(code);
       if (!st.incident) setStatus(code, { phase: 'enroute' });
+    }
+    if (from && distMeters(from, { lat, lng }) >= 8) {
+      stickyHeadings.set(code, bearingDeg(from, { lat, lng }));
     }
     pinBoatPosition(code, lat, lng, { user: true });
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
