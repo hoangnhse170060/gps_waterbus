@@ -395,6 +395,56 @@ function isActiveBoatCode(boatCode) {
   return String(boat.dbStatus || '').trim().toLowerCase() === 'active';
 }
 
+/**
+ * Lọc nhảy/teleport trước khi cập nhật hub (SignalR / boats.latest / live GPS).
+ * - speed≈0 mà Δpos lớn → giữ điểm cũ
+ * - Δpos > speed*Δt*2.5 + buffer → bỏ
+ */
+function shouldAcceptHubJump(prev, next) {
+  if (!prev || !Number.isFinite(Number(prev.lat)) || !Number.isFinite(Number(prev.lng))) {
+    return { ok: true };
+  }
+  const lat = Number(next.lat);
+  const lng = Number(next.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return { ok: false, reason: 'invalid-coords' };
+
+  const moved = distanceMeters(
+    { lat: Number(prev.lat), lng: Number(prev.lng) },
+    { lat, lng },
+  );
+  if (!Number.isFinite(moved)) return { ok: true };
+
+  const speed = Number.isFinite(Number(next.speedKmh))
+    ? Number(next.speedKmh)
+    : (Number.isFinite(Number(prev.speedKmh)) ? Number(prev.speedKmh) : 0);
+
+  const prevAt = Date.parse(prev.recordedAt || prev.receivedAt || prev.updatedAt || '') || 0;
+  const nextAt = Date.parse(next.recordedAt || next.receivedAt || '') || Date.now();
+  const dtSec = prevAt > 0 ? Math.max(0.5, (nextAt - prevAt) / 1000) : 5;
+
+  // Đứng yên / tốc thấp: không nhận lệch > 40m (tránh nhảy ~350m speed=0).
+  if (speed < 2 && moved > 40) {
+    return { ok: false, reason: `idle-jump ${Math.round(moved)}m speed=${speed}` };
+  }
+  // Công thức: Δpos > speed(m/s)*Δt*2.5 + buffer
+  const maxM = (Math.max(0, speed) / 3.6) * dtSec * 2.5 + 80;
+  if (moved > maxM) {
+    return { ok: false, reason: `teleport ${Math.round(moved)}m > max ${Math.round(maxM)}m` };
+  }
+
+  // Sequence / thời gian cũ hơn điểm đang giữ → bỏ.
+  const prevSeq = Number(prev.sequence);
+  const nextSeq = Number(next.sequence);
+  if (Number.isFinite(prevSeq) && Number.isFinite(nextSeq) && nextSeq < prevSeq) {
+    return { ok: false, reason: `stale-sequence ${nextSeq}<${prevSeq}` };
+  }
+  if (prevAt > 0 && nextAt > 0 && nextAt < prevAt - 2000) {
+    return { ok: false, reason: 'stale-recordedAt' };
+  }
+
+  return { ok: true, moved };
+}
+
 function upsertHubBoat(payload) {
   if (!payload || typeof payload !== 'object') return;
   const code = String(payload.boatCode || '').trim();
@@ -411,15 +461,10 @@ function upsertHubBoat(payload) {
   if (suppressUntil) hubBoatSuppressUntil.delete(code);
   // Đang hoặc vừa survey cùng mã → không giữ twin live trên map (marker collector/route xong sẽ ẩn).
   if (state.collector && String(state.collector.boatCode || '').trim() === code) return;
-  state.hubBoats.set(code, {
-    boatCode: code,
-    boatName: payload.boatName || null,
-    boatId: payload.boatId || null,
-    deviceId: payload.deviceId || null,
-    routeId: payload.routeId || null,
-    routeCode: payload.routeCode || null,
-    tripId: payload.tripId || null,
-    tripCode: payload.tripCode || null,
+
+  const prev = state.hubBoats.get(code);
+  const forceAccept = payload.forceAccept === true || payload._forceAccept === true;
+  const incoming = {
     lat,
     lng,
     speedKmh: Number.isFinite(Number(payload.speedKmh)) ? Number(payload.speedKmh) : null,
@@ -427,6 +472,51 @@ function upsertHubBoat(payload) {
     recordedAt: payload.recordedAt || null,
     receivedAt: payload.receivedAt || null,
     sequence: payload.sequence ?? null,
+  };
+  const gate = forceAccept ? { ok: true } : shouldAcceptHubJump(prev, incoming);
+  if (!gate.ok) {
+    if (gate.reason && !String(gate.reason).startsWith('stale')) {
+      console.warn(`[hub-jump] ${code}: keep previous — ${gate.reason}`);
+    }
+    // Cập nhật metadata online/time nhưng giữ lat/lng cũ.
+    if (prev) {
+      state.hubBoats.set(code, {
+        ...prev,
+        isOnline: payload.isOnline !== false,
+        receivedAt: incoming.receivedAt || prev.receivedAt,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
+  // Đứng yên: giữ heading cũ (tránh xoay 0↔360).
+  let heading = incoming.heading;
+  if (
+    prev
+    && Number.isFinite(Number(prev.heading))
+    && (incoming.speedKmh == null || incoming.speedKmh < 2)
+    && (gate.moved == null || gate.moved < 8)
+  ) {
+    heading = Number(prev.heading);
+  }
+
+  state.hubBoats.set(code, {
+    boatCode: code,
+    boatName: payload.boatName || prev?.boatName || null,
+    boatId: payload.boatId || prev?.boatId || null,
+    deviceId: payload.deviceId || prev?.deviceId || null,
+    routeId: payload.routeId || null,
+    routeCode: payload.routeCode || null,
+    tripId: payload.tripId || null,
+    tripCode: payload.tripCode || null,
+    lat,
+    lng,
+    speedKmh: incoming.speedKmh,
+    heading,
+    recordedAt: incoming.recordedAt,
+    receivedAt: incoming.receivedAt,
+    sequence: incoming.sequence,
     isOnline: payload.isOnline !== false,
     updatedAt: new Date().toISOString(),
   });
@@ -1061,6 +1151,7 @@ async function publishLiveGpsPosition(body = {}) {
     isOnline: true,
     recordedAt: payload.recordedAt,
     receivedAt: new Date().toISOString(),
+    forceAccept: true, // kéo/gửi tay Live — không lọc nhảy
   });
   broadcast();
 
@@ -1789,6 +1880,7 @@ async function finalizeCollectorRecording() {
       isOnline: true,
       recordedAt: formatRecordedAt(new Date()),
       receivedAt: new Date().toISOString(),
+      forceAccept: true,
     });
     state.collector = null;
     state.collectorQueue = [];
@@ -1832,6 +1924,7 @@ async function finalizeCollectorRecording() {
     isOnline: true,
     recordedAt: formatRecordedAt(new Date()),
     receivedAt: new Date().toISOString(),
+    forceAccept: true,
   });
   state.collector = null;
   state.collectorQueue = [];
