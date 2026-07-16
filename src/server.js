@@ -716,28 +716,8 @@ async function refreshFromDatabase() {
 }
 
 function tickSimulator() {
-  for (const boat of state.boats.values()) {
-    const route = state.routes.get(boat.routeId);
-    if (!route || boat.paused || boat.speedKmh <= 0) continue;
-    const metersPerSecond = boat.speedKmh / 3.6;
-    boat.direction ||= 1;
-    boat.progressMeters += metersPerSecond * boat.direction;
-
-    if (boat.progressMeters >= route.lengthMeters) {
-      boat.progressMeters = route.lengthMeters;
-      boat.direction = -1;
-    } else if (boat.progressMeters <= 0) {
-      boat.progressMeters = 0;
-      boat.direction = 1;
-    }
-
-    const next = pointAtDistance(route.coordinates, boat.progressMeters);
-    boat.lat = next.lat;
-    boat.lng = next.lng;
-    boat.heading = boat.direction === 1 ? next.heading : (next.heading + 180) % 360;
-    boat.status = 'moving';
-    boat.updatedAt = new Date().toISOString();
-  }
+  // Live GPS: tàu không tự chạy trên tuyến.
+  // Survey: chỉ collector chạy sau khi user bấm ghi GPS.
   tickCollector();
   broadcast();
 }

@@ -303,9 +303,9 @@ function autoPhaseForBoat(code, lat, lng) {
   const near = nearestStationAny({ lat, lng }, latest?.stations || []);
   if (near && near.dist <= SNAP_STATION_M) return 'arrived';
   if (near && near.dist <= APPROACH_M) return 'approaching';
-  // Chưa có chuyến thật — không suy ETA/lịch. Chỉ phân biệt đứng bến / đang đi.
+  // Chỉ “Đang đi” sau khi user kéo (phase đã set). Không tự chạy như Survey.
   if (st.phase === 'enroute' || st.phase === 'departing') return st.phase;
-  return near && near.dist > APPROACH_M ? 'enroute' : 'prepare';
+  return 'prepare';
 }
 
 function phaseLabel(code, lat, lng) {
@@ -1035,9 +1035,13 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
   const st = getStatus(boatCode);
   const phase = autoPhaseForBoat(boatCode, lat, lng);
   const cruise = getBoatSpeedKmh(boatCode);
-  const moving = !st.incident && (phase === 'enroute' || phase === 'departing' || phase === 'approaching');
+  // Live ≠ Survey: heartbeat chỉ giữ vị trí (idle). Chỉ kéo/gửi tay mới gửi moving.
+  const userDriven = !quiet;
+  const moving = userDriven
+    && !st.incident
+    && (phase === 'enroute' || phase === 'departing' || phase === 'approaching');
   const status = st.incident ? 'idle' : (moving ? 'moving' : 'idle');
-  const speedKmh = st.incident ? 0 : (moving ? cruise : (phase === 'arrived' || phase === 'prepare' ? 0 : cruise));
+  const speedKmh = moving ? cruise : 0;
   const sendToTarget = sendAzureSelectEl.value === 'on';
   try {
     const response = await fetch('/api/live/gps', {
