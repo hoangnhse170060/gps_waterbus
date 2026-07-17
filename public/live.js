@@ -88,6 +88,12 @@ let heartbeatBusy = false;
 let incidentBusy = false;
 let lastIncidentToastKey = '';
 let lastRescueToastKey = '';
+let eventsReconnectTimer = null;
+let eventsBackoffMs = 1000;
+let lastEventsAt = 0;
+let snapshotPollTimer = null;
+let snapshotPollBusy = false;
+let sseAlive = false;
 const pinnedPositions = loadJsonMap(STORAGE_PINS);
 const boatStatuses = loadJsonMap(STORAGE_STATUS);
 const boatSpeeds = loadJsonMap(STORAGE_SPEEDS);
@@ -2105,26 +2111,97 @@ function render(data) {
   syncBoatControls();
 }
 
+async function pullSnapshot({ force = false } = {}) {
+  if (snapshotPollBusy) return;
+  // SSE đang sống và mới nhận data → không cần poll (trừ force).
+  if (!force && sseAlive && lastEventsAt && (Date.now() - lastEventsAt) < 4000) return;
+  snapshotPollBusy = true;
+  try {
+    const response = await fetch(`/api/snapshot?t=${Date.now()}`, { cache: 'no-store' });
+    if (!response.ok) return;
+    const data = await response.json();
+    if (data && typeof data === 'object' && !data.error) {
+      lastEventsAt = Date.now();
+      render(data);
+    }
+  } catch {
+    // ignore — sẽ thử lại vòng poll sau
+  } finally {
+    snapshotPollBusy = false;
+  }
+}
+
+function startSnapshotPoll() {
+  if (snapshotPollTimer) clearInterval(snapshotPollTimer);
+  snapshotPollTimer = setInterval(() => {
+    pullSnapshot().catch(() => {});
+  }, 2000);
+  // Lấy ngay 1 snapshot khi vào trang / khi SSE chết.
+  pullSnapshot({ force: true }).catch(() => {});
+}
+
+function scheduleEventsReconnect() {
+  if (eventsReconnectTimer) return;
+  const delay = eventsBackoffMs;
+  eventsBackoffMs = Math.min(15000, Math.round(eventsBackoffMs * 1.6));
+  eventsReconnectTimer = setTimeout(() => {
+    eventsReconnectTimer = null;
+    connectEvents();
+  }, delay);
+}
+
 function connectEvents() {
   if (eventsSource) {
     eventsSource.onmessage = null;
     eventsSource.onerror = null;
-    eventsSource.close();
+    try { eventsSource.close(); } catch { /* ignore */ }
+    eventsSource = null;
   }
-  eventsSource = new EventSource('/events');
+  sseAlive = false;
+  try {
+    eventsSource = new EventSource(`/events?t=${Date.now()}`);
+  } catch {
+    scheduleEventsReconnect();
+    return;
+  }
+  eventsSource.onopen = () => {
+    sseAlive = true;
+    eventsBackoffMs = 1000;
+  };
   eventsSource.onmessage = (message) => {
     try {
       const data = JSON.parse(message.data);
+      lastEventsAt = Date.now();
+      sseAlive = true;
+      eventsBackoffMs = 1000;
       render(data);
     } catch {
       // ignore
     }
   };
   eventsSource.onerror = () => {
-    eventsSource.close();
-    setTimeout(connectEvents, 1500);
+    sseAlive = false;
+    try { eventsSource?.close(); } catch { /* ignore */ }
+    eventsSource = null;
+    // SSE chết → poll snapshot ngay để SOS vẫn chạy trên map.
+    pullSnapshot({ force: true }).catch(() => {});
+    scheduleEventsReconnect();
   };
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  // Tab tỉnh lại sau ERR_NETWORK_IO_SUSPENDED — reconnect + snapshot.
+  eventsBackoffMs = 1000;
+  pullSnapshot({ force: true }).catch(() => {});
+  if (!sseAlive) connectEvents();
+});
+
+window.addEventListener('online', () => {
+  eventsBackoffMs = 1000;
+  pullSnapshot({ force: true }).catch(() => {});
+  connectEvents();
+});
 
 boatSelectEl.addEventListener('change', () => {
   hideBoatContextMenu();
@@ -2408,4 +2485,5 @@ try {
 }
 
 connectEvents();
+startSnapshotPoll();
 startHeartbeat();

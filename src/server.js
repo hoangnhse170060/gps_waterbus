@@ -5097,12 +5097,16 @@ function broadcast() {
   }
 }
 
-function handleEvents(_req, res) {
+function handleEvents(req, res) {
   res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
+  if (typeof res.flushHeaders === 'function') {
+    try { res.flushHeaders(); } catch { /* ignore */ }
+  }
   res.write(': connected\n\n');
   clients.add(res);
   try {
@@ -5110,18 +5114,25 @@ function handleEvents(_req, res) {
   } catch (error) {
     console.error(`[events] initial snapshot failed: ${error.message}`);
   }
+  // Railway/proxy cắt SSE nếu lâu không có data — ping thường xuyên.
   const heartbeat = setInterval(() => {
     try {
-      res.write(': ping\n\n');
+      res.write(`: ping ${Date.now()}\n\n`);
     } catch {
       clearInterval(heartbeat);
       clients.delete(res);
     }
-  }, 15000);
-  res.on('close', () => {
+  }, 10000);
+  const onClose = () => {
     clearInterval(heartbeat);
     clients.delete(res);
-  });
+  };
+  res.on('close', onClose);
+  res.on('error', onClose);
+  if (req && typeof req.on === 'function') {
+    req.on('close', onClose);
+    req.on('aborted', onClose);
+  }
 }
 
 async function serveStatic(pathname, res) {
