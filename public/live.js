@@ -577,6 +577,33 @@ function syncSurveyCollectorPin(data = latest) {
   pinBoatPosition(code, lat, lng, { user: false });
 }
 
+/** Cập nhật pin từ hub GPS — trừ khi user đang khóa kéo tay. */
+function syncLiveHubPins(hubBoats) {
+  let changed = false;
+  for (const boat of hubBoats || []) {
+    const code = String(boat?.boatCode || '').trim();
+    if (!code) continue;
+    const pin = pinnedFor(code);
+    if (pin?.user) continue;
+    const lat = Number(boat.lat);
+    const lng = Number(boat.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const prevLat = Number(pin?.lat);
+    const prevLng = Number(pin?.lng);
+    if (
+      pin
+      && Number.isFinite(prevLat)
+      && Number.isFinite(prevLng)
+      && distMeters({ lat: prevLat, lng: prevLng }, { lat, lng }) < 1.5
+    ) {
+      continue;
+    }
+    pinnedPositions.set(code, { lat, lng, at: Date.now(), user: false });
+    changed = true;
+  }
+  if (changed) persistPins();
+}
+
 function getStatus(code) {
   const key = String(code || '').trim();
   const cur = boatStatuses.get(key) || {};
@@ -949,15 +976,19 @@ function boatColor({ signal, incident, decks, rescue, maintenance }) {
 function boatIcon(heading = 0, opts = {}) {
   const deg = Number(heading) || 0;
   const fill = boatColor(opts);
-  const size = opts.drag ? 52 : 44;
+  const size = opts.drag ? 52 : (opts.rescue ? 50 : 44);
+  const tag = opts.rescue
+    ? '<span class="live-boat-tag is-rescue">CỨU</span>'
+    : (opts.incident ? '<span class="live-boat-tag is-incident">SC</span>' : '');
   return L.divIcon({
     className: 'live-boat-wrap',
     html: `
-      <div class="live-boat${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}" style="--heading:${deg}deg;--boat:${fill}">
+      <div class="live-boat${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}${opts.rescue ? ' is-rescue' : ''}" style="--heading:${deg}deg;--boat:${fill}">
         <span class="live-boat-ring"></span>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path fill="${fill}" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
         </svg>
+        ${tag}
       </div>
     `,
     iconSize: [size, size],
@@ -1327,7 +1358,9 @@ function renderRoutes(routes, stations) {
 function renderHubBoats(hubBoats) {
   // Tọa độ sự cố từ FE/BE phải giống nhau ở cả hai bản đồ, không giữ pin cũ.
   syncOpenIncidentPins();
-  // Mission tự động chạy ở GPS server; dùng tọa độ hub mới thay cho pin kéo tay cũ.
+  // Hub GPS mới (không phải pin user) → cập nhật vị trí hiển thị.
+  syncLiveHubPins(hubBoats);
+  // Mission cứu hộ ghi đè sau — bám currentLat/incidentCurrentLat khi đang kéo.
   syncAutomatedRescuePins(hubBoats);
   // Đang survey: Live bám collector theo đường vẽ (ghi đè pin kéo tay tại bến cũ).
   syncSurveyCollectorPin();
@@ -1423,7 +1456,9 @@ function renderHubBoats(hubBoats) {
       marker = L.marker([show.lat, show.lng], {
         icon: boatIcon(heading, iconOpts),
         draggable: canDrag,
-        zIndexOffset: isSelected || canDrag ? 1200 : 700 + index,
+        zIndexOffset: isSelected || canDrag
+          ? 1200
+          : (iconOpts.rescue ? 1100 : (iconOpts.incident ? 1000 : 700 + index)),
         autoPan: true,
       }).addTo(map);
       marker.bindPopup(popupHtml, {
