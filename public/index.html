@@ -13,6 +13,11 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
+    <script>
+      if (new URLSearchParams(location.search).get('embed') === '1') {
+        document.documentElement.classList.add('is-embed');
+      }
+    </script>
     <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
     <div class="app">
       <section class="map-shell">
@@ -34,7 +39,7 @@
               </label>
               <div class="sender-actions">
                 <button id="refreshRoutes" type="button" class="secondary">Làm mới</button>
-                <a class="secondary topbar-link" href="/live.html" title="Theo dõi & kéo tàu gửi GPS">Live GPS</a>
+                <a class="secondary topbar-link" href="/" title="Theo dõi & kéo tàu gửi GPS">Live GPS</a>
                 <a class="secondary topbar-link" href="/api-log.html" target="_blank" rel="noopener" title="Xem payload / lỗi đẩy lên BE">Log API</a>
               </div>
             </div>

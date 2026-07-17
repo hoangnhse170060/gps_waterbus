@@ -456,6 +456,8 @@ const server = createServer(async (req, res) => {
       state.lastAutoSavedRoute = null;
       // Đồng bộ sequence cao hơn mọi bản tin cũ trên Azure (tránh 409 "sequence cũ").
       bumpDeviceSequence(state.collector.deviceId, state.collector);
+      syncCollectorToHub();
+      broadcast();
       if (state.collector.sendToTarget && getTargetApiRoot()) {
         const sessionResult = await startTrackingSessionOnTarget(state.collector);
         if (sessionResult.ok) {
@@ -1316,18 +1318,10 @@ function tickCollector() {
   collector.heading = next.heading;
   collector.updatedAt = new Date().toISOString();
   if (collector.progressMeters >= collector.lengthMeters) {
-    // Dừng đúng điểm cuối (bến đích) — idle cho GPS side FE.
+    // Dừng đúng điểm cuối đường vẽ — không nhảy về tâm bến.
     const end = pointAtDistance(collector.coordinates, collector.lengthMeters);
-    const endStation = collector.endStationId
-      ? (state.stations || []).find((s) => String(s.stationId) === String(collector.endStationId))
-      : null;
-    if (endStation && Number.isFinite(Number(endStation.lat)) && Number.isFinite(Number(endStation.lng))) {
-      collector.lat = Number(endStation.lat);
-      collector.lng = Number(endStation.lng);
-    } else {
-      collector.lat = end.lat;
-      collector.lng = end.lng;
-    }
+    collector.lat = end.lat;
+    collector.lng = end.lng;
     collector.heading = end.heading;
     collector.progressMeters = collector.lengthMeters;
     collector.speedKmh = 0;
@@ -1336,6 +1330,35 @@ function tickCollector() {
   } else {
     collector.status = 'moving';
   }
+  syncCollectorToHub();
+}
+
+/** Live map theo dõi tàu đang survey theo đúng path vẽ (không giữ pin cũ / echo Azure). */
+function syncCollectorToHub() {
+  const collector = state.collector;
+  const code = String(collector?.boatCode || '').trim();
+  if (!code) return;
+  const lat = Number(collector.lat);
+  const lng = Number(collector.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const prev = state.hubBoats.get(code);
+  state.hubBoats.set(code, {
+    ...(prev || {}),
+    boatCode: code,
+    boatName: collector.boatName || prev?.boatName || code,
+    boatId: prev?.boatId || null,
+    deviceId: collector.deviceId || prev?.deviceId || null,
+    routeCode: collector.routeCode || prev?.routeCode || null,
+    lat,
+    lng,
+    speedKmh: Number(collector.speedKmh) || 0,
+    heading: Number(collector.heading) || 0,
+    isOnline: true,
+    source: 'survey-collector',
+    recordedAt: new Date().toISOString(),
+    receivedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 async function publishGpsPositions() {
@@ -2480,12 +2503,13 @@ async function tickRescueMissions() {
 }
 
 /**
- * Nhận lệnh sự cố/cứu hộ không cần JWT Azure.
- * Manager/Admin FE hoặc BE gọi: POST /api/incidents/hook + header X-Live-Hook-Secret.
+ * Nhận lệnh sự cố/cứu hộ từ BE (nguồn sự thật). Không JWT Azure.
+ * Production: chỉ BE gọi — FE không giữ secret, không gọi hook.
+ * POST /api/incidents/hook + header X-Live-Hook-Secret.
  *
  * Body mẫu:
  * { "event": "IncidentCreated", "boatCode": "WB_002", "lat": 10.77, "lng": 106.70 }
- * { "event": "RescueDispatched", "incidentId": "...", "boatCode": "WB_002", "replacementBoatCode": "WB_001" }
+ * { "event": "RescueDispatched", "incidentId": "...", "boatCode": "WB_002", "replacementBoatCode": "WB_001", "lat": 10.77, "lng": 106.70 }
  * { "event": "IncidentResolved", "incidentId": "..." }
  */
 function ingestIncidentHook(body = {}, req = null) {
@@ -3091,6 +3115,16 @@ async function saveRouteFromGpsOnTarget(session, body) {
   const azureMaxSpeed = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
   const azureSpeedKmh = Math.min(averageSpeedKmh, azureMaxSpeed);
   const coordinates = resolveSurveyPathCoordinates(session, body, averageSpeedKmh);
+  const uniqueCoordKeys = new Set(
+    coordinates.map((p) => `${Number(p.lat).toFixed(6)},${Number(p.lng).toFixed(6)}`),
+  );
+  if (coordinates.length < 2 || uniqueCoordKeys.size < 2) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Can it nhat 2 diem GPS khac nhau de tao route_geometry.',
+    };
+  }
 
   const payload = {
     routeCode: cleanRouteText(body.routeCode || session.routeCode, 'Route code'),
@@ -4636,7 +4670,12 @@ function handleEvents(_req, res) {
 }
 
 async function serveStatic(pathname, res) {
-  const requested = pathname === '/' ? '/index.html' : pathname;
+  let requested = pathname;
+  if (pathname === '/' || pathname === '/live' || pathname === '/live/') {
+    requested = '/live.html';
+  } else if (pathname === '/survey' || pathname === '/survey/') {
+    requested = '/index.html';
+  }
   const filePath = path.normalize(path.join(publicDir, requested));
   if (!filePath.startsWith(publicDir)) return sendJson(res, { error: 'Forbidden' }, 403);
   try {

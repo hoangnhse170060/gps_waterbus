@@ -561,6 +561,19 @@ function ensureSeedPin(code, lat, lng) {
   pinBoatPosition(code, lat, lng, { user: false });
 }
 
+/** Khi đang ghi GPS survey — Live theo collector, không giữ tàu tại pin bến cũ. */
+function syncSurveyCollectorPin(data = latest) {
+  const collector = data?.collector;
+  const code = String(collector?.boatCode || '').trim();
+  if (!code) return;
+  const lat = Number(collector.lat);
+  const lng = Number(collector.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const status = String(collector.status || '').toLowerCase();
+  if (!['moving', 'paused', 'completed'].includes(status)) return;
+  pinBoatPosition(code, lat, lng, { user: false });
+}
+
 function getStatus(code) {
   const key = String(code || '').trim();
   const cur = boatStatuses.get(key) || {};
@@ -1310,6 +1323,8 @@ function renderHubBoats(hubBoats) {
   syncOpenIncidentPins();
   // Mission tự động chạy ở GPS server; dùng tọa độ hub mới thay cho pin kéo tay cũ.
   syncAutomatedRescuePins(hubBoats);
+  // Đang survey: Live bám collector theo đường vẽ (ghi đè pin kéo tay tại bến cũ).
+  syncSurveyCollectorPin();
   const hubByCode = new Map();
   for (const boat of hubBoats || []) {
     const code = String(boat.boatCode || '').trim();
@@ -2085,6 +2100,11 @@ document.addEventListener('click', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
+    const overlay = document.querySelector('#surveyOverlay');
+    if (overlay && !overlay.hidden) {
+      closeSurveyOverlay();
+      return;
+    }
     hideBoatContextMenu();
     return;
   }
@@ -2176,6 +2196,59 @@ refreshBtn.addEventListener('click', async () => {
     toast(error.message, 'err');
   }
 });
+
+const openSurveyBtn = document.querySelector('#openSurveyBtn');
+const closeSurveyBtn = document.querySelector('#closeSurveyBtn');
+const surveyOverlayEl = document.querySelector('#surveyOverlay');
+const surveyFrameEl = document.querySelector('#surveyFrame');
+
+function openSurveyOverlay() {
+  if (!surveyOverlayEl || !surveyFrameEl) return;
+  hideBoatContextMenu();
+  if (!surveyFrameEl.src || surveyFrameEl.src === 'about:blank' || surveyFrameEl.getAttribute('src') === 'about:blank') {
+    surveyFrameEl.src = '/survey?embed=1';
+  }
+  surveyOverlayEl.hidden = false;
+  document.body.classList.add('survey-open');
+}
+
+function closeSurveyOverlay() {
+  if (!surveyOverlayEl) return;
+  surveyOverlayEl.hidden = true;
+  document.body.classList.remove('survey-open');
+  // Giải phóng SSE/map Survey khi đóng — lần mở sau load lại.
+  if (surveyFrameEl) surveyFrameEl.src = 'about:blank';
+}
+
+openSurveyBtn?.addEventListener('click', openSurveyOverlay);
+closeSurveyBtn?.addEventListener('click', closeSurveyOverlay);
+
+const livePanelEl = document.querySelector('#livePanel');
+const toggleLivePanelBtn = document.querySelector('#toggleLivePanelBtn');
+const STORAGE_PANEL = 'liveGpsPanelCollapsed.v1';
+
+function setLivePanelCollapsed(collapsed) {
+  if (!livePanelEl || !toggleLivePanelBtn) return;
+  livePanelEl.classList.toggle('is-collapsed', collapsed);
+  toggleLivePanelBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  toggleLivePanelBtn.title = collapsed ? 'Mở rộng panel' : 'Thu gọn panel';
+  try {
+    localStorage.setItem(STORAGE_PANEL, collapsed ? '1' : '0');
+  } catch {
+    // ignore
+  }
+}
+
+toggleLivePanelBtn?.addEventListener('click', () => {
+  const next = !livePanelEl?.classList.contains('is-collapsed');
+  setLivePanelCollapsed(next);
+});
+
+try {
+  setLivePanelCollapsed(localStorage.getItem(STORAGE_PANEL) === '1');
+} catch {
+  setLivePanelCollapsed(false);
+}
 
 connectEvents();
 startHeartbeat();

@@ -805,7 +805,18 @@ function finishDraw() {
     return;
   }
   ensureEndStationFromPath();
-  if (endStationEl?.value) seedToEndStation();
+  // Giữ hình đã vẽ: chỉ gắn nhãn bến cuối nếu điểm cuối đã gần bến.
+  // Không nối thẳng thêm tới tâm bến (tránh phá path / tàu chạy lệch đường vẽ).
+  const endStation = getSelectedEndStation();
+  const last = captureState.points.at(-1);
+  if (endStation && last && last.source !== 'station-end') {
+    const near = haversineMeters(last, endStation) <= 60;
+    if (near || String(last.stationId || '') === String(endStation.stationId)) {
+      last.source = 'station-end';
+      last.stationId = endStation.stationId;
+      last.label = endStation.stationName;
+    }
+  }
   // Giữ đúng hình đang vẽ — không kéo điểm, không ép cong/thẳng lại.
   captureState.finished = true;
   setDrawTool('pan');
@@ -2200,20 +2211,44 @@ async function startRecording() {
     return;
   }
 
-  // Kiểu cũ: 2 bến (đầu → cuối) + 1 trong 5 tàu. Ưu tiên path 2 điểm nếu đủ bến.
-  if (getSelectedStation() && getSelectedEndStation()) {
-    buildSimpleTwoStationPath();
-  } else if (captureState.points.length < 2) {
-    if (getSelectedStation() && !captureState.points.length) seedFromStation();
-    if (getSelectedEndStation()) seedToEndStation();
-    if (captureState.points.length < 2) {
-      captureStatusEl.textContent = 'Chọn bến xuất phát + bến kết thúc (2 điểm).';
+  // Giữ đường đã vẽ. Chỉ tự tạo path 2 điểm khi chưa vẽ gì và bến đầu ≠ bến cuối.
+  // Loop (cùng 1 bến): bắt buộc đã vẽ đường vòng — không thay bằng 2 điểm trùng tọa độ (Azure từ chối).
+  const startStation = getSelectedStation();
+  const endStation = getSelectedEndStation();
+  const isSightseeingLoop = Boolean(
+    startStation
+    && endStation
+    && String(startStation.stationId) === String(endStation.stationId),
+  );
+  if (captureState.points.length < 2) {
+    if (startStation && endStation && !isSightseeingLoop) {
+      buildSimpleTwoStationPath();
+    } else if (isSightseeingLoop) {
+      captureStatusEl.textContent = 'Vòng sightseeing: vẽ đường vòng rồi click lại bến đầu để đóng, sau đó mới ghi GPS.';
+      notifyWarn('Loop cần đường vẽ (≥ 2 điểm khác nhau), không chỉ cùng 1 bến.');
       return;
+    } else {
+      if (startStation && !captureState.points.length) seedFromStation();
+      if (endStation) seedToEndStation();
+      if (captureState.points.length < 2) {
+        captureStatusEl.textContent = 'Chọn bến xuất phát + bến kết thúc (2 điểm).';
+        return;
+      }
     }
   }
   if (!captureState.finished) finishDraw();
   if (!ensureEndStationFromPath({ quiet: true }) && !endStationEl?.value) {
     captureStatusEl.textContent = 'Cần bến kết thúc để tàu dừng đúng bến.';
+    return;
+  }
+
+  const plannedCheck = getPathCoordinates();
+  const uniquePts = new Set(
+    plannedCheck.map((p) => `${Number(p.lat).toFixed(6)},${Number(p.lng).toFixed(6)}`),
+  );
+  if (plannedCheck.length < 2 || uniquePts.size < 2) {
+    captureStatusEl.textContent = 'Cần ít nhất 2 điểm GPS khác nhau trên đường vẽ (Azure không nhận path trùng tọa độ).';
+    notifyWarn('Đường vẽ chưa đủ 2 điểm khác nhau — vẽ thêm rồi thử lại.');
     return;
   }
 
@@ -2260,12 +2295,13 @@ async function startRecording() {
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || 'Không bắt đầu ghi được GPS');
     const warn = body.targetSessionWarning ? ` ${body.targetSessionWarning}` : '';
-    captureStatusEl.textContent = `Đang ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
+    const startName = startStation?.stationName || startStation?.stationCode || 'điểm đầu đường vẽ';
+    captureStatusEl.textContent = `Tàu nhảy tới ${startName} rồi ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
     collectorStatusEl.textContent = `Đang chạy ${body.boatCode} · ${body.deviceId}`;
     gpsStatusEl.textContent = 'Đang ghi GPS';
     ensureSurveyPathVisible();
     if (body.targetSessionWarning) notifyWarn(`Ghi GPS: ${body.targetSessionWarning}`);
-    else notifyOk(`Bắt đầu ghi GPS · ${body.boatCode} · ${body.deviceId}`);
+    else notifyOk(`${body.boatCode} nhảy tới ${startName} · bắt đầu ghi GPS`);
   } catch (error) {
     recordingActive = false;
     recordingStartedAt = 0;

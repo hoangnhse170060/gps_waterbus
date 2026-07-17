@@ -1740,3 +1740,9 @@ input[type="range"] {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+/* Survey mở trong overlay Live GPS */
+html.is-embed .topbar-link[href="/"],
+html.is-embed .topbar-link[href="/live.html"] {
+  display: none !important;
+}

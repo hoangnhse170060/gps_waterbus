@@ -30,117 +30,107 @@
     <div class="live-shell">
       <div id="map" class="live-map"></div>
 
-      <aside class="live-panel">
-        <header class="live-brand">
-          <p class="live-eyebrow">Saigon Waterbus</p>
-          <h1>Live GPS</h1>
-          <p class="live-lead">Hiện tàu + bến. Chuột phải → Mở khóa kéo / Khóa di chuyển. Teal = 1 tầng, cam = 2 tầng.</p>
-        </header>
-
-        <nav class="live-nav">
-          <a href="/">Survey</a>
-          <a href="/live.html" aria-current="page">Live GPS</a>
-          <a href="/api-log.html" target="_blank" rel="noopener">Log API</a>
-        </nav>
-
-        <label class="live-field">
-          <span>Tàu GPS</span>
-          <select id="boatSelect">
-            <option value="">Chọn tàu...</option>
-          </select>
-          <small id="deviceHint" class="live-hint">Chọn tàu đã đăng ký device để kéo trên map.</small>
-        </label>
-
-        <label class="live-field">
-          <span>Vận tốc (km/h)</span>
-          <input id="speedInput" type="number" min="0" max="80" step="1" value="16" disabled>
-          <small class="live-hint">Mặc định 16 — nhập để tăng/giảm tốc tàu đang chọn (trạng thái do vị trí tàu tự báo).</small>
-        </label>
-
-        <div class="live-field">
-          <span>Hướng mũi tàu</span>
-          <div class="live-heading-pad" role="group" aria-label="Xoay tàu">
-            <button type="button" id="headNorthBtn" class="secondary" title="Bắc (0°)" disabled>↑</button>
-            <button type="button" id="headWestBtn" class="secondary" title="Tây (270°)" disabled>←</button>
-            <button type="button" id="rotateLeftBtn" class="secondary" title="Xoay trái 15°" disabled>↺</button>
-            <button type="button" id="rotateRightBtn" class="secondary" title="Xoay phải 15°" disabled>↻</button>
-            <button type="button" id="headEastBtn" class="secondary" title="Đông (90°)" disabled>→</button>
-            <button type="button" id="headSouthBtn" class="secondary" title="Nam (180°)" disabled>↓</button>
-          </div>
-          <small id="headingHint" class="live-hint">Phím ← → xoay · ↑ Bắc · ↓ Nam (khi đã mở khóa tàu).</small>
+      <aside class="live-panel" id="livePanel">
+        <div class="live-panel-top">
+          <header class="live-brand">
+            <p class="live-eyebrow">Saigon Waterbus</p>
+            <h1>Live GPS</h1>
+            <p class="live-lead">Chuột phải tàu → mở khóa kéo / xoay hướng.</p>
+          </header>
+          <button
+            type="button"
+            id="toggleLivePanelBtn"
+            class="live-panel-toggle"
+            title="Thu gọn / mở rộng"
+            aria-expanded="true"
+            aria-controls="livePanelBody"
+          >
+            <span class="live-panel-toggle-icon" aria-hidden="true">‹</span>
+          </button>
         </div>
 
-        <label class="live-field live-toggle">
-          <span>Gửi Azure BE</span>
-          <select id="sendAzureSelect">
-            <option value="on">Bật — POST /tracking/locations</option>
-            <option value="off">Tắt — chỉ local map</option>
-          </select>
-        </label>
+        <div class="live-panel-body" id="livePanelBody">
+          <nav class="live-nav">
+            <a href="/" aria-current="page">Live GPS</a>
+            <button type="button" id="openSurveyBtn" class="live-nav-btn">Bảng vẽ</button>
+          </nav>
 
-        <div class="live-actions live-actions-2x2">
-          <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
-          <button id="sendNowBtn" type="button" class="secondary" disabled>Gửi GPS</button>
-          <button id="incidentBtn" type="button" class="secondary is-danger" disabled>Báo sự cố</button>
-          <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
+          <label class="live-field">
+            <span>Tàu GPS</span>
+            <select id="boatSelect">
+              <option value="">Chọn tàu...</option>
+            </select>
+            <small id="deviceHint" class="live-hint">Chọn tàu, chuột phải để mở khóa.</small>
+          </label>
+
+          <label class="live-field">
+            <span>Vận tốc (km/h)</span>
+            <input id="speedInput" type="number" min="0" max="80" step="1" value="16" disabled>
+          </label>
+
+          <label class="live-field live-toggle">
+            <span>Gửi Azure</span>
+            <select id="sendAzureSelect">
+              <option value="on">Bật</option>
+              <option value="off">Tắt (local)</option>
+            </select>
+          </label>
+
+          <div class="live-actions live-actions-3">
+            <button id="centerBoatBtn" type="button" class="secondary" disabled>Focus tàu</button>
+            <button id="sendNowBtn" type="button" class="secondary" disabled>Gửi GPS</button>
+            <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
+          </div>
+
+          <section class="live-status" id="statusCard">
+            <div class="live-status-row">
+              <span>Trạng thái</span>
+              <b id="boatPhaseStatus">—</b>
+            </div>
+            <div class="live-status-row">
+              <span>Gửi gần nhất</span>
+              <b id="sendStatus">Chưa gửi</b>
+            </div>
+          </section>
+
+          <footer class="live-legend">
+            <span><i class="leg-deck1"></i> 1 tầng</span>
+            <span><i class="leg-deck2"></i> 2 tầng</span>
+            <span><i class="leg-incident"></i> Sự cố</span>
+            <span><i class="leg-rescue"></i> Tàu cứu</span>
+          </footer>
         </div>
-
-        <section class="live-incidents" id="incidentsCard">
-          <div class="live-incidents-head">
-            <h2>Sự cố mở</h2>
-            <button id="refreshIncidentsBtn" type="button" class="secondary live-mini-btn">Tải lại</button>
-          </div>
-          <p id="incidentsHubHint" class="live-hint">Hub incidents · chờ dữ liệu…</p>
-          <div id="incidentsList" class="live-incidents-list">
-            <p class="live-incidents-empty">Chưa có sự cố mở.</p>
-          </div>
-        </section>
-
-        <section class="live-status" id="statusCard">
-          <div class="live-status-row">
-            <span>Hub / relay</span>
-            <b id="hubStatus">…</b>
-          </div>
-          <div class="live-status-row">
-            <span>Hub sự cố</span>
-            <b id="incidentsHubStatus">…</b>
-          </div>
-          <div class="live-status-row">
-            <span>Gửi gần nhất</span>
-            <b id="sendStatus">Chưa gửi</b>
-          </div>
-          <div class="live-status-row">
-            <span>Tọa độ</span>
-            <b id="coordStatus">—</b>
-          </div>
-          <div class="live-status-row">
-            <span>DB tàu</span>
-            <b id="boatDbStatus">—</b>
-          </div>
-          <div class="live-status-row">
-            <span>Trạng thái</span>
-            <b id="boatPhaseStatus">—</b>
-          </div>
-          <div class="live-status-row">
-            <span>Lộ trình</span>
-            <b id="boatRouteStatus">—</b>
-          </div>
-        </section>
-
-        <p id="liveHelp" class="live-help">
-          Manager/Admin phân tàu cứu → POST /api/incidents/hook (secret, không JWT) → map đỏ + kéo tàu cứu.
-        </p>
-
-        <footer class="live-legend">
-          <span><i class="leg-deck1"></i> 1 tầng</span>
-          <span><i class="leg-deck2"></i> 2 tầng</span>
-          <span><i class="leg-mute"></i> Mất tín hiệu</span>
-          <span><i class="leg-maint"></i> Bảo trì</span>
-          <span><i class="leg-incident"></i> Sự cố</span>
-          <span><i class="leg-rescue"></i> Tàu cứu</span>
-        </footer>
       </aside>
     </div>
+
+    <div id="surveyOverlay" class="survey-overlay" hidden>
+      <header class="survey-overlay-bar">
+        <div>
+          <p class="survey-overlay-eyebrow">Saigon Waterbus</p>
+          <strong>Bảng vẽ Survey</strong>
+        </div>
+        <button type="button" id="closeSurveyBtn" class="secondary">Đóng</button>
+      </header>
+      <iframe id="surveyFrame" class="survey-overlay-frame" title="Bảng vẽ Survey" src="about:blank"></iframe>
+    </div>
+
+    <!-- Hidden status hooks — JS vẫn cập nhật được nếu cần, không chiếm panel -->
+    <span id="hubStatus" hidden></span>
+    <span id="incidentsHubStatus" hidden></span>
+    <span id="coordStatus" hidden></span>
+    <span id="boatDbStatus" hidden></span>
+    <span id="boatRouteStatus" hidden></span>
+    <span id="incidentsHubHint" hidden></span>
+    <div id="incidentsList" hidden></div>
+    <button id="incidentBtn" type="button" hidden></button>
+    <button id="refreshIncidentsBtn" type="button" hidden></button>
+    <button id="rotateLeftBtn" type="button" hidden></button>
+    <button id="rotateRightBtn" type="button" hidden></button>
+    <button id="headNorthBtn" type="button" hidden></button>
+    <button id="headSouthBtn" type="button" hidden></button>
+    <button id="headEastBtn" type="button" hidden></button>
+    <button id="headWestBtn" type="button" hidden></button>
+    <span id="headingHint" hidden></span>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
