@@ -17,6 +17,14 @@
     <div id="boatContextMenu" class="live-ctx-menu" hidden>
       <p class="live-ctx-title" id="boatCtxTitle">Tàu</p>
       <button type="button" id="boatCtxToggleLock">Mở khóa kéo</button>
+      <button type="button" id="boatCtxRotateLeft">Xoay trái 15°</button>
+      <button type="button" id="boatCtxRotateRight">Xoay phải 15°</button>
+      <div class="live-ctx-heading-pad" role="group" aria-label="Hướng mũi tàu">
+        <button type="button" id="boatCtxHeadNorth" title="Bắc">↑</button>
+        <button type="button" id="boatCtxHeadWest" title="Tây">←</button>
+        <button type="button" id="boatCtxHeadEast" title="Đông">→</button>
+        <button type="button" id="boatCtxHeadSouth" title="Nam">↓</button>
+      </div>
     </div>
 
     <div class="live-shell">
@@ -49,6 +57,19 @@
           <small class="live-hint">Mặc định 16 — nhập để tăng/giảm tốc tàu đang chọn (trạng thái do vị trí tàu tự báo).</small>
         </label>
 
+        <div class="live-field">
+          <span>Hướng mũi tàu</span>
+          <div class="live-heading-pad" role="group" aria-label="Xoay tàu">
+            <button type="button" id="headNorthBtn" class="secondary" title="Bắc (0°)" disabled>↑</button>
+            <button type="button" id="headWestBtn" class="secondary" title="Tây (270°)" disabled>←</button>
+            <button type="button" id="rotateLeftBtn" class="secondary" title="Xoay trái 15°" disabled>↺</button>
+            <button type="button" id="rotateRightBtn" class="secondary" title="Xoay phải 15°" disabled>↻</button>
+            <button type="button" id="headEastBtn" class="secondary" title="Đông (90°)" disabled>→</button>
+            <button type="button" id="headSouthBtn" class="secondary" title="Nam (180°)" disabled>↓</button>
+          </div>
+          <small id="headingHint" class="live-hint">Phím ← → xoay · ↑ Bắc · ↓ Nam (khi đã mở khóa tàu).</small>
+        </div>
+
         <label class="live-field live-toggle">
           <span>Gửi Azure BE</span>
           <select id="sendAzureSelect">
@@ -64,10 +85,25 @@
           <button id="refreshBtn" type="button" class="secondary">Làm mới</button>
         </div>
 
+        <section class="live-incidents" id="incidentsCard">
+          <div class="live-incidents-head">
+            <h2>Sự cố mở</h2>
+            <button id="refreshIncidentsBtn" type="button" class="secondary live-mini-btn">Tải lại</button>
+          </div>
+          <p id="incidentsHubHint" class="live-hint">Hub incidents · chờ dữ liệu…</p>
+          <div id="incidentsList" class="live-incidents-list">
+            <p class="live-incidents-empty">Chưa có sự cố mở.</p>
+          </div>
+        </section>
+
         <section class="live-status" id="statusCard">
           <div class="live-status-row">
             <span>Hub / relay</span>
             <b id="hubStatus">…</b>
+          </div>
+          <div class="live-status-row">
+            <span>Hub sự cố</span>
+            <b id="incidentsHubStatus">…</b>
           </div>
           <div class="live-status-row">
             <span>Gửi gần nhất</span>
@@ -78,20 +114,30 @@
             <b id="coordStatus">—</b>
           </div>
           <div class="live-status-row">
+            <span>DB tàu</span>
+            <b id="boatDbStatus">—</b>
+          </div>
+          <div class="live-status-row">
             <span>Trạng thái</span>
             <b id="boatPhaseStatus">—</b>
+          </div>
+          <div class="live-status-row">
+            <span>Lộ trình</span>
+            <b id="boatRouteStatus">—</b>
           </div>
         </section>
 
         <p id="liveHelp" class="live-help">
-          Trạng thái do vị trí tàu · tốc độ mặc định 16 km/h (đổi ở ô vận tốc) · GPS heartbeat 5s.
+          Manager/Admin phân tàu cứu → POST /api/incidents/hook (secret, không JWT) → map đỏ + kéo tàu cứu.
         </p>
 
         <footer class="live-legend">
           <span><i class="leg-deck1"></i> 1 tầng</span>
           <span><i class="leg-deck2"></i> 2 tầng</span>
           <span><i class="leg-mute"></i> Mất tín hiệu</span>
+          <span><i class="leg-maint"></i> Bảo trì</span>
           <span><i class="leg-incident"></i> Sự cố</span>
+          <span><i class="leg-rescue"></i> Tàu cứu</span>
         </footer>
       </aside>
     </div>

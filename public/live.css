@@ -228,6 +228,14 @@
   background: #dc2626;
 }
 
+.leg-maint {
+  background: #ca8a04;
+}
+
+.leg-rescue {
+  background: #7c3aed;
+}
+
 .leg-mute {
   background: #94a3b8;
 }
@@ -381,6 +389,137 @@
 .live-ctx-menu button:hover {
   background: #ccfbf1;
   color: #115e59;
+}
+
+.live-ctx-heading-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding-top: 2px;
+}
+
+.live-ctx-heading-pad button {
+  text-align: center;
+  padding: 8px 0;
+  font-size: 14px;
+}
+
+.live-ctx-heading-pad #boatCtxHeadNorth { grid-column: 2; }
+.live-ctx-heading-pad #boatCtxHeadWest { grid-column: 1; grid-row: 2; }
+.live-ctx-heading-pad #boatCtxHeadEast { grid-column: 3; grid-row: 2; }
+.live-ctx-heading-pad #boatCtxHeadSouth { grid-column: 2; grid-row: 3; }
+
+.live-heading-pad {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.live-heading-pad #headNorthBtn { grid-column: 2; grid-row: 1; }
+.live-heading-pad #headWestBtn { grid-column: 1; grid-row: 2; }
+.live-heading-pad #rotateLeftBtn { grid-column: 2; grid-row: 2; }
+.live-heading-pad #headEastBtn { grid-column: 3; grid-row: 2; }
+.live-heading-pad #rotateRightBtn { grid-column: 1; grid-row: 3; }
+.live-heading-pad #headSouthBtn { grid-column: 2; grid-row: 3; }
+
+.live-heading-pad button {
+  min-height: 36px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.live-incidents {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(220, 38, 38, 0.18);
+  background: linear-gradient(165deg, rgba(254, 242, 242, 0.92), rgba(255, 255, 255, 0.88));
+}
+
+.live-incidents-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.live-incidents-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: #991b1b;
+}
+
+.live-mini-btn {
+  height: 28px !important;
+  padding: 0 10px !important;
+  font-size: 12px !important;
+}
+
+.live-incidents-list {
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.live-incidents-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.live-incident-item {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(220, 38, 38, 0.14);
+  background: #fff;
+}
+
+.live-incident-item strong {
+  font-size: 13px;
+  font-weight: 800;
+  color: #7f1d1d;
+}
+
+.live-incident-meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.live-incident-mission {
+  color: #6d28d9;
+  font-weight: 700;
+}
+
+.live-incident-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+.live-incident-actions select,
+.live-incident-actions button {
+  width: 100%;
+  min-height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.live-incident-actions .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
 }
 
 .toast-host {

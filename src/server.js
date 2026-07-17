@@ -46,6 +46,10 @@ const state = {
   lastAutoSavedRoute: null,
   gpsDevicesByBoatCode: new Map(),
   hubBoats: new Map(),
+  openIncidents: new Map(),
+  rescueMissions: new Map(),
+  resolvedIncidentIds: new Map(),
+  beBoatStatuses: new Map(), // boatCode|boatId → { status, boatId, boatCode, source, updatedAt }
   signalrStatus: {
     connected: false,
     hubUrl: '',
@@ -53,31 +57,106 @@ const state = {
     lastEventAt: null,
     transport: null,
   },
+  incidentsHubStatus: {
+    connected: false,
+    hubUrl: '',
+    lastError: null,
+    lastEventAt: null,
+    transport: null,
+  },
+  targetBearerToken: String(env.TARGET_BEARER_TOKEN || env.AZURE_BEARER_TOKEN || '').trim(),
+  liveHookSecret: String(env.LIVE_HOOK_SECRET || '').trim(),
   dbStatus: { ok: false, message: 'Not loaded yet', loadedAt: null },
 };
 
 let hubBroadcastTimer = null;
+let incidentsBroadcastTimer = null;
 const signalrRelay = createSignalRRelay({
+  name: 'signalr-tracking',
   getHubUrl: () => {
     const configured = cleanOptionalText(env.SIGNALR_HUB_URL);
     if (configured) return configured;
     const root = getTargetApiRoot();
     return root ? `${root}/hubs/tracking` : '';
   },
-  onBoatLocation: (payload) => {
-    upsertHubBoat(payload);
-    // Gộp broadcast để không flood SSE khi GPS ping dày.
-    if (hubBroadcastTimer) return;
-    hubBroadcastTimer = setTimeout(() => {
-      hubBroadcastTimer = null;
-      broadcast();
-    }, 200);
-  },
+  getAccessToken: () => state.targetBearerToken,
+  events: [
+    {
+      names: ['boatLocation', 'BoatLocationUpdated'],
+      onEvent: (payload) => {
+        upsertHubBoat(payload);
+        // Gộp broadcast để không flood SSE khi GPS ping dày.
+        if (hubBroadcastTimer) return;
+        hubBroadcastTimer = setTimeout(() => {
+          hubBroadcastTimer = null;
+          broadcast();
+        }, 200);
+      },
+    },
+    {
+      names: ['BoatStatusUpdated', 'boatStatusUpdated'],
+      onEvent: (payload) => {
+        applyBoatStatusesFromBePayload(payload, 'tracking:BoatStatusUpdated');
+        scheduleIncidentsBroadcast();
+      },
+    },
+  ],
   onStatus: (status) => {
     state.signalrStatus = status;
     broadcast();
   },
 });
+
+const incidentsRelay = createSignalRRelay({
+  name: 'signalr-incidents',
+  getHubUrl: () => {
+    const configured = cleanOptionalText(env.SIGNALR_INCIDENTS_HUB_URL);
+    if (configured) return configured;
+    const root = getTargetApiRoot();
+    return root ? `${root}/hubs/incidents` : '';
+  },
+  getAccessToken: () => state.targetBearerToken,
+  events: [
+    {
+      names: ['IncidentUpdated', 'incidentUpdated'],
+      onEvent: (payload) => {
+        upsertIncidentFromHub(payload, 'IncidentUpdated');
+        applyBoatStatusesFromBePayload(payload, 'IncidentUpdated');
+        scheduleIncidentsBroadcast();
+        // Đồng bộ list Open từ BE (staff app báo sự cố → Live nhận ngay).
+        refreshOpenIncidents({ force: false }).catch(() => {});
+      },
+    },
+    {
+      names: ['RescueDispatched', 'rescueDispatched'],
+      onEvent: (payload) => {
+        upsertIncidentFromHub(payload, 'RescueDispatched');
+        applyBoatStatusesFromBePayload(payload, 'RescueDispatched');
+        scheduleIncidentsBroadcast();
+        refreshOpenIncidents({ force: false }).catch(() => {});
+      },
+    },
+    {
+      names: ['BoatStatusUpdated', 'boatStatusUpdated', 'BoatUpdated', 'boatUpdated'],
+      onEvent: (payload) => {
+        applyBoatStatusesFromBePayload(payload, 'BoatStatusUpdated');
+        scheduleIncidentsBroadcast();
+      },
+    },
+  ],
+  onStatus: (status) => {
+    state.incidentsHubStatus = status;
+    broadcast();
+  },
+});
+
+function scheduleIncidentsBroadcast() {
+  if (incidentsBroadcastTimer) return;
+  incidentsBroadcastTimer = setTimeout(() => {
+    incidentsBroadcastTimer = null;
+    broadcast();
+  }, 150);
+}
 
 const boatsSql = `
 with default_route as (
@@ -101,7 +180,26 @@ select coalesce(jsonb_agg(jsonb_build_object(
 )), '[]'::jsonb)
 from boats b
 left join latest_trip t on t.boat_id = b.boat_id
-where coalesce(b.status, '') ilike 'active';
+where coalesce(b.status, '') ilike 'active'
+   or coalesce(b.status, '') ilike 'undermaintenance'
+   or coalesce(b.status, '') ilike 'incident';
+`;
+
+/** Poll nhẹ — chỉ status tàu từ Neon (nhận Active/Bảo trì/Sự cố ngay khi bạn cập nhật DB). */
+const boatStatusSql = `
+select coalesce(jsonb_agg(jsonb_build_object(
+  'boatId', b.boat_id,
+  'boatCode', b.boat_code,
+  'boatName', b.boat_name,
+  'status', b.status,
+  'maxSpeedKmh', b.max_speed_kmh,
+  'numberOfDecks', b.number_of_decks
+)), '[]'::jsonb)
+from boats b
+where coalesce(b.status, '') ilike 'active'
+   or coalesce(b.status, '') ilike 'undermaintenance'
+   or coalesce(b.status, '') ilike 'incident'
+   or coalesce(b.status, '') ilike 'inactive';
 `;
 
 const routesSql = `
@@ -170,10 +268,21 @@ let boatsLatestLastError = null;
 
 await refreshFromDatabase();
 setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 15000));
+// Status tàu từ Neon ~2s — cập nhật DB là Live GPS nhận gần như ngay.
+setInterval(() => {
+  refreshBoatStatusesFromDatabase().catch((error) => {
+    console.warn(`[boat-status] ${error.message}`);
+  });
+}, Math.max(1000, Number(env.BOAT_STATUS_POLL_MS || 2000)));
 setInterval(tickSimulator, 1000);
 setInterval(publishGpsPositions, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(pruneStaleHubBoats, 5000);
+setInterval(() => {
+  tickRescueMissions().catch((error) => {
+    console.warn(`[rescue-gps] ${error.message}`);
+  });
+}, Math.max(1000, Number(env.RESCUE_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
 // BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
 setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
 
@@ -216,6 +325,7 @@ const server = createServer(async (req, res) => {
       if (body.enabled !== undefined) state.senderEnabled = Boolean(body.enabled);
       if (body.endpoint !== undefined) state.targetEndpoint = cleanOptionalText(body.endpoint) || '';
       if (body.apiKey !== undefined) state.targetApiKey = cleanOptionalText(body.apiKey) || '';
+      if (body.bearerToken !== undefined) state.targetBearerToken = cleanOptionalText(body.bearerToken) || '';
       broadcast();
       return sendJson(res, publicConfig());
     }
@@ -262,6 +372,81 @@ const server = createServer(async (req, res) => {
           code: error.code || undefined,
         }, error.status || 500);
       }
+    }
+    if (url.pathname === '/api/incidents/hook' && req.method === 'POST') {
+      const body = await readJson(req);
+      const result = ingestIncidentHook(body, req);
+      return sendJson(res, result, result.ok ? 200 : (result.status || 401));
+    }
+    if (url.pathname === '/api/incidents' && req.method === 'GET') {
+      const resolutionStatus = url.searchParams.get('resolutionStatus') || 'Open';
+      const result = await listIncidents({ resolutionStatus });
+      return sendJson(res, result, result.ok ? 200 : (result.status || 502));
+    }
+    if (url.pathname === '/api/incidents' && req.method === 'POST') {
+      const body = await readJson(req);
+      const result = await createIncident(body);
+      return sendJson(res, result, result.ok ? 200 : (result.status || 400));
+    }
+    {
+      const assignMatch = url.pathname.match(/^\/api\/incidents\/([^/]+)\/assign-replacement-boat$/);
+      if (assignMatch && req.method === 'PATCH') {
+        const body = await readJson(req);
+        const result = await assignReplacementBoat(decodeURIComponent(assignMatch[1]), body);
+        return sendJson(res, result, result.ok ? 200 : (result.status || 400));
+      }
+    }
+    {
+      const resolveMatch = url.pathname.match(/^\/api\/incidents\/([^/]+)\/resolve$/);
+      if (resolveMatch && req.method === 'PATCH') {
+        const body = await readJson(req);
+        const result = await resolveIncident(decodeURIComponent(resolveMatch[1]), body);
+        return sendJson(res, result, result.ok ? 200 : (result.status || 400));
+      }
+    }
+    if (url.pathname === '/api/incidents/refresh' && req.method === 'POST') {
+      await refreshFromDatabase();
+      const result = state.targetBearerToken
+        ? await refreshOpenIncidents({ force: true })
+        : { ok: true, status: 200, error: null };
+      syncStatusesWithNeon();
+      broadcast();
+      return sendJson(res, {
+        ok: true,
+        status: 200,
+        azureOk: Boolean(result.ok),
+        error: result.error || null,
+        count: state.openIncidents.size,
+        incidents: [...state.openIncidents.values()],
+      });
+    }
+    if (url.pathname === '/api/incidents/clear-stale' && req.method === 'POST') {
+      const before = state.openIncidents.size;
+      syncStatusesWithNeon();
+      // Xóa toàn bộ sự cố hook/local còn sót (demo).
+      for (const [id, row] of [...state.openIncidents.entries()]) {
+        const src = String(row.source || '');
+        if (src === 'hook' || src === 'local' || src.startsWith('local')) {
+          state.openIncidents.delete(id);
+          clearBeBoatStatus(row.boatCode || row.boatId);
+        }
+      }
+      for (const boat of state.boats.values()) {
+        if (normalizeBoatStatus(boat.dbStatus) === 'active' && !hasOpenIncidentForBoat(boat)) {
+          clearBeBoatStatus(boat);
+        }
+      }
+      broadcast();
+      return sendJson(res, {
+        ok: true,
+        cleared: Math.max(0, before - state.openIncidents.size),
+        openCount: state.openIncidents.size,
+        boats: [...state.boats.values()].map((b) => ({
+          boatCode: b.boatCode,
+          neonStatus: b.dbStatus,
+          effectiveStatus: effectiveBoatStatus(b),
+        })),
+      });
     }
     if (url.pathname === '/api/collector/start' && req.method === 'POST') {
       const body = await readJson(req);
@@ -374,14 +559,57 @@ server.on('error', (error) => {
 
 server.listen(port, '0.0.0.0', () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
+  const hookMode = Boolean(String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim());
+  const jwtMode = Boolean(state.targetBearerToken);
+  if (hookMode) {
+    console.log('[incidents] nhận lệnh qua webhook POST /api/incidents/hook (không cần JWT)');
+  }
   signalrRelay.start().catch((error) => {
     console.warn(`[signalr-relay] start: ${error.message}`);
   });
+  // Chỉ nối hub/poll Azure incidents khi có JWT. Hook mode thì bỏ qua (tránh 401 spam).
+  if (jwtMode) {
+    incidentsRelay.start().catch((error) => {
+      console.warn(`[signalr-incidents] start: ${error.message}`);
+    });
+    refreshOpenIncidents({ force: true }).catch((error) => {
+      console.warn(`[incidents] seed: ${error.message}`);
+    });
+    const incidentsPollMs = Math.max(5000, Number(env.INCIDENTS_POLL_MS || 8000));
+    setInterval(() => {
+      refreshOpenIncidents({ force: false }).catch(() => {});
+    }, incidentsPollMs);
+  } else if (hookMode) {
+    state.incidentsHubStatus = {
+      connected: false,
+      hubUrl: '',
+      lastError: null,
+      lastEventAt: null,
+      transport: 'webhook',
+      mode: 'hook',
+    };
+  } else {
+    console.warn('[incidents] Chưa có LIVE_HOOK_SECRET lẫn TARGET_BEARER_TOKEN — chỉ demo local');
+  }
   // BE: GET /api/tracking/boats/latest lần đầu rồi poll (fallback khi hub chưa có).
   pollLatestBoatLocations({ force: true }).catch((error) => {
     console.warn(`[boats-latest] seed: ${error.message}`);
   });
 });
+
+function normalizeBoatStatus(value) {
+  return String(value || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function canonicalBoatStatus(value) {
+  const n = normalizeBoatStatus(value);
+  if (n === 'undermaintenance') return 'UnderMaintenance';
+  if (n === 'incident') return 'Incident';
+  if (n === 'active') return 'Active';
+  if (n === 'inactive') return 'Inactive';
+  if (n === 'retired') return 'Retired';
+  return null;
+}
 
 function isActiveBoatCode(boatCode) {
   const code = String(boatCode || '').trim();
@@ -392,7 +620,187 @@ function isActiveBoatCode(boatCode) {
     && row.boatId !== 'fallback-boat'
   ));
   if (!boat) return false;
-  return String(boat.dbStatus || '').trim().toLowerCase() === 'active';
+  return effectiveBoatStatus(boat) === 'Active';
+}
+
+/** Live map: Active + UnderMaintenance + Incident (FE báo sự cố → DB = Incident, vẫn hiện đỏ). */
+function isLiveMapBoatCode(boatCode) {
+  const code = String(boatCode || '').trim();
+  if (!code) return false;
+  const boat = [...state.boats.values()].find((row) => (
+    String(row.boatCode || '').trim() === code
+    && !String(row.boatId || '').startsWith('collector-')
+    && row.boatId !== 'fallback-boat'
+  ));
+  if (!boat) {
+    // Vẫn giữ hub nếu đang có sự cố mở (DB chưa kịp refresh).
+    return [...state.openIncidents.values()].some((row) => String(row.boatCode || '').trim() === code);
+  }
+  const status = normalizeBoatStatus(effectiveBoatStatus(boat));
+  return status === 'active' || status === 'undermaintenance' || status === 'incident';
+}
+
+/** Ưu tiên status BE chỉ khi còn sự cố mở; không thì tin Neon DB. */
+function beStatusForBoat(boatOrCode) {
+  if (!boatOrCode) return null;
+  if (typeof boatOrCode === 'object') {
+    const code = String(boatOrCode.boatCode || '').trim();
+    const id = String(boatOrCode.boatId || '').trim();
+    return state.beBoatStatuses.get(code)?.status
+      || state.beBoatStatuses.get(id)?.status
+      || boatOrCode.beStatus
+      || null;
+  }
+  const key = String(boatOrCode).trim();
+  return state.beBoatStatuses.get(key)?.status || null;
+}
+
+function hasOpenIncidentForBoat(boatOrCode) {
+  const code = String(
+    typeof boatOrCode === 'object' ? (boatOrCode.boatCode || '') : boatOrCode || '',
+  ).trim();
+  const id = String(
+    typeof boatOrCode === 'object' ? (boatOrCode.boatId || '') : '',
+  ).trim();
+  for (const row of state.openIncidents.values()) {
+    if (code && String(row.boatCode || '').trim() === code) return true;
+    if (id && String(row.boatId || '') === id) return true;
+  }
+  return false;
+}
+
+function clearBeBoatStatus(boatOrCode) {
+  const boat = typeof boatOrCode === 'object' ? boatOrCode : boatByIdOrCode(boatOrCode);
+  const code = String(boat?.boatCode || (typeof boatOrCode === 'string' ? boatOrCode : '') || '').trim();
+  const id = String(boat?.boatId || '').trim();
+  if (code) state.beBoatStatuses.delete(code);
+  if (id) state.beBoatStatuses.delete(id);
+  if (boat) boat.beStatus = null;
+  if (code && state.hubBoats.has(code)) {
+    const hub = state.hubBoats.get(code);
+    state.hubBoats.set(code, { ...hub, boatStatus: null, beStatus: null });
+  }
+}
+
+function effectiveBoatStatus(boatOrCode) {
+  const boat = typeof boatOrCode === 'object' ? boatOrCode : boatByIdOrCode(boatOrCode);
+  const neon = canonicalBoatStatus(boat?.dbStatus) || boat?.dbStatus || null;
+  // Còn sự cố mở → hiện Sự cố / Bảo trì.
+  if (hasOpenIncidentForBoat(boatOrCode) || hasOpenIncidentForBoat(boat)) {
+    return beStatusForBoat(boatOrCode) || 'Incident';
+  }
+  // Neon đã là Incident → giữ hiện đỏ trên map.
+  if (normalizeBoatStatus(neon) === 'incident') return 'Incident';
+  return neon;
+}
+
+function applyBeBoatStatus({ boatId = null, boatCode = null, status, source = 'be' } = {}) {
+  const canon = canonicalBoatStatus(status);
+  if (!canon) return false;
+  const boat = boatByIdOrCode(boatId || boatCode);
+  const code = String(boat?.boatCode || boatCode || '').trim();
+  const id = String(boat?.boatId || boatId || '').trim();
+  if (!code && !id) return false;
+
+  const row = {
+    status: canon,
+    boatId: id || null,
+    boatCode: code || null,
+    source,
+    updatedAt: new Date().toISOString(),
+  };
+  if (code) state.beBoatStatuses.set(code, row);
+  if (id) state.beBoatStatuses.set(id, row);
+
+  if (boat) {
+    boat.beStatus = canon;
+  }
+  if (code && state.hubBoats.has(code)) {
+    const hub = state.hubBoats.get(code);
+    state.hubBoats.set(code, { ...hub, boatStatus: canon, beStatus: canon });
+  }
+  return true;
+}
+
+function applyBoatStatusesFromBePayload(payload, source = 'be') {
+  if (!payload || typeof payload !== 'object') return;
+  const rows = extractIncidentRows(payload);
+  if (!rows.length) rows.push(payload);
+
+  for (const row of rows) {
+    const nested = row.incident && typeof row.incident === 'object' ? row.incident : row;
+    const boatId = nested.boatId || nested.BoatId || row.boatId || null;
+    const boatCode = nested.boatCode || nested.BoatCode || row.boatCode || boatCodeFromId(boatId);
+    const resolution = String(
+      nested.resolutionStatus || nested.ResolutionStatus || row.resolutionStatus || '',
+    ).toLowerCase();
+    const explicit = nested.boatStatus || nested.BoatStatus
+      || row.boatStatus || row.BoatStatus
+      || nested.status || nested.Status
+      || null;
+
+    if (explicit && canonicalBoatStatus(explicit)) {
+      applyBeBoatStatus({ boatId, boatCode, status: explicit, source });
+      continue;
+    }
+    if (resolution === 'open' || source === 'IncidentUpdated' || source === 'RescueDispatched') {
+      if (!resolution || resolution === 'open') {
+        applyBeBoatStatus({ boatId, boatCode, status: 'Incident', source });
+      } else {
+        applyBeBoatStatus({ boatId, boatCode, status: 'Active', source });
+      }
+    }
+  }
+}
+
+/**
+ * Đồng bộ nhẹ với Neon — KHÔNG tự đóng sự cố hook/FE.
+ * Sự cố chỉ đóng khi: IncidentResolved / clear-stale / BoatStatusUpdated Active từ hook.
+ */
+function syncStatusesWithNeon() {
+  let changed = false;
+
+  for (const boat of state.boats.values()) {
+    const code = String(boat.boatCode || '').trim();
+    if (!code) continue;
+    const neon = normalizeBoatStatus(boat.dbStatus);
+
+    if (hasOpenIncidentForBoat(boat)) {
+      // FE/Manager đang có sự cố mở → giữ Sự cố + hiện map (không ẩn).
+      if (beStatusForBoat(boat) !== 'Incident' && beStatusForBoat(boat) !== 'UnderMaintenance') {
+        applyBeBoatStatus({
+          boatId: boat.boatId,
+          boatCode: boat.boatCode,
+          status: 'Incident',
+          source: 'open-incident',
+        });
+        changed = true;
+      }
+      boat.beStatus = 'Incident';
+      continue;
+    }
+
+    // Không còn sự cố → tin Neon (Incident trên DB vẫn hiện).
+    if (neon === 'active') {
+      if (beStatusForBoat(boat)) {
+        clearBeBoatStatus(boat);
+        changed = true;
+      }
+      boat.beStatus = null;
+    } else if (neon === 'incident') {
+      boat.beStatus = 'Incident';
+    }
+  }
+  return changed;
+}
+
+function reapplyBeBoatStatusesToCatalog() {
+  syncStatusesWithNeon();
+  for (const boat of state.boats.values()) {
+    const effective = effectiveBoatStatus(boat);
+    boat.beStatus = hasOpenIncidentForBoat(boat) ? (beStatusForBoat(boat) || 'Incident') : null;
+    void effective;
+  }
 }
 
 /**
@@ -451,8 +859,8 @@ function upsertHubBoat(payload) {
   const lat = Number(payload.lat);
   const lng = Number(payload.lng);
   if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
-  // Không hiện / giữ hub cho tàu không Active.
-  if (!isActiveBoatCode(code)) {
+  // Không hiện / giữ hub cho tàu không thuộc Live map (Active / UnderMaintenance / đang sự cố).
+  if (!isLiveMapBoatCode(code)) {
     state.hubBoats.delete(code);
     return;
   }
@@ -536,7 +944,9 @@ function pruneStaleHubBoats() {
   const now = Date.now();
   let changed = false;
   for (const [code, boat] of [...state.hubBoats.entries()]) {
-    if (!isActiveBoatCode(code)) {
+    // Tàu đang sự cố: luôn giữ marker (đỏ), không ẩn vì mất ping.
+    if (hasOpenIncidentForBoat(code)) continue;
+    if (!isLiveMapBoatCode(code)) {
       state.hubBoats.delete(code);
       changed = true;
       continue;
@@ -638,6 +1048,84 @@ async function loadEnv() {
     if (!values[key]) values[key] = value;
   }
   return values;
+}
+
+async function refreshBoatStatusesFromDatabase() {
+  if (!dbPool) return;
+  const rows = await queryJson(boatStatusSql);
+  if (!Array.isArray(rows)) return;
+
+  let changed = false;
+  let needFullRefresh = false;
+  const activeLikeIds = new Set();
+
+  for (const row of rows) {
+    const id = row.boatId;
+    const code = String(row.boatCode || '').trim();
+    if (!id || !code) continue;
+    const status = String(row.status || '').trim();
+    const statusNorm = normalizeBoatStatus(status);
+
+    if (statusNorm === 'active' || statusNorm === 'undermaintenance' || statusNorm === 'incident') {
+      activeLikeIds.add(id);
+    }
+
+    let boat = state.boats.get(id);
+    if (!boat) {
+      boat = [...state.boats.values()].find((b) => String(b.boatCode) === code);
+    }
+    if (!boat) {
+      if (statusNorm === 'active' || statusNorm === 'undermaintenance' || statusNorm === 'incident') {
+        needFullRefresh = true;
+      }
+      continue;
+    }
+
+    const prevStatus = String(boat.dbStatus || '');
+    if (prevStatus !== status) {
+      boat.dbStatus = status;
+      changed = true;
+      console.log(`[boat-status] ${code}: ${prevStatus || '—'} → ${status}`);
+    }
+    if (row.boatName && boat.boatName !== row.boatName) {
+      boat.boatName = row.boatName;
+      changed = true;
+    }
+    if (Number.isFinite(Number(row.maxSpeedKmh))) {
+      boat.maxSpeedKmh = Number(row.maxSpeedKmh);
+    }
+    if (Number.isFinite(Number(row.numberOfDecks))) {
+      boat.numberOfDecks = Number(row.numberOfDecks) || 1;
+    }
+
+    // Inactive trên DB → bỏ khỏi catalog live, TRỪ khi đang có sự cố mở (vẫn phải hiện đỏ).
+    if (statusNorm === 'inactive' || statusNorm === 'retired') {
+      if (hasOpenIncidentForBoat(boat) || hasOpenIncidentForBoat(code)) {
+        boat.dbStatus = status;
+        applyBeBoatStatus({
+          boatId: boat.boatId,
+          boatCode: code,
+          status: 'Incident',
+          source: 'incident-keep-visible',
+        });
+        changed = true;
+      } else {
+        state.boats.delete(boat.boatId);
+        clearBeBoatStatus(boat);
+        if (code) state.hubBoats.delete(code);
+        changed = true;
+      }
+    }
+  }
+
+  if (needFullRefresh) {
+    await refreshFromDatabase();
+    return;
+  }
+  if (changed) {
+    syncStatusesWithNeon();
+    broadcast();
+  }
 }
 
 async function refreshFromDatabase() {
@@ -776,12 +1264,15 @@ async function refreshFromDatabase() {
       boats.map((boat) => String(boat.boatCode || '').trim()).filter(Boolean),
     );
     for (const boatId of [...state.boats.keys()]) {
+      const row = state.boats.get(boatId);
+      if (hasOpenIncidentForBoat(row) || hasOpenIncidentForBoat(row?.boatCode)) continue;
       if (!activeBoatIds.has(boatId) && !String(boatId).startsWith('collector-') && boatId !== 'fallback-boat') {
         state.boats.delete(boatId);
       }
     }
-    // Tàu Inactive: bỏ hub + không còn gửi/hiện GPS live.
+    // Tàu Inactive: bỏ hub — trừ tàu đang sự cố (vẫn hiện đỏ).
     for (const code of [...state.hubBoats.keys()]) {
+      if (hasOpenIncidentForBoat(code)) continue;
       if (!activeBoatCodes.has(code)) state.hubBoats.delete(code);
     }
 
@@ -797,6 +1288,8 @@ async function refreshFromDatabase() {
     } else {
       state.dbStatus = { ok: true, message: `Loaded ${boats.length} boat(s), ${routes.length} route(s)`, loadedAt: new Date().toISOString() };
     }
+    // Neon là nguồn truth; bỏ cache Bảo trì/sự cố hook khi DB đã Active.
+    reapplyBeBoatStatusesToCatalog();
     broadcast();
   } catch (error) {
     state.dbStatus = { ok: false, message: error.message, loadedAt: new Date().toISOString() };
@@ -1079,7 +1572,7 @@ async function publishLiveGpsPosition(body = {}) {
     throw err;
   }
 
-  if (!isActiveBoatCode(boatCode)) {
+  if (!isLiveMapBoatCode(boatCode)) {
     state.hubBoats.delete(boatCode);
     return {
       ok: false,
@@ -1099,7 +1592,7 @@ async function publishLiveGpsPosition(body = {}) {
   const matched = [...state.boats.values()].find((boat) => (
     String(boat.boatCode) === boatCode
     && !String(boat.boatId || '').startsWith('collector-')
-    && String(boat.dbStatus || '').trim().toLowerCase() === 'active'
+    && isLiveMapBoatCode(boatCode)
   ));
   const deviceId = deviceIdForBoat({ boatCode, boatId: matched?.boatId });
   const prev = state.hubBoats.get(boatCode);
@@ -1495,21 +1988,47 @@ function azureTravelMinutes(value) {
 }
 
 async function getFromTargetApi(pathname, deviceId, { silent = false } = {}) {
+  return requestTargetApi({
+    method: 'GET',
+    pathname,
+    deviceId,
+    silent,
+    auth: 'gps',
+  });
+}
+
+async function requestTargetApi({
+  method = 'GET',
+  pathname,
+  payload = null,
+  deviceId = null,
+  silent = false,
+  auth = 'gps',
+} = {}) {
   const url = targetApiUrl(pathname);
   if (!url) {
-    const result = { ok: false, error: 'Chua cau hinh TARGET_GPS_ENDPOINT', status: 400, at: new Date().toISOString(), path: pathname };
-    if (!silent) pushApiCallLog({ method: 'GET', ...result, request: null, url: null });
+    const result = {
+      ok: false,
+      error: 'Chua cau hinh TARGET_GPS_ENDPOINT',
+      status: 400,
+      at: new Date().toISOString(),
+      path: pathname,
+      data: null,
+    };
+    if (!silent) pushApiCallLog({ method, ...result, request: summarizeApiPayload(payload), url: null });
     return result;
   }
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: buildGpsHeaders({ deviceId }),
-    });
+    const headers = auth === 'bearer' ? buildBearerHeaders() : buildGpsHeaders({ deviceId });
+    const init = { method, headers };
+    if (payload != null && method !== 'GET' && method !== 'HEAD') {
+      init.body = JSON.stringify(payload);
+    }
+    const response = await fetch(url, init);
     let data = null;
-    const text = await response.text();
-    if (text) {
-      try { data = JSON.parse(text); } catch { data = { message: text }; }
+    const textBody = await response.text();
+    if (textBody) {
+      try { data = JSON.parse(textBody); } catch { data = { message: textBody }; }
     }
     const result = {
       ok: response.status >= 200 && response.status < 300,
@@ -1520,41 +2039,991 @@ async function getFromTargetApi(pathname, deviceId, { silent = false } = {}) {
       path: pathname,
     };
     if (!result.ok) {
-      result.error = data?.error || data?.message || data?.title || `BE tra ${response.status}`;
+      result.error = formatTargetApiError(data, response.status);
+      if (response.status === 401 && auth === 'bearer') {
+        result.error = `${result.error} · Cần TARGET_BEARER_TOKEN (JWT Staff/Admin)`;
+      }
     }
     if (!silent) {
       pushApiCallLog({
-        method: 'GET',
+        method,
         url,
         path: pathname,
         ok: result.ok,
         status: result.status,
         error: result.error,
         at: result.at,
-        request: null,
+        request: summarizeApiPayload(payload),
         response: summarizeApiPayload(data),
         deviceId: deviceId || null,
+        auth,
       });
     }
     return result;
   } catch (error) {
-    const result = { ok: false, status: 502, data: null, error: error.message, at: new Date().toISOString(), path: pathname };
+    const result = {
+      ok: false,
+      status: 502,
+      data: null,
+      error: error.message,
+      at: new Date().toISOString(),
+      path: pathname,
+    };
     if (!silent) {
       pushApiCallLog({
-        method: 'GET',
+        method,
         url,
         path: pathname,
         ok: false,
         status: 502,
         error: error.message,
         at: result.at,
-        request: null,
+        request: summarizeApiPayload(payload),
         response: null,
         deviceId: deviceId || null,
+        auth,
       });
     }
     return result;
   }
+}
+
+function buildBearerHeaders() {
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  const token = String(state.targetBearerToken || '').trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (state.targetApiKey) headers['X-Api-Key'] = state.targetApiKey;
+  return headers;
+}
+
+function boatByIdOrCode(boatIdOrCode) {
+  const key = String(boatIdOrCode || '').trim();
+  if (!key) return null;
+  return [...state.boats.values()].find((b) => (
+    String(b.boatId || '') === key
+    || String(b.boatCode || '').trim() === key
+  )) || null;
+}
+
+function boatCodeFromId(boatId) {
+  const boat = boatByIdOrCode(boatId);
+  return boat?.boatCode || null;
+}
+
+function extractIncidentRows(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== 'object') return [];
+  for (const key of ['items', 'data', 'incidents', 'results', 'value']) {
+    if (Array.isArray(data[key])) return data[key];
+  }
+  if (data.incidentId || data.id || data.IncidentId) return [data];
+  return [];
+}
+
+function normalizeIncident(row, source = 'api') {
+  if (!row || typeof row !== 'object') return null;
+  const nested = row.incident && typeof row.incident === 'object' ? row.incident : row;
+  const incidentId = String(
+    nested.incidentId || nested.id || nested.IncidentId || nested.Id || '',
+  ).trim();
+  if (!incidentId) return null;
+
+  const boatId = nested.boatId || nested.BoatId || row.boatId || null;
+  const boatCode = String(
+    nested.boatCode || nested.BoatCode || boatCodeFromId(boatId) || '',
+  ).trim() || null;
+  const replacementBoatId = nested.replacementBoatId
+    || nested.ReplacementBoatId
+    || row.replacementBoatId
+    || null;
+  const replacementBoatCode = String(
+    nested.replacementBoatCode
+    || nested.ReplacementBoatCode
+    || boatCodeFromId(replacementBoatId)
+    || '',
+  ).trim() || null;
+
+  const lat = Number(
+    nested.lat ?? nested.latitude ?? nested.Latitude
+    ?? nested.location?.lat ?? nested.Location?.lat
+    ?? row.lat ?? row.latitude,
+  );
+  const lng = Number(
+    nested.lng ?? nested.longitude ?? nested.Longitude
+    ?? nested.location?.lng ?? nested.Location?.lng
+    ?? row.lng ?? row.longitude,
+  );
+
+  const resolutionStatus = String(
+    nested.resolutionStatus || nested.ResolutionStatus || 'Open',
+  ).trim() || 'Open';
+
+  return {
+    incidentId,
+    boatId: boatId || null,
+    boatCode,
+    boatName: nested.boatName || nested.BoatName || boatByIdOrCode(boatId)?.boatName || null,
+    tripId: nested.tripId || nested.TripId || null,
+    incidentType: nested.incidentType || nested.IncidentType || null,
+    severity: nested.severity || nested.Severity || null,
+    description: nested.description || nested.Description || null,
+    resolutionStatus,
+    resolutionNote: nested.resolutionNote || nested.ResolutionNote || null,
+    replacementBoatId: replacementBoatId || null,
+    replacementBoatCode,
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+    occurredAt: nested.occurredAt || nested.OccurredAt || nested.createdAt || null,
+    updatedAt: nested.updatedAt || nested.UpdatedAt || new Date().toISOString(),
+    source,
+    raw: nested,
+  };
+}
+
+function upsertIncidentRecord(incident, { removeIfResolved = true } = {}) {
+  if (!incident?.incidentId) return false;
+  const status = String(incident.resolutionStatus || '').toLowerCase();
+  const isOpen = !status || status === 'open';
+  if (removeIfResolved && !isOpen) {
+    return state.openIncidents.delete(incident.incidentId);
+  }
+  const prev = state.openIncidents.get(incident.incidentId) || {};
+  state.openIncidents.set(incident.incidentId, {
+    ...prev,
+    ...incident,
+    lat: incident.lat ?? prev.lat ?? null,
+    lng: incident.lng ?? prev.lng ?? null,
+    boatCode: incident.boatCode || prev.boatCode || null,
+    replacementBoatCode: incident.replacementBoatCode || prev.replacementBoatCode || null,
+  });
+  return true;
+}
+
+function rescueMissionPublic(mission) {
+  if (!mission) return null;
+  const { publishing, ...publicMission } = mission;
+  return publicMission;
+}
+
+function completeRescueMission(incidentId, reason = 'IncidentResolved') {
+  const id = String(incidentId || '').trim();
+  if (!id) return null;
+  const mission = state.rescueMissions.get(id);
+  if (!mission) return null;
+  Object.assign(mission, {
+    status: 'Completed',
+    completedReason: reason,
+    completedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    publishing: false,
+  });
+  return mission;
+}
+
+function nearestStationTo(point) {
+  let nearest = null;
+  for (const station of state.stations || []) {
+    const lat = Number(station?.lat);
+    const lng = Number(station?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const meters = distanceMeters(point, { lat, lng });
+    if (!nearest || meters < nearest.meters) {
+      nearest = { station, lat, lng, meters };
+    }
+  }
+  return nearest;
+}
+
+function pointBehind(position, heading, meters) {
+  const reverseRad = ((Number(heading) + 180) % 360) * Math.PI / 180;
+  const lat = Number(position.lat);
+  const lng = Number(position.lng);
+  const northMeters = Math.cos(reverseRad) * meters;
+  const eastMeters = Math.sin(reverseRad) * meters;
+  const latOffset = northMeters / 111320;
+  const lngScale = 111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180));
+  return {
+    lat: lat + latOffset,
+    lng: lng + (eastMeters / lngScale),
+  };
+}
+
+/**
+ * Nhận RescueDispatched một lần rồi tự phát GPS tàu cứu tới hiện trường,
+ * sau đó kéo cả tàu lỗi về bến gần hiện trường nhất.
+ * Duplicate incidentId không tạo thêm vòng chạy.
+ */
+function startRescueAutomation(incident) {
+  const incidentId = String(incident?.incidentId || '').trim();
+  const rescueBoatCode = String(incident?.replacementBoatCode || '').trim();
+  const targetLat = Number(incident?.lat);
+  const targetLng = Number(incident?.lng);
+  if (!incidentId || !rescueBoatCode) {
+    return { started: false, error: 'Thiếu incidentId / replacementBoatCode' };
+  }
+  if (!Number.isFinite(targetLat) || !Number.isFinite(targetLng)) {
+    return { started: false, error: 'Chưa có tọa độ tàu sự cố' };
+  }
+
+  const existing = state.rescueMissions.get(incidentId);
+  if (existing && existing.rescueBoatCode === rescueBoatCode) {
+    if (existing.status === 'Dispatched' || existing.status === 'InTransit') {
+      existing.targetLat = targetLat;
+      existing.targetLng = targetLng;
+      existing.incidentLat = targetLat;
+      existing.incidentLng = targetLng;
+    }
+    existing.updatedAt = new Date().toISOString();
+    return { started: false, duplicate: true, mission: rescueMissionPublic(existing) };
+  }
+
+  const rescueBoat = boatByIdOrCode(rescueBoatCode);
+  const hub = state.hubBoats.get(rescueBoatCode);
+  const startLat = Number(hub?.lat ?? rescueBoat?.lat);
+  const startLng = Number(hub?.lng ?? rescueBoat?.lng);
+  if (!Number.isFinite(startLat) || !Number.isFinite(startLng)) {
+    return { started: false, error: `Chưa có GPS tàu cứu ${rescueBoatCode}` };
+  }
+
+  const now = new Date().toISOString();
+  const configuredSpeed = Math.max(1, Number(env.RESCUE_SPEED_KMH || env.DEFAULT_SPEED_KMH || 16));
+  const rescueMaxSpeed = Number(rescueBoat?.maxSpeedKmh);
+  const mission = {
+    incidentId,
+    incidentBoatCode: incident.boatCode || null,
+    rescueBoatCode,
+    status: 'Dispatched',
+    currentLat: startLat,
+    currentLng: startLng,
+    targetLat,
+    targetLng,
+    incidentLat: targetLat,
+    incidentLng: targetLng,
+    speedKmh: Number.isFinite(rescueMaxSpeed)
+      ? Math.min(configuredSpeed, rescueMaxSpeed)
+      : configuredSpeed,
+    startedAt: now,
+    updatedAt: now,
+    lastTickAt: Date.now(),
+    publishing: false,
+    lastSequence: null,
+    lastPublishMode: null,
+    lastError: null,
+  };
+  state.rescueMissions.set(incidentId, mission);
+  const open = state.openIncidents.get(incidentId);
+  if (open) {
+    open.missionStatus = 'Dispatched';
+    open.updatedAt = now;
+  }
+  console.log(`[rescue-gps] ${rescueBoatCode} → ${incident.boatCode || incidentId}`);
+  return { started: true, mission: rescueMissionPublic(mission) };
+}
+
+async function tickRescueMissions() {
+  const nowMs = Date.now();
+  const arrivalMeters = Math.max(3, Number(env.RESCUE_ARRIVE_METERS || 15));
+  const active = [...state.rescueMissions.values()].filter((mission) => (
+    (mission.status === 'Dispatched' || mission.status === 'InTransit' || mission.status === 'Towing')
+    && !mission.publishing
+  ));
+
+  await Promise.all(active.map(async (mission) => {
+    mission.publishing = true;
+    try {
+      const current = { lat: Number(mission.currentLat), lng: Number(mission.currentLng) };
+      const target = { lat: Number(mission.targetLat), lng: Number(mission.targetLng) };
+      const remaining = distanceMeters(current, target);
+      const elapsedSeconds = Math.max(
+        1,
+        Math.min(10, (nowMs - Number(mission.lastTickAt || nowMs - 2000)) / 1000),
+      );
+      const stepMeters = Math.max(2, (Number(mission.speedKmh) * 1000 / 3600) * elapsedSeconds);
+      // Không teleport: mỗi tick chỉ đi tối đa stepMeters, kể cả nhịp cập bến.
+      const ratio = remaining <= 0 ? 1 : Math.min(1, stepMeters / remaining);
+      const lat = current.lat + ((target.lat - current.lat) * ratio);
+      const lng = current.lng + ((target.lng - current.lng) * ratio);
+      const heading = remaining > 0 ? bearingDegrees(current, target) : Number(mission.lastHeading || 0);
+      const arrived = distanceMeters({ lat, lng }, target) <= arrivalMeters;
+
+      const rescueResult = await publishLiveGpsPosition({
+        boatCode: mission.rescueBoatCode,
+        lat,
+        lng,
+        heading,
+        speedKmh: arrived ? 0 : mission.speedKmh,
+        status: arrived ? 'idle' : 'moving',
+        sendToTarget: true,
+      });
+      let incidentResult = null;
+      if (mission.status === 'Towing' && mission.incidentBoatCode) {
+        // Khi kéo: tàu lỗi đi sau tàu cứu. Cập bến vẫn giữ nối đuôi, không đè cùng 1 điểm rồi cluster nhảy.
+        const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
+        const berthGapMeters = Math.max(12, Number(env.TOW_BERTH_GAP_METERS || 16));
+        const towHeading = heading || Number(mission.lastHeading || 0);
+        const towedPosition = arrived
+          ? pointBehind({ lat, lng }, towHeading || bearingDegrees(current, target) || 0, berthGapMeters)
+          : pointBehind({ lat, lng }, towHeading, towRopeMeters);
+        mission.incidentCurrentLat = towedPosition.lat;
+        mission.incidentCurrentLng = towedPosition.lng;
+        mission.lastHeading = towHeading;
+        incidentResult = await publishLiveGpsPosition({
+          boatCode: mission.incidentBoatCode,
+          lat: towedPosition.lat,
+          lng: towedPosition.lng,
+          heading: towHeading,
+          speedKmh: arrived ? 0 : mission.speedKmh,
+          status: arrived ? 'idle' : 'moving',
+          sendToTarget: true,
+        });
+      } else {
+        mission.lastHeading = heading;
+      }
+      const resultOk = rescueResult.ok && (!incidentResult || incidentResult.ok);
+
+      mission.lastTickAt = nowMs;
+      mission.updatedAt = new Date().toISOString();
+      mission.lastSequence = rescueResult.sequence || null;
+      mission.incidentBoatSequence = incidentResult?.sequence || mission.incidentBoatSequence || null;
+      mission.lastPublishMode = rescueResult.mode || null;
+      mission.lastError = resultOk
+        ? null
+        : (rescueResult.error || incidentResult?.error || 'Không gửi được GPS kéo tàu');
+      // Vẫn cập nhật vị trí local để map nối đuôi; chỉ dừng nếu tàu cứu cũng lỗi cứng.
+      if (!rescueResult.ok) return;
+
+      mission.currentLat = lat;
+      mission.currentLng = lng;
+      if (!arrived) {
+        mission.status = mission.status === 'Towing' ? 'Towing' : 'InTransit';
+      } else if (mission.status === 'Towing') {
+        mission.status = 'AtStation';
+        mission.stationArrivedAt = mission.updatedAt;
+        // Nhả tàu cứu: về trạng thái bình thường trên map / hub.
+        clearBeBoatStatus(mission.rescueBoatCode);
+        const rescueBoat = boatByIdOrCode(mission.rescueBoatCode);
+        if (rescueBoat && normalizeBoatStatus(rescueBoat.dbStatus) !== 'incident') {
+          rescueBoat.beStatus = null;
+          if (normalizeBoatStatus(rescueBoat.dbStatus) === 'undermaintenance') {
+            // giữ db Neon; chỉ bỏ override cứu hộ
+          }
+        }
+        const hubRescue = state.hubBoats.get(mission.rescueBoatCode);
+        if (hubRescue) {
+          hubRescue.boatStatus = rescueBoat?.dbStatus || 'Active';
+          hubRescue.beStatus = null;
+        }
+        console.log(
+          `[rescue-gps] đã về ${mission.destinationStationCode || 'bến'} — `
+          + `nhả ${mission.rescueBoatCode}, ${mission.incidentBoatCode} vẫn sự cố`,
+        );
+      } else {
+        mission.arrivedAt = mission.updatedAt;
+        const nearest = nearestStationTo({ lat: mission.incidentLat, lng: mission.incidentLng });
+        if (nearest) {
+          mission.status = 'Towing';
+          mission.targetLat = nearest.lat;
+          mission.targetLng = nearest.lng;
+          mission.destinationStationId = nearest.station.stationId || null;
+          mission.destinationStationCode = nearest.station.stationCode || null;
+          mission.destinationStationName = nearest.station.stationName || null;
+          mission.destinationDistanceMeters = Math.round(nearest.meters);
+          mission.towingStartedAt = mission.updatedAt;
+          // Ngay khi bắt đầu kéo: đặt tàu lỗi nối đuôi tàu cứu (không chờ tick sau).
+          const towHeading = bearingDegrees(
+            { lat: mission.currentLat, lng: mission.currentLng },
+            { lat: nearest.lat, lng: nearest.lng },
+          ) || heading;
+          const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
+          const behind = pointBehind(
+            { lat: mission.currentLat, lng: mission.currentLng },
+            towHeading,
+            towRopeMeters,
+          );
+          mission.incidentCurrentLat = behind.lat;
+          mission.incidentCurrentLng = behind.lng;
+          if (mission.incidentBoatCode) {
+            const towStart = await publishLiveGpsPosition({
+              boatCode: mission.incidentBoatCode,
+              lat: behind.lat,
+              lng: behind.lng,
+              heading: towHeading,
+              speedKmh: mission.speedKmh,
+              status: 'moving',
+              sendToTarget: true,
+            });
+            if (towStart.ok) mission.incidentBoatSequence = towStart.sequence || null;
+          }
+          console.log(
+            `[rescue-gps] ${mission.rescueBoatCode} kéo ${mission.incidentBoatCode} → `
+            + `${mission.destinationStationCode || mission.destinationStationName || 'bến gần nhất'}`,
+          );
+        } else {
+          mission.status = 'Arrived';
+          mission.lastError = 'Không tìm thấy bến để kéo tàu về';
+        }
+      }
+
+      const open = state.openIncidents.get(mission.incidentId);
+      if (open) {
+        open.missionStatus = mission.status;
+        open.updatedAt = mission.updatedAt;
+      }
+      broadcast();
+    } finally {
+      mission.publishing = false;
+    }
+  }));
+}
+
+/**
+ * Nhận lệnh sự cố/cứu hộ không cần JWT Azure.
+ * Manager/Admin FE hoặc BE gọi: POST /api/incidents/hook + header X-Live-Hook-Secret.
+ *
+ * Body mẫu:
+ * { "event": "IncidentCreated", "boatCode": "WB_002", "lat": 10.77, "lng": 106.70 }
+ * { "event": "RescueDispatched", "incidentId": "...", "boatCode": "WB_002", "replacementBoatCode": "WB_001" }
+ * { "event": "IncidentResolved", "incidentId": "..." }
+ */
+function ingestIncidentHook(body = {}, req = null) {
+  const expected = String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim();
+  if (!expected) {
+    return {
+      ok: false,
+      status: 503,
+      error: 'Chưa cấu hình LIVE_HOOK_SECRET — đặt secret trong .env rồi restart',
+    };
+  }
+  const provided = String(
+    req?.headers?.['x-live-hook-secret']
+    || body.secret
+    || body.hookSecret
+    || '',
+  ).trim();
+  if (provided !== expected) {
+    return { ok: false, status: 401, error: 'Hook secret sai — gửi header X-Live-Hook-Secret' };
+  }
+
+  const event = String(body.event || body.type || body.action || 'IncidentUpdated').trim();
+  const eventLower = event.toLowerCase();
+  const incomingIncidentId = String(body.incidentId || body.id || '').trim();
+  const isResolveEvent = eventLower.includes('resolve')
+    || eventLower.includes('closed')
+    || eventLower === 'incidentresolved';
+  if (incomingIncidentId && !isResolveEvent && state.resolvedIncidentIds.has(incomingIncidentId)) {
+    return {
+      ok: true,
+      duplicate: true,
+      ignored: true,
+      event,
+      incidentId: incomingIncidentId,
+      reason: 'Incident đã kết thúc',
+    };
+  }
+
+  // Cập nhật status tàu trực tiếp (Active / UnderMaintenance) — không cần JWT.
+  if (
+    eventLower.includes('boatstatus')
+    || eventLower === 'statusupdated'
+    || (body.status && !body.incidentType && !eventLower.includes('incident') && !eventLower.includes('rescue'))
+  ) {
+    const boat = boatByIdOrCode(body.boatId || body.boatCode);
+    const status = canonicalBoatStatus(body.status || body.boatStatus);
+    if (!boat && !(body.boatCode || body.boatId)) {
+      return { ok: false, status: 400, error: 'Thiếu boatCode / boatId' };
+    }
+    if (!status) {
+      return { ok: false, status: 400, error: 'status phải là Active | Incident | UnderMaintenance | Inactive | Retired' };
+    }
+    if (boat) {
+      boat.dbStatus = status;
+      if (status === 'Active') {
+        // Active lại → đóng sự cố hook/local của tàu này.
+        for (const [id, row] of [...state.openIncidents.entries()]) {
+          if (String(row.boatCode || '') === String(boat.boatCode)) {
+            state.openIncidents.delete(id);
+          }
+        }
+        clearBeBoatStatus(boat);
+      } else if (status === 'Incident' || status === 'UnderMaintenance') {
+        applyBeBoatStatus({
+          boatId: boat.boatId,
+          boatCode: boat.boatCode,
+          status,
+          source: 'hook:BoatStatusUpdated',
+        });
+      } else {
+        clearBeBoatStatus(boat);
+        state.boats.delete(boat.boatId);
+        if (boat.boatCode) state.hubBoats.delete(boat.boatCode);
+      }
+    }
+    syncStatusesWithNeon();
+    broadcast();
+    return {
+      ok: true,
+      event: 'BoatStatusUpdated',
+      boatCode: boat?.boatCode || body.boatCode,
+      status,
+      effectiveStatus: boat ? effectiveBoatStatus(boat) : status,
+    };
+  }
+
+  if (
+    isResolveEvent
+  ) {
+    const id = String(body.incidentId || body.id || '').trim();
+    if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId để đóng' };
+    const existing = state.openIncidents.get(id);
+    state.openIncidents.delete(id);
+    state.resolvedIncidentIds.set(id, Date.now());
+    completeRescueMission(id);
+    applyBeBoatStatus({
+      boatId: existing?.boatId || body.boatId,
+      boatCode: existing?.boatCode || body.boatCode,
+      status: canonicalBoatStatus(body.boatStatus) || 'Active',
+      source: 'hook:resolve',
+    });
+    broadcast();
+    return {
+      ok: true,
+      event: 'IncidentResolved',
+      incidentId: id,
+      boatCode: existing?.boatCode || body.boatCode || null,
+      openCount: state.openIncidents.size,
+    };
+  }
+
+  const boat = boatByIdOrCode(body.boatId || body.boatCode);
+  const rescue = boatByIdOrCode(
+    body.replacementBoatId || body.replacementBoatCode || body.rescueBoatCode,
+  );
+  const incidentId = String(
+    body.incidentId || body.id || randomUUID(),
+  ).trim();
+
+  const lat = Number(body.lat ?? body.latitude ?? body.location?.lat);
+  const lng = Number(body.lng ?? body.longitude ?? body.location?.lng);
+
+  const incident = {
+    incidentId,
+    boatId: body.boatId || boat?.boatId || null,
+    boatCode: body.boatCode || boat?.boatCode || null,
+    boatName: body.boatName || boat?.boatName || null,
+    tripId: body.tripId || boat?.tripId || null,
+    incidentType: body.incidentType || 'OperationalIssue',
+    severity: body.severity || 'High',
+    description: body.description || `Hook ${event}`,
+    resolutionStatus: 'Open',
+    replacementBoatId: body.replacementBoatId || rescue?.boatId || null,
+    replacementBoatCode: body.replacementBoatCode || body.rescueBoatCode || rescue?.boatCode || null,
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+    occurredAt: body.occurredAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source: 'hook',
+    raw: body,
+  };
+
+  if (!incident.boatCode && !incident.boatId) {
+    return { ok: false, status: 400, error: 'Thiếu boatCode / boatId' };
+  }
+
+  // Đảm bảo tàu vẫn trong catalog để Live KHÔNG ẩn khi FE báo sự cố (DB = Incident).
+  let liveBoat = boat || boatByIdOrCode(incident.boatCode || incident.boatId);
+  if (!liveBoat && incident.boatCode) {
+    const id = incident.boatId || randomUUID();
+    liveBoat = {
+      boatId: id,
+      boatCode: incident.boatCode,
+      boatName: incident.boatName || incident.boatCode,
+      dbStatus: 'Incident',
+      beStatus: 'Incident',
+      numberOfDecks: 1,
+      maxSpeedKmh: Number(env.DEFAULT_SPEED_KMH || 16),
+      lat: Number.isFinite(lat) ? lat : 10.776,
+      lng: Number.isFinite(lng) ? lng : 106.705,
+      heading: 0,
+      speedKmh: 0,
+      status: 'idle',
+      paused: true,
+      updatedAt: new Date().toISOString(),
+    };
+    state.boats.set(id, liveBoat);
+    incident.boatId = id;
+  } else if (liveBoat) {
+    liveBoat.dbStatus = 'Incident';
+    liveBoat.beStatus = 'Incident';
+  }
+
+  upsertIncidentRecord(incident);
+  applyBeBoatStatus({
+    boatId: incident.boatId,
+    boatCode: incident.boatCode,
+    status: 'Incident',
+    source: 'hook',
+  });
+  applyBoatStatusesFromBePayload(incident, event);
+
+  // Bổ sung tọa độ từ hub nếu hook không gửi lat/lng.
+  if ((incident.lat == null || incident.lng == null) && incident.boatCode) {
+    const hub = state.hubBoats.get(incident.boatCode);
+    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+      incident.lat = Number(hub.lat);
+      incident.lng = Number(hub.lng);
+      upsertIncidentRecord(incident);
+    }
+  }
+
+  // Giữ marker hub nếu đang có — không prune vì sự cố.
+  if (incident.boatCode && Number.isFinite(incident.lat) && Number.isFinite(incident.lng)) {
+    const prev = state.hubBoats.get(incident.boatCode);
+    state.hubBoats.set(incident.boatCode, {
+      ...(prev || {}),
+      boatCode: incident.boatCode,
+      boatName: incident.boatName || prev?.boatName || null,
+      boatId: incident.boatId || prev?.boatId || null,
+      lat: incident.lat,
+      lng: incident.lng,
+      speedKmh: 0,
+      heading: prev?.heading ?? 0,
+      isOnline: true,
+      boatStatus: 'Incident',
+      beStatus: 'Incident',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  const isRescueDispatch = eventLower.includes('rescue')
+    || eventLower.includes('dispatch')
+    || eventLower.includes('replacement');
+  const rescueAutomation = isRescueDispatch
+    ? startRescueAutomation(incident)
+    : null;
+  broadcast();
+  return {
+    ok: true,
+    event,
+    incident,
+    rescueAutomation,
+    boatStatus: 'Incident',
+    openCount: state.openIncidents.size,
+  };
+}
+
+function upsertIncidentFromHub(payload, eventName) {
+  const rows = extractIncidentRows(payload);
+  if (!rows.length && payload && typeof payload === 'object') rows.push(payload);
+  for (const row of rows) {
+    const incident = normalizeIncident(row, `hub:${eventName}`);
+    if (incident) {
+      upsertIncidentRecord(incident);
+      applyBoatStatusesFromBePayload(incident, eventName);
+    }
+  }
+}
+
+async function refreshOpenIncidents({ force = false } = {}) {
+  if (!getTargetApiRoot()) {
+    return { ok: false, status: 400, error: 'Chưa cấu hình Azure endpoint' };
+  }
+  if (!state.targetBearerToken) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'Thiếu TARGET_BEARER_TOKEN (JWT Staff/Admin) cho /api/incidents',
+    };
+  }
+  const result = await requestTargetApi({
+    method: 'GET',
+    pathname: '/api/incidents?resolutionStatus=Open',
+    auth: 'bearer',
+    silent: !force,
+  });
+  if (!result.ok) return result;
+
+  const next = new Map();
+  for (const row of extractIncidentRows(result.data)) {
+    const incident = normalizeIncident(row, 'api');
+    if (!incident) continue;
+    const prev = state.openIncidents.get(incident.incidentId);
+    if (prev) {
+      incident.lat = incident.lat ?? prev.lat ?? null;
+      incident.lng = incident.lng ?? prev.lng ?? null;
+      incident.boatCode = incident.boatCode || prev.boatCode || null;
+      incident.replacementBoatCode = incident.replacementBoatCode || prev.replacementBoatCode || null;
+    }
+    if ((incident.lat == null || incident.lng == null) && incident.boatCode) {
+      const hub = state.hubBoats.get(incident.boatCode);
+      if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+        incident.lat = Number(hub.lat);
+        incident.lng = Number(hub.lng);
+      }
+    }
+    next.set(incident.incidentId, incident);
+  }
+
+  for (const [id, row] of state.openIncidents) {
+    if (row.source === 'local' && !next.has(id)) next.set(id, row);
+  }
+
+  state.openIncidents = next;
+  for (const incident of next.values()) {
+    applyBeBoatStatus({
+      boatId: incident.boatId,
+      boatCode: incident.boatCode,
+      status: 'Incident',
+      source: 'incidents:open',
+    });
+  }
+  broadcast();
+  return { ok: true, status: 200, count: next.size, data: [...next.values()] };
+}
+
+async function listIncidents({ resolutionStatus = 'Open' } = {}) {
+  if (String(resolutionStatus).toLowerCase() === 'open') {
+    const refreshed = await refreshOpenIncidents({ force: true });
+    if (refreshed.ok) {
+      return {
+        ok: true,
+        status: 200,
+        incidents: [...state.openIncidents.values()],
+        source: 'azure',
+      };
+    }
+    return {
+      ok: state.openIncidents.size > 0,
+      status: refreshed.status,
+      error: refreshed.error,
+      incidents: [...state.openIncidents.values()],
+      source: 'cache',
+    };
+  }
+
+  const qs = new URLSearchParams({ resolutionStatus: String(resolutionStatus) }).toString();
+  const result = await requestTargetApi({
+    method: 'GET',
+    pathname: `/api/incidents?${qs}`,
+    auth: 'bearer',
+  });
+  if (!result.ok) {
+    return {
+      ok: false,
+      status: result.status,
+      error: result.error,
+      incidents: [],
+    };
+  }
+  const incidents = extractIncidentRows(result.data)
+    .map((row) => normalizeIncident(row, 'api'))
+    .filter(Boolean);
+  return { ok: true, status: 200, incidents, source: 'azure' };
+}
+
+async function createIncident(body = {}) {
+  const boat = boatByIdOrCode(body.boatId || body.boatCode);
+  const boatId = body.boatId || boat?.boatId;
+  if (!boatId) {
+    return { ok: false, status: 400, error: 'Thiếu boatId / boatCode hợp lệ' };
+  }
+
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  const payload = {
+    boatId,
+    tripId: body.tripId || boat?.tripId || null,
+    incidentType: body.incidentType || 'OperationalIssue',
+    severity: body.severity || 'High',
+    description: body.description
+      || `Sự cố báo từ Live GPS${Number.isFinite(lat) && Number.isFinite(lng) ? ` @ ${lat.toFixed(5)},${lng.toFixed(5)}` : ''}`,
+    occurredAt: body.occurredAt || new Date().toISOString(),
+  };
+
+  let azure = { ok: false, status: 401, error: 'Chưa gọi Azure' };
+  if (state.targetBearerToken) {
+    azure = await requestTargetApi({
+      method: 'POST',
+      pathname: '/api/incidents',
+      payload,
+      auth: 'bearer',
+    });
+  } else {
+    azure = {
+      ok: false,
+      status: 401,
+      error: 'Thiếu TARGET_BEARER_TOKEN — tạo sự cố local để demo',
+    };
+  }
+
+  let incident = null;
+  if (azure.ok) {
+    incident = normalizeIncident(azure.data, 'api')
+      || normalizeIncident({ ...payload, incidentId: azure.data?.incidentId || azure.data?.id }, 'api');
+  }
+
+  if (!incident) {
+    incident = {
+      incidentId: randomUUID(),
+      boatId,
+      boatCode: boat?.boatCode || body.boatCode || null,
+      boatName: boat?.boatName || null,
+      tripId: payload.tripId,
+      incidentType: payload.incidentType,
+      severity: payload.severity,
+      description: payload.description,
+      resolutionStatus: 'Open',
+      replacementBoatId: null,
+      replacementBoatCode: null,
+      lat: Number.isFinite(lat) ? lat : null,
+      lng: Number.isFinite(lng) ? lng : null,
+      occurredAt: payload.occurredAt,
+      updatedAt: new Date().toISOString(),
+      source: 'local',
+      raw: payload,
+    };
+  } else {
+    incident.boatCode = incident.boatCode || boat?.boatCode || body.boatCode || null;
+    incident.boatName = incident.boatName || boat?.boatName || null;
+    if (Number.isFinite(lat)) incident.lat = lat;
+    if (Number.isFinite(lng)) incident.lng = lng;
+    if (!state.targetBearerToken || !azure.ok) incident.source = 'local';
+  }
+
+  upsertIncidentRecord(incident);
+  applyBeBoatStatus({
+    boatId: incident.boatId,
+    boatCode: incident.boatCode,
+    status: 'Incident',
+    source: azure.ok ? 'azure:createIncident' : 'local:createIncident',
+  });
+  if (boat) {
+    // Mirror status DB FE dùng (Incident), không ẩn tàu.
+    boat.dbStatus = 'Incident';
+    boat.beStatus = 'Incident';
+  }
+  broadcast();
+  return {
+    ok: true,
+    status: 200,
+    azureOk: Boolean(azure.ok),
+    azureStatus: azure.status,
+    azureError: azure.ok ? null : azure.error,
+    incident,
+    boatStatus: 'Incident',
+    warning: azure.ok ? null : (azure.error || 'Đã lưu sự cố local (Azure chưa nhận)'),
+  };
+}
+
+async function assignReplacementBoat(incidentId, body = {}) {
+  const id = String(incidentId || '').trim();
+  if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId' };
+
+  const rescue = boatByIdOrCode(body.replacementBoatId || body.replacementBoatCode || body.boatCode);
+  const replacementBoatId = body.replacementBoatId || rescue?.boatId;
+  if (!replacementBoatId) {
+    return { ok: false, status: 400, error: 'Thiếu replacementBoatId / boatCode tàu cứu' };
+  }
+
+  const payload = {
+    replacementBoatId,
+    delayMinutes: body.delayMinutes == null ? null : Number(body.delayMinutes),
+    note: body.note || `Điều tàu ${rescue?.boatCode || replacementBoatId} cứu hộ từ Live GPS`,
+  };
+
+  let azure = { ok: false, status: 401, error: 'Thiếu TARGET_BEARER_TOKEN' };
+  if (state.targetBearerToken) {
+    azure = await requestTargetApi({
+      method: 'PATCH',
+      pathname: `/api/incidents/${encodeURIComponent(id)}/assign-replacement-boat`,
+      payload,
+      auth: 'bearer',
+    });
+  }
+
+  const existing = state.openIncidents.get(id) || { incidentId: id, resolutionStatus: 'Open' };
+  const next = {
+    ...existing,
+    replacementBoatId,
+    replacementBoatCode: rescue?.boatCode || body.replacementBoatCode || existing.replacementBoatCode || null,
+    updatedAt: new Date().toISOString(),
+    source: azure.ok ? 'api' : (existing.source || 'local'),
+  };
+  if (azure.ok) {
+    const fromAzure = normalizeIncident(azure.data, 'api');
+    if (fromAzure) {
+      Object.assign(next, fromAzure, {
+        replacementBoatCode: fromAzure.replacementBoatCode || next.replacementBoatCode,
+        lat: fromAzure.lat ?? next.lat,
+        lng: fromAzure.lng ?? next.lng,
+      });
+    }
+  }
+  upsertIncidentRecord(next);
+  const rescueAutomation = startRescueAutomation(next);
+  broadcast();
+
+  return {
+    ok: true,
+    azureOk: Boolean(azure.ok),
+    azureStatus: azure.status,
+    azureError: azure.ok ? null : azure.error,
+    incident: next,
+    rescueAutomation,
+    warning: azure.ok
+      ? null
+      : (azure.error || 'Đã gán tàu cứu local (Azure chưa nhận — cần tripId trên incident)'),
+  };
+}
+
+async function resolveIncident(incidentId, body = {}) {
+  const id = String(incidentId || '').trim();
+  if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId' };
+
+  const payload = {
+    resolutionNote: body.resolutionNote || 'Đã xử lý sự cố từ Live GPS',
+    boatStatus: body.boatStatus || 'Active',
+    tripStatus: body.tripStatus || undefined,
+  };
+
+  let azure = { ok: false, status: 401, error: 'Thiếu TARGET_BEARER_TOKEN' };
+  if (state.targetBearerToken) {
+    azure = await requestTargetApi({
+      method: 'PATCH',
+      pathname: `/api/incidents/${encodeURIComponent(id)}/resolve`,
+      payload,
+      auth: 'bearer',
+    });
+  }
+
+  const existing = state.openIncidents.get(id);
+  state.openIncidents.delete(id);
+  state.resolvedIncidentIds.set(id, Date.now());
+  completeRescueMission(id);
+  const nextStatus = canonicalBoatStatus(
+    azure.data?.boatStatus || azure.data?.BoatStatus || payload.boatStatus,
+  ) || 'Active';
+  applyBeBoatStatus({
+    boatId: existing?.boatId,
+    boatCode: existing?.boatCode,
+    status: nextStatus,
+    source: azure.ok ? 'azure:resolve' : 'local:resolve',
+  });
+  applyBoatStatusesFromBePayload(azure.data || {}, 'resolveIncident');
+  broadcast();
+
+  return {
+    ok: true,
+    azureOk: Boolean(azure.ok),
+    azureStatus: azure.status,
+    azureError: azure.ok ? null : azure.error,
+    incidentId: id,
+    boatCode: existing?.boatCode || null,
+    boatStatus: nextStatus,
+    warning: azure.ok ? null : (azure.error || 'Đã đóng sự cố local'),
+  };
 }
 
 async function startTrackingSessionOnTarget(collector) {
@@ -2922,20 +4391,57 @@ function ensureFallbackData() {
 
 function snapshot() {
   return {
-    boats: [...state.boats.values()].map((boat) => ({
-      ...boat,
-      lat: round(boat.lat, 7),
-      lng: round(boat.lng, 7),
-      heading: round(boat.heading, 0),
-      speedKmh: round(boat.speedKmh, 1),
+    boats: [...state.boats.values()].map((boat) => {
+      const neonStatus = boat.dbStatus || null;
+      const beStatus = beStatusForBoat(boat) || boat.beStatus || null;
+      const effectiveStatus = beStatus || neonStatus;
+      return {
+        ...boat,
+        neonStatus,
+        beStatus,
+        dbStatus: effectiveStatus,
+        effectiveStatus,
+        lat: round(boat.lat, 7),
+        lng: round(boat.lng, 7),
+        heading: round(boat.heading, 0),
+        speedKmh: round(boat.speedKmh, 1),
+      };
+    }),
+    hubBoats: [...state.hubBoats.values()].map((boat) => {
+      const beStatus = beStatusForBoat(boat.boatCode) || boat.beStatus || boat.boatStatus || null;
+      return {
+        ...boat,
+        beStatus,
+        boatStatus: beStatus || boat.boatStatus || null,
+        lat: round(boat.lat, 7),
+        lng: round(boat.lng, 7),
+        heading: boat.heading == null ? null : round(boat.heading, 0),
+        speedKmh: boat.speedKmh == null ? null : round(boat.speedKmh, 1),
+      };
+    }),
+    beBoatStatuses: [...state.beBoatStatuses.entries()]
+      .filter(([key, row]) => row && key === row.boatCode)
+      .map(([, row]) => row),
+    openIncidents: [...state.openIncidents.values()].map((row) => ({
+      incidentId: row.incidentId,
+      boatId: row.boatId,
+      boatCode: row.boatCode,
+      boatName: row.boatName,
+      tripId: row.tripId,
+      incidentType: row.incidentType,
+      severity: row.severity,
+      description: row.description,
+      resolutionStatus: row.resolutionStatus,
+      replacementBoatId: row.replacementBoatId,
+      replacementBoatCode: row.replacementBoatCode,
+      missionStatus: row.missionStatus || null,
+      lat: row.lat == null ? null : round(row.lat, 7),
+      lng: row.lng == null ? null : round(row.lng, 7),
+      occurredAt: row.occurredAt,
+      updatedAt: row.updatedAt,
+      source: row.source,
     })),
-    hubBoats: [...state.hubBoats.values()].map((boat) => ({
-      ...boat,
-      lat: round(boat.lat, 7),
-      lng: round(boat.lng, 7),
-      heading: boat.heading == null ? null : round(boat.heading, 0),
-      speedKmh: boat.speedKmh == null ? null : round(boat.speedKmh, 1),
-    })),
+    rescueMissions: [...state.rescueMissions.values()].map(rescueMissionPublic),
     routes: [...state.routes.values()].map((route) => ({
       routeId: route.routeId,
       routeCode: route.routeCode,
@@ -3060,6 +4566,15 @@ function publicConfig() {
       boatsLatestOkAt: boatsLatestLastOkAt,
       boatsLatestError: boatsLatestLastError,
     },
+    incidentsHubStatus: {
+      ...state.incidentsHubStatus,
+    },
+    hasBearerToken: Boolean(state.targetBearerToken),
+    hasLiveHookSecret: Boolean(state.liveHookSecret || env.LIVE_HOOK_SECRET),
+    incidentReceiveMode: (state.liveHookSecret || env.LIVE_HOOK_SECRET)
+      ? 'hook'
+      : (state.targetBearerToken ? 'jwt' : 'local'),
+    openIncidentCount: state.openIncidents.size,
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),

@@ -1,14 +1,27 @@
 import * as signalR from '@microsoft/signalr';
 
 /**
- * Nối Azure /hubs/tracking từ server (không bị CORS trình duyệt),
- * rồi đẩy boatLocation vào callback để FE nhận qua SSE cùng origin.
+ * Nối Azure SignalR hub từ server (tránh CORS trình duyệt),
+ * rồi đẩy event vào callback để FE nhận qua SSE cùng origin.
+ *
+ * @param {{
+ *   name?: string,
+ *   getHubUrl: () => string,
+ *   getAccessToken?: () => string | null | undefined,
+ *   events?: Array<{ names: string[], onEvent: (payload: unknown, eventName: string) => void }>,
+ *   onStatus?: (status: object) => void,
+ * }} options
  */
-export function createSignalRRelay({ getHubUrl, onBoatLocation, onStatus }) {
+export function createSignalRRelay({
+  name = 'signalr-relay',
+  getHubUrl,
+  getAccessToken,
+  events = [],
+  onStatus,
+}) {
   let connection = null;
   let starting = false;
   let stopped = false;
-  let broadcastTimer = null;
   const status = {
     connected: false,
     hubUrl: '',
@@ -42,23 +55,32 @@ export function createSignalRRelay({ getHubUrl, onBoatLocation, onStatus }) {
 
     starting = true;
     try {
+      const hubOptions = {
+        withCredentials: false,
+        // Azure hiện chỉ advertise SSE + LongPolling (không có WebSockets).
+        transport: signalR.HttpTransportType.ServerSentEvents
+          | signalR.HttpTransportType.LongPolling,
+      };
+      const token = String(getAccessToken?.() || '').trim();
+      if (token) {
+        hubOptions.accessTokenFactory = () => token;
+      }
+
       connection = new signalR.HubConnectionBuilder()
-        .withUrl(hubUrl, {
-          withCredentials: false,
-          // Azure hiện chỉ advertise SSE + LongPolling (không có WebSockets).
-          transport: signalR.HttpTransportType.ServerSentEvents
-            | signalR.HttpTransportType.LongPolling,
-        })
+        .withUrl(hubUrl, hubOptions)
         .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
         .configureLogging(signalR.LogLevel.Warning)
         .build();
 
-      const handle = (payload) => {
-        status.lastEventAt = new Date().toISOString();
-        onBoatLocation?.(payload);
-      };
-      connection.on('boatLocation', handle);
-      connection.on('BoatLocationUpdated', handle);
+      for (const group of events) {
+        const names = group?.names || [];
+        for (const eventName of names) {
+          connection.on(eventName, (payload) => {
+            status.lastEventAt = new Date().toISOString();
+            group.onEvent?.(payload, eventName);
+          });
+        }
+      }
 
       connection.onreconnecting((error) => {
         status.connected = false;
@@ -69,7 +91,7 @@ export function createSignalRRelay({ getHubUrl, onBoatLocation, onStatus }) {
         status.connected = true;
         status.lastError = null;
         emitStatus();
-        console.log(`[signalr-relay] reconnected ${hubUrl}`);
+        console.log(`[${name}] reconnected ${hubUrl}`);
       });
       connection.onclose((error) => {
         status.connected = false;
@@ -84,13 +106,13 @@ export function createSignalRRelay({ getHubUrl, onBoatLocation, onStatus }) {
       status.lastError = null;
       status.transport = connection.connection?.transport?.name || null;
       emitStatus();
-      console.log(`[signalr-relay] connected ${hubUrl}`);
+      console.log(`[${name}] connected ${hubUrl}`);
     } catch (error) {
       status.connected = false;
       status.lastError = error?.message || String(error);
       connection = null;
       emitStatus();
-      console.warn(`[signalr-relay] connect failed: ${status.lastError}`);
+      console.warn(`[${name}] connect failed: ${status.lastError}`);
       scheduleReconnect();
     } finally {
       starting = false;
@@ -103,7 +125,6 @@ export function createSignalRRelay({ getHubUrl, onBoatLocation, onStatus }) {
 
   function stop() {
     stopped = true;
-    if (broadcastTimer) clearTimeout(broadcastTimer);
     const conn = connection;
     connection = null;
     return conn?.stop?.().catch(() => {});
