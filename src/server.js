@@ -378,6 +378,11 @@ const server = createServer(async (req, res) => {
       const result = ingestIncidentHook(body, req);
       return sendJson(res, result, result.ok ? 200 : (result.status || 401));
     }
+    if (url.pathname === '/api/rescue/restart' && req.method === 'POST') {
+      const body = await readJson(req).catch(() => ({}));
+      const result = restartOpenRescueMissions(body);
+      return sendJson(res, result, result.ok ? 200 : (result.status || 400));
+    }
     if (url.pathname === '/api/incidents' && req.method === 'GET') {
       const resolutionStatus = url.searchParams.get('resolutionStatus') || 'Open';
       const result = await listIncidents({ resolutionStatus });
@@ -2510,6 +2515,95 @@ function startRescueAutomation(incident) {
     started: true,
     mission: rescueMissionPublic(mission),
     transferAutomation,
+  };
+}
+
+/**
+ * Chạy lại cứu hộ cho sự cố đang mở (AtStation/Completed hoặc chưa có mission).
+ * Dùng khi BE đã gán tàu cứu nhưng SOS đang đứng bến — Live bấm "Chạy cứu lại".
+ */
+function restartOpenRescueMissions(body = {}) {
+  const onlyId = String(body.incidentId || '').trim();
+  const rows = [...state.openIncidents.values()].filter((row) => {
+    if (onlyId && String(row.incidentId) !== onlyId) return false;
+    const rescue = pickRescueBoatCode(row) || String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
+    return Boolean(rescue);
+  });
+  if (!rows.length) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'Không có sự cố mở nào đã gán tàu cứu (rescueBoatCode)',
+      restarted: [],
+    };
+  }
+
+  // Một SOS không chạy song song 2 mission — ưu tiên sự cố xa SOS nhất.
+  const byRescue = new Map();
+  for (const row of rows) {
+    const rescue = pickRescueBoatCode(row) || String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
+    const list = byRescue.get(rescue) || [];
+    list.push(row);
+    byRescue.set(rescue, list);
+  }
+
+  const restarted = [];
+  const skipped = [];
+  for (const [rescueCode, list] of byRescue) {
+    const hub = state.hubBoats.get(rescueCode);
+    const rescuePos = {
+      lat: Number(hub?.lat),
+      lng: Number(hub?.lng),
+    };
+    list.sort((a, b) => {
+      const da = (Number.isFinite(rescuePos.lat) && Number.isFinite(Number(a.lat)))
+        ? distanceMeters(rescuePos, { lat: Number(a.lat), lng: Number(a.lng) })
+        : 0;
+      const db = (Number.isFinite(rescuePos.lat) && Number.isFinite(Number(b.lat)))
+        ? distanceMeters(rescuePos, { lat: Number(b.lat), lng: Number(b.lng) })
+        : 0;
+      return db - da;
+    });
+    const primary = list[0];
+    for (const extra of list.slice(1)) {
+      skipped.push({
+        incidentId: extra.incidentId,
+        boatCode: extra.boatCode,
+        reason: `Cùng ${rescueCode} — ưu tiên ${primary.boatCode}`,
+      });
+    }
+    // Force restart: xóa mission cũ dù AtStation.
+    state.rescueMissions.delete(String(primary.incidentId));
+    state.rescueMissions.delete(`${primary.incidentId}__xfer`);
+    state.resolvedIncidentIds.delete(String(primary.incidentId));
+    let lat = Number(primary.lat);
+    let lng = Number(primary.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      const hubInc = state.hubBoats.get(String(primary.boatCode || ''));
+      lat = Number(hubInc?.lat);
+      lng = Number(hubInc?.lng);
+    }
+    const result = startRescueAutomation({
+      ...primary,
+      rescueBoatCode: rescueCode,
+      lat,
+      lng,
+    });
+    restarted.push({
+      incidentId: primary.incidentId,
+      boatCode: primary.boatCode,
+      rescueBoatCode: rescueCode,
+      ...result,
+    });
+  }
+  broadcast();
+  return {
+    ok: true,
+    restarted,
+    skipped,
+    message: restarted.some((r) => r.started)
+      ? 'Đã khởi động lại cứu hộ — SOS sẽ chạy ra hiện trường rồi kéo về bến'
+      : 'Không start được mission — xem restarted[].error',
   };
 }
 
