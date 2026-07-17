@@ -2145,12 +2145,16 @@ function boatCodeFromId(boatId) {
 
 /** Tàu cứu chính: ưu tiên rescueBoatCode (SOS_*), fallback replacementBoatCode (contract cũ). */
 function pickRescueBoatCode(src = {}) {
-  return String(
+  const direct = String(
     src.rescueBoatCode
     || src.RescueBoatCode
     || src.rescue_boat_code
     || '',
-  ).trim() || String(
+  ).trim();
+  if (direct) return direct;
+  const fromId = boatCodeFromId(src.rescueBoatId || src.RescueBoatId || src.rescue_boat_id);
+  if (fromId) return fromId;
+  return String(
     src.replacementBoatCode
     || src.ReplacementBoatCode
     || '',
@@ -2402,10 +2406,9 @@ function pointBehind(position, heading, meters) {
 }
 
 /**
- * Nhận RescueDispatched một lần rồi tự phát GPS tàu cứu tới hiện trường,
- * sau đó kéo cả tàu lỗi về bến gần hiện trường nhất.
- * Tàu cứu = rescueBoatCode (ưu tiên) hoặc replacementBoatCode (fallback contract cũ).
- * Duplicate incidentId không tạo thêm vòng chạy.
+ * Nhận RescueDispatched → kéo tàu cứu tới hiện trường, rồi kéo tàu lỗi về bến gần nhất.
+ * Đang chạy (InTransit/Towing): chỉ cập nhật target (idempotent).
+ * Đã AtStation/Completed: cho phép Điều tàu lại → tạo mission mới.
  */
 function startRescueAutomation(incident) {
   const incidentId = String(incident?.incidentId || '').trim();
@@ -2424,15 +2427,23 @@ function startRescueAutomation(incident) {
   }
 
   const existing = state.rescueMissions.get(incidentId);
-  if (existing && existing.rescueBoatCode === rescueBoatCode) {
-    if (existing.status === 'Dispatched' || existing.status === 'InTransit') {
+  if (existing) {
+    const status = String(existing.status || '');
+    const stillRunning = ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status);
+    const sameRescue = existing.rescueBoatCode === rescueBoatCode;
+    if (stillRunning && sameRescue) {
       existing.targetLat = targetLat;
       existing.targetLng = targetLng;
       existing.incidentLat = targetLat;
       existing.incidentLng = targetLng;
+      existing.updatedAt = new Date().toISOString();
+      console.log(`[rescue-gps] skip duplicate (đang ${status}) ${rescueBoatCode} · ${incidentId}`);
+      return { started: false, duplicate: true, mission: rescueMissionPublic(existing) };
     }
-    existing.updatedAt = new Date().toISOString();
-    return { started: false, duplicate: true, mission: rescueMissionPublic(existing) };
+    // AtStation / Completed / đổi tàu cứu → xóa mission cũ để chạy lại.
+    state.rescueMissions.delete(incidentId);
+    state.rescueMissions.delete(`${incidentId}__xfer`);
+    console.log(`[rescue-gps] restart sau ${status || 'none'} · ${rescueBoatCode} → ${incident.boatCode || incidentId}`);
   }
 
   ensureRescueBoatOnMap(rescueBoatCode, targetLat, targetLng);
@@ -2480,7 +2491,7 @@ function startRescueAutomation(incident) {
     open.replacementBoatCode = mission.replacementBoatCode;
     open.updatedAt = now;
   }
-  console.log(`[rescue-gps] ${rescueBoatCode} → ${incident.boatCode || incidentId}`);
+  console.log(`[rescue-gps] START ${rescueBoatCode} → ${incident.boatCode || incidentId} @ ${targetLat},${targetLng}`);
 
   // Có tàu thay khách riêng → điều thêm (không kéo tàu sự cố).
   let transferAutomation = null;
@@ -2885,9 +2896,21 @@ function ingestIncidentHook(body = {}, req = null) {
   const isRescueDispatch = eventLower.includes('rescue')
     || eventLower.includes('dispatch')
     || eventLower.includes('replacement');
+  // Điều tàu lại trên cùng incident đã resolve trước đó → cho phép mở lại.
+  if (isRescueDispatch && incomingIncidentId) {
+    state.resolvedIncidentIds.delete(incomingIncidentId);
+  }
   const rescueAutomation = isRescueDispatch
     ? startRescueAutomation(incident)
     : null;
+  if (isRescueDispatch) {
+    console.log(
+      `[hook] RescueDispatched boat=${incident.boatCode} rescue=${incident.rescueBoatCode}`
+      + ` started=${Boolean(rescueAutomation?.started)}`
+      + ` duplicate=${Boolean(rescueAutomation?.duplicate)}`
+      + ` err=${rescueAutomation?.error || '-'}`,
+    );
+  }
   broadcast();
   return {
     ok: true,
