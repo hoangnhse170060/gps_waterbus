@@ -248,8 +248,8 @@ function syncOpenIncidentPins(data = latest) {
 }
 
 function incidentTargetCoords(row) {
-  const lat = Number(row?.lat ?? row?.incidentLat);
-  const lng = Number(row?.lng ?? row?.incidentLng);
+  const lat = Number(row?.sceneLat ?? row?.lat ?? row?.incidentLat);
+  const lng = Number(row?.sceneLng ?? row?.lng ?? row?.incidentLng);
   if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
   const pin = pinnedFor(row?.boatCode);
   if (pin) return { lat: pin.lat, lng: pin.lng };
@@ -429,8 +429,15 @@ function renderRescueOverlays(data = latest) {
       overlay.incidentDot.setLatLng([target.lat, target.lng]);
     }
 
-    // Đã về bến: xóa toàn bộ đường kéo / đường đi, chỉ giữ chấm sự cố trên tàu lỗi.
-    if (autoStatus === 'AtStation' || autoStatus === 'Completed' || localMission?.phase === 'completed') {
+    // Đã về bến (server hoặc local): xóa đường — không để localMission vẽ tím khi SOS đứng yên.
+    const openMissionStatus = String(row.missionStatus || '');
+    if (
+      autoStatus === 'AtStation'
+      || autoStatus === 'Completed'
+      || openMissionStatus === 'AtStation'
+      || openMissionStatus === 'Completed'
+      || localMission?.phase === 'completed'
+    ) {
       overlay.toLine?.remove();
       overlay.toLine = null;
       overlay.returnLine?.remove();
@@ -443,6 +450,38 @@ function renderRescueOverlays(data = latest) {
         localMission.phase = 'completed';
         rescueMissions.set(row.incidentId, localMission);
         persistRescueMissions();
+      }
+      continue;
+    }
+
+    // Server đang chạy: vẽ đường theo autoMission (không phụ thuộc localMission).
+    if (
+      (autoStatus === 'Dispatched' || autoStatus === 'InTransit')
+      && rescuePin
+      && Number.isFinite(Number(autoMission?.targetLat))
+    ) {
+      const toPoints = [
+        [rescuePin.lat, rescuePin.lng],
+        [Number(autoMission.targetLat), Number(autoMission.targetLng)],
+      ];
+      if (!overlay.toLine) {
+        overlay.toLine = L.polyline(toPoints, {
+          color: '#7c3aed',
+          weight: 4,
+          dashArray: '10 8',
+          opacity: 0.85,
+        }).addTo(map);
+      } else {
+        overlay.toLine.setLatLngs(toPoints);
+        if (!map.hasLayer(overlay.toLine)) overlay.toLine.addTo(map);
+      }
+      if (overlay.returnLine) {
+        overlay.returnLine.remove();
+        overlay.returnLine = null;
+      }
+      if (overlay.towLine) {
+        overlay.towLine.remove();
+        overlay.towLine = null;
       }
       continue;
     }
@@ -490,6 +529,8 @@ function renderRescueOverlays(data = latest) {
     }
 
     if (!localMission || localMission.phase === 'completed' || !rescueCode || !rescuePin) continue;
+    // Có server mission đang chạy / đã xong → không vẽ path local (tránh tím ảo khi SOS đứng bến).
+    if (autoMission && autoStatus) continue;
 
     const toPoints = [[rescuePin.lat, rescuePin.lng], [target.lat, target.lng]];
     const returnPoints = Number.isFinite(localMission.departureLat)
@@ -2261,6 +2302,10 @@ document.querySelector('#restartRescueBtn')?.addEventListener('click', async () 
     }
     const started = (body.restarted || []).filter((r) => r.started);
     if (started.length) {
+      for (const row of started) {
+        if (row.incidentId) rescueMissions.delete(String(row.incidentId));
+      }
+      persistRescueMissions();
       const first = started[0];
       toast(
         `Cứu hộ lại: ${first.rescueBoatCode} → ${first.boatCode} (đang chạy ra hiện trường)`,
