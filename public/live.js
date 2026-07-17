@@ -255,7 +255,9 @@ function incidentTargetCoords(row) {
 }
 
 function startRescueMission(incident, { announce = true } = {}) {
-  const rescueCode = String(incident?.replacementBoatCode || '').trim();
+  const rescueCode = String(
+    incident?.rescueBoatCode || incident?.replacementBoatCode || '',
+  ).trim();
   const incidentId = String(incident?.incidentId || '').trim();
   if (!incidentId || !rescueCode) return null;
 
@@ -298,9 +300,10 @@ function syncRescueMissionsFromIncidents(data = latest) {
   const openIds = new Set();
   for (const row of openIncidentsList(data)) {
     openIds.add(row.incidentId);
-    if (!row.replacementBoatCode) continue;
+    const assignedRescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
+    if (!assignedRescue) continue;
     const existing = missionForIncident(row.incidentId);
-    if (!existing || existing.rescueBoatCode !== row.replacementBoatCode) {
+    if (!existing || existing.rescueBoatCode !== assignedRescue) {
       startRescueMission(row, { announce: !existing });
       continue;
     }
@@ -384,7 +387,7 @@ function renderRescueOverlays(data = latest) {
     const localMission = missionForIncident(row.incidentId);
     const autoMission = autoById.get(String(row.incidentId || '').trim());
     const rescueCode = String(
-      autoMission?.rescueBoatCode || localMission?.rescueBoatCode || row.replacementBoatCode || '',
+      autoMission?.rescueBoatCode || localMission?.rescueBoatCode || row.rescueBoatCode || row.replacementBoatCode || '',
     ).trim();
     const incidentCode = String(autoMission?.incidentBoatCode || row.boatCode || '').trim();
     const rescuePin = rescueCode ? pinnedFor(rescueCode) : null;
@@ -635,7 +638,8 @@ function isRescueBoat(code) {
     return ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(String(automated.status));
   }
   return openIncidentsList().some((row) => {
-    if (String(row.replacementBoatCode || '').trim() !== key) return false;
+    const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
+    if (rescue !== key) return false;
     // Có mission AtStation cùng incident → đã nhả tàu cứu.
     const mission = (latest?.rescueMissions || []).find(
       (m) => String(m.incidentId || '') === String(row.incidentId || ''),
@@ -726,8 +730,10 @@ function mapBoatCodes(data = latest) {
   for (const row of openIncidentsList(data)) {
     const code = String(row.boatCode || '').trim();
     if (code) codes.add(code);
-    const rescue = String(row.replacementBoatCode || '').trim();
+    const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
     if (rescue) codes.add(rescue);
+    const transfer = String(row.replacementBoatCode || '').trim();
+    if (transfer) codes.add(transfer);
   }
   return [...codes].sort();
 }
@@ -858,8 +864,8 @@ function phaseStatusText(code, lat, lng) {
   const dbLabel = boatDbStatusLabel(code);
   if (phase === 'incident') {
     const open = openIncidentForBoat(code);
-    const base = open?.replacementBoatCode
-      ? `Sự cố · cứu: ${open.replacementBoatCode}`
+    const base = (open?.rescueBoatCode || open?.replacementBoatCode)
+      ? `Sự cố · cứu: ${open.rescueBoatCode || open.replacementBoatCode}`
       : 'Sự cố';
     return dbLabel === 'Bảo trì' ? `${base} · Bảo trì` : base;
   }
@@ -1734,7 +1740,9 @@ function renderIncidentsPanel(data = latest) {
     const meta = [
       row.severity || null,
       row.incidentType || null,
-      row.replacementBoatCode ? `cứu: ${row.replacementBoatCode}` : null,
+      row.rescueBoatCode || row.replacementBoatCode
+        ? `cứu: ${row.rescueBoatCode || row.replacementBoatCode}`
+        : null,
       row.source === 'local' ? 'local' : null,
     ].filter(Boolean).join(' · ');
     const desc = row.description || '';
@@ -1776,7 +1784,7 @@ function renderIncidentsPanel(data = latest) {
             <button type="button" class="assign-rescue secondary">Điều tàu</button>
             <button type="button" class="resolve-incident secondary is-ok">Đóng</button>
           </div>
-          <button type="button" class="focus-rescue secondary" ${row.replacementBoatCode ? '' : 'disabled'}>Kéo tàu cứu</button>
+          <button type="button" class="focus-rescue secondary" ${(row.rescueBoatCode || row.replacementBoatCode) ? '' : 'disabled'}>Kéo tàu cứu</button>
           <button type="button" class="focus-incident secondary">Focus sự cố</button>
         </div>
       </article>
@@ -1787,7 +1795,9 @@ function renderIncidentsPanel(data = latest) {
     const incidentId = item.getAttribute('data-incident-id');
     const row = rows.find((r) => r.incidentId === incidentId);
     const select = item.querySelector('.rescue-select');
-    if (select && row?.replacementBoatCode) select.value = row.replacementBoatCode;
+    if (select && (row?.rescueBoatCode || row?.replacementBoatCode)) {
+      select.value = row.rescueBoatCode || row.replacementBoatCode;
+    }
     item.querySelector('.assign-rescue')?.addEventListener('click', () => {
       const code = select?.value || '';
       if (!code) {
@@ -1800,7 +1810,7 @@ function renderIncidentsPanel(data = latest) {
       resolveOpenIncident(incidentId);
     });
     item.querySelector('.focus-rescue')?.addEventListener('click', () => {
-      const code = row?.replacementBoatCode || select?.value || '';
+      const code = row?.rescueBoatCode || row?.replacementBoatCode || select?.value || '';
       if (!code) {
         toast('Chưa gán tàu cứu', 'warn');
         return;
@@ -1947,17 +1957,20 @@ async function resolveOpenIncident(incidentId) {
 
 function maybeToastNewIncidents(data) {
   const rows = openIncidentsList(data);
-  const key = rows.map((r) => `${r.incidentId}:${r.updatedAt || ''}:${r.replacementBoatCode || ''}`).sort().join('|');
+  const key = rows.map((r) => (
+    `${r.incidentId}:${r.updatedAt || ''}:${r.rescueBoatCode || ''}:${r.replacementBoatCode || ''}`
+  )).sort().join('|');
   if (!key) {
     lastIncidentToastKey = '';
     return;
   }
   if (lastIncidentToastKey && key !== lastIncidentToastKey) {
     const newest = rows[0];
-    if (newest?.replacementBoatCode && newest.replacementBoatCode !== lastRescueToastKey) {
-      lastRescueToastKey = newest.replacementBoatCode;
+    const rescueCode = newest?.rescueBoatCode || newest?.replacementBoatCode;
+    if (rescueCode && rescueCode !== lastRescueToastKey) {
+      lastRescueToastKey = rescueCode;
       toast(
-        `BE điều cứu: ${newest.replacementBoatCode} → ${newest.boatName || newest.boatCode}`,
+        `BE điều cứu: ${rescueCode} → ${newest.boatName || newest.boatCode}`,
         'ok',
         5000,
       );

@@ -635,8 +635,15 @@ function isLiveMapBoatCode(boatCode) {
     && row.boatId !== 'fallback-boat'
   ));
   if (!boat) {
-    // Vẫn giữ hub nếu đang có sự cố mở (DB chưa kịp refresh).
-    return [...state.openIncidents.values()].some((row) => String(row.boatCode || '').trim() === code);
+    // Vẫn giữ hub nếu đang có sự cố mở / đang là tàu cứu hoặc tàu thay khách.
+    return [...state.openIncidents.values()].some((row) => (
+      String(row.boatCode || '').trim() === code
+      || String(row.rescueBoatCode || '').trim() === code
+      || String(row.replacementBoatCode || '').trim() === code
+    )) || [...state.rescueMissions.values()].some((mission) => (
+      String(mission.rescueBoatCode || '').trim() === code
+      && String(mission.status || '') !== 'Completed'
+    ));
   }
   const status = normalizeBoatStatus(effectiveBoatStatus(boat));
   return status === 'active' || status === 'undermaintenance' || status === 'incident';
@@ -2136,6 +2143,109 @@ function boatCodeFromId(boatId) {
   return boat?.boatCode || null;
 }
 
+/** Tàu cứu chính: ưu tiên rescueBoatCode (SOS_*), fallback replacementBoatCode (contract cũ). */
+function pickRescueBoatCode(src = {}) {
+  return String(
+    src.rescueBoatCode
+    || src.RescueBoatCode
+    || src.rescue_boat_code
+    || '',
+  ).trim() || String(
+    src.replacementBoatCode
+    || src.ReplacementBoatCode
+    || '',
+  ).trim() || '';
+}
+
+function pickReplacementBoatCode(src = {}) {
+  return String(
+    src.replacementBoatCode
+    || src.ReplacementBoatCode
+    || '',
+  ).trim() || '';
+}
+
+/**
+ * Đảm bảo tàu cứu (vd SOS_001) có trong catalog + hub để Live hiện và POST tracking được.
+ * Nếu chưa có GPS: seed gần hiện trường (lệch ~350m) hoặc bến đầu catalog.
+ */
+function ensureRescueBoatOnMap(boatCode, nearLat = null, nearLng = null) {
+  const code = String(boatCode || '').trim();
+  if (!code) return null;
+  let boat = boatByIdOrCode(code);
+  let lat = Number(nearLat);
+  let lng = Number(nearLng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    const station = (state.stations || []).find((s) => (
+      Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
+    ));
+    lat = Number(station?.lat) || 10.776;
+    lng = Number(station?.lng) || 106.705;
+  } else {
+    // Lệch nhẹ khỏi hiện trường — tránh đè lên tàu sự cố lúc xuất phát.
+    lat += 0.0032;
+  }
+  if (!boat) {
+    const id = randomUUID();
+    boat = {
+      boatId: id,
+      boatCode: code,
+      boatName: /^SOS[_-]?/i.test(code) ? `Tàu cứu ${code}` : code,
+      dbStatus: 'Active',
+      beStatus: 'Active',
+      numberOfDecks: 1,
+      maxSpeedKmh: Math.max(1, Number(env.RESCUE_SPEED_KMH || env.DEFAULT_SPEED_KMH || 16)),
+      lat,
+      lng,
+      heading: 0,
+      speedKmh: 0,
+      status: 'idle',
+      paused: true,
+      updatedAt: new Date().toISOString(),
+    };
+    state.boats.set(id, boat);
+  } else {
+    boat.dbStatus = boat.dbStatus || 'Active';
+    boat.beStatus = boat.beStatus || 'Active';
+    if (!Number.isFinite(Number(boat.lat)) || !Number.isFinite(Number(boat.lng))) {
+      boat.lat = lat;
+      boat.lng = lng;
+    }
+  }
+  const hub = state.hubBoats.get(code);
+  const hubLat = Number(hub?.lat ?? boat.lat);
+  const hubLng = Number(hub?.lng ?? boat.lng);
+  if (!Number.isFinite(hubLat) || !Number.isFinite(hubLng)) {
+    state.hubBoats.set(code, {
+      ...(hub || {}),
+      boatCode: code,
+      boatName: boat.boatName,
+      boatId: boat.boatId,
+      lat,
+      lng,
+      speedKmh: 0,
+      heading: Number(hub?.heading ?? boat.heading ?? 0),
+      isOnline: true,
+      source: 'rescue-seed',
+      updatedAt: new Date().toISOString(),
+    });
+  } else if (!hub) {
+    state.hubBoats.set(code, {
+      boatCode: code,
+      boatName: boat.boatName,
+      boatId: boat.boatId,
+      lat: hubLat,
+      lng: hubLng,
+      speedKmh: 0,
+      heading: Number(boat.heading || 0),
+      isOnline: true,
+      source: 'rescue-seed',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  return boat;
+}
+
 function extractIncidentRows(data) {
   if (Array.isArray(data)) return data;
   if (!data || typeof data !== 'object') return [];
@@ -2162,12 +2272,15 @@ function normalizeIncident(row, source = 'api') {
     || nested.ReplacementBoatId
     || row.replacementBoatId
     || null;
-  const replacementBoatCode = String(
-    nested.replacementBoatCode
-    || nested.ReplacementBoatCode
-    || boatCodeFromId(replacementBoatId)
-    || '',
-  ).trim() || null;
+  const rescueBoatCode = pickRescueBoatCode(nested) || pickRescueBoatCode(row) || null;
+  const replacementBoatCode = pickReplacementBoatCode(nested)
+    || pickReplacementBoatCode(row)
+    || (rescueBoatCode ? '' : boatCodeFromId(replacementBoatId))
+    || null;
+  // Contract mới: rescue ≠ replacement. Chỉ fallback cũ khi BE chưa gửi rescueBoatCode.
+  const effectiveRescue = rescueBoatCode
+    || String(replacementBoatCode || boatCodeFromId(replacementBoatId) || '').trim()
+    || null;
 
   const lat = Number(
     nested.lat ?? nested.latitude ?? nested.Latitude
@@ -2196,7 +2309,8 @@ function normalizeIncident(row, source = 'api') {
     resolutionStatus,
     resolutionNote: nested.resolutionNote || nested.ResolutionNote || null,
     replacementBoatId: replacementBoatId || null,
-    replacementBoatCode,
+    replacementBoatCode: replacementBoatCode || null,
+    rescueBoatCode: effectiveRescue,
     lat: Number.isFinite(lat) ? lat : null,
     lng: Number.isFinite(lng) ? lng : null,
     occurredAt: nested.occurredAt || nested.OccurredAt || nested.createdAt || null,
@@ -2221,6 +2335,7 @@ function upsertIncidentRecord(incident, { removeIfResolved = true } = {}) {
     lng: incident.lng ?? prev.lng ?? null,
     boatCode: incident.boatCode || prev.boatCode || null,
     replacementBoatCode: incident.replacementBoatCode || prev.replacementBoatCode || null,
+    rescueBoatCode: incident.rescueBoatCode || prev.rescueBoatCode || null,
   });
   return true;
 }
@@ -2235,15 +2350,27 @@ function completeRescueMission(incidentId, reason = 'IncidentResolved') {
   const id = String(incidentId || '').trim();
   if (!id) return null;
   const mission = state.rescueMissions.get(id);
-  if (!mission) return null;
-  Object.assign(mission, {
-    status: 'Completed',
-    completedReason: reason,
-    completedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    publishing: false,
-  });
-  return mission;
+  if (mission) {
+    Object.assign(mission, {
+      status: 'Completed',
+      completedReason: reason,
+      completedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      publishing: false,
+    });
+  }
+  // Đóng luôn mission tàu thay khách (nếu có).
+  const transfer = state.rescueMissions.get(`${id}__xfer`);
+  if (transfer && transfer.status !== 'Completed') {
+    Object.assign(transfer, {
+      status: 'Completed',
+      completedReason: reason,
+      completedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      publishing: false,
+    });
+  }
+  return mission || transfer || null;
 }
 
 function nearestStationTo(point) {
@@ -2277,15 +2404,20 @@ function pointBehind(position, heading, meters) {
 /**
  * Nhận RescueDispatched một lần rồi tự phát GPS tàu cứu tới hiện trường,
  * sau đó kéo cả tàu lỗi về bến gần hiện trường nhất.
+ * Tàu cứu = rescueBoatCode (ưu tiên) hoặc replacementBoatCode (fallback contract cũ).
  * Duplicate incidentId không tạo thêm vòng chạy.
  */
 function startRescueAutomation(incident) {
   const incidentId = String(incident?.incidentId || '').trim();
-  const rescueBoatCode = String(incident?.replacementBoatCode || '').trim();
+  const rescueBoatCode = pickRescueBoatCode(incident)
+    || String(incident?.rescueBoatCode || incident?.replacementBoatCode || '').trim();
+  const replacementBoatCode = pickReplacementBoatCode(incident)
+    || String(incident?.replacementBoatCode || '').trim()
+    || null;
   const targetLat = Number(incident?.lat);
   const targetLng = Number(incident?.lng);
   if (!incidentId || !rescueBoatCode) {
-    return { started: false, error: 'Thiếu incidentId / replacementBoatCode' };
+    return { started: false, error: 'Thiếu incidentId / rescueBoatCode' };
   }
   if (!Number.isFinite(targetLat) || !Number.isFinite(targetLng)) {
     return { started: false, error: 'Chưa có tọa độ tàu sự cố' };
@@ -2303,6 +2435,7 @@ function startRescueAutomation(incident) {
     return { started: false, duplicate: true, mission: rescueMissionPublic(existing) };
   }
 
+  ensureRescueBoatOnMap(rescueBoatCode, targetLat, targetLng);
   const rescueBoat = boatByIdOrCode(rescueBoatCode);
   const hub = state.hubBoats.get(rescueBoatCode);
   const startLat = Number(hub?.lat ?? rescueBoat?.lat);
@@ -2318,6 +2451,9 @@ function startRescueAutomation(incident) {
     incidentId,
     incidentBoatCode: incident.boatCode || null,
     rescueBoatCode,
+    replacementBoatCode: replacementBoatCode && replacementBoatCode !== rescueBoatCode
+      ? replacementBoatCode
+      : null,
     status: 'Dispatched',
     currentLat: startLat,
     currentLng: startLng,
@@ -2340,10 +2476,30 @@ function startRescueAutomation(incident) {
   const open = state.openIncidents.get(incidentId);
   if (open) {
     open.missionStatus = 'Dispatched';
+    open.rescueBoatCode = rescueBoatCode;
+    open.replacementBoatCode = mission.replacementBoatCode;
     open.updatedAt = now;
   }
   console.log(`[rescue-gps] ${rescueBoatCode} → ${incident.boatCode || incidentId}`);
-  return { started: true, mission: rescueMissionPublic(mission) };
+
+  // Có tàu thay khách riêng → điều thêm (không kéo tàu sự cố).
+  let transferAutomation = null;
+  if (mission.replacementBoatCode) {
+    transferAutomation = startRescueAutomation({
+      incidentId: `${incidentId}__xfer`,
+      boatCode: null,
+      rescueBoatCode: mission.replacementBoatCode,
+      replacementBoatCode: null,
+      lat: targetLat,
+      lng: targetLng,
+    });
+  }
+
+  return {
+    started: true,
+    mission: rescueMissionPublic(mission),
+    transferAutomation,
+  };
 }
 
 async function tickRescueMissions() {
@@ -2509,8 +2665,10 @@ async function tickRescueMissions() {
  *
  * Body mẫu:
  * { "event": "IncidentCreated", "boatCode": "WB_002", "lat": 10.77, "lng": 106.70 }
- * { "event": "RescueDispatched", "incidentId": "...", "boatCode": "WB_002", "replacementBoatCode": "WB_001", "lat": 10.77, "lng": 106.70 }
+ * { "event": "RescueDispatched", "incidentId": "...", "boatCode": "WB_001", "rescueBoatCode": "SOS_001", "replacementBoatCode": "WB_002", "lat": 10.77, "lng": 106.70 }
  * { "event": "IncidentResolved", "incidentId": "..." }
+ *
+ * RescueDispatched: kéo rescueBoatCode (SOS) tới lat/lng; replacementBoatCode optional (tàu thay khách).
  */
 function ingestIncidentHook(body = {}, req = null) {
   const expected = String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim();
@@ -2622,9 +2780,9 @@ function ingestIncidentHook(body = {}, req = null) {
   }
 
   const boat = boatByIdOrCode(body.boatId || body.boatCode);
-  const rescue = boatByIdOrCode(
-    body.replacementBoatId || body.replacementBoatCode || body.rescueBoatCode,
-  );
+  const rescueBoatCode = pickRescueBoatCode(body);
+  const replacementBoatCode = pickReplacementBoatCode(body) || null;
+  const rescue = boatByIdOrCode(rescueBoatCode || replacementBoatCode);
   const incidentId = String(
     body.incidentId || body.id || randomUUID(),
   ).trim();
@@ -2642,8 +2800,11 @@ function ingestIncidentHook(body = {}, req = null) {
     severity: body.severity || 'High',
     description: body.description || `Hook ${event}`,
     resolutionStatus: 'Open',
-    replacementBoatId: body.replacementBoatId || rescue?.boatId || null,
-    replacementBoatCode: body.replacementBoatCode || body.rescueBoatCode || rescue?.boatCode || null,
+    rescueBoatCode: rescueBoatCode || replacementBoatCode || rescue?.boatCode || null,
+    replacementBoatId: body.replacementBoatId || null,
+    replacementBoatCode: replacementBoatCode && replacementBoatCode !== rescueBoatCode
+      ? replacementBoatCode
+      : (replacementBoatCode || null),
     lat: Number.isFinite(lat) ? lat : null,
     lng: Number.isFinite(lng) ? lng : null,
     occurredAt: body.occurredAt || new Date().toISOString(),
@@ -2779,6 +2940,7 @@ async function refreshOpenIncidents({ force = false } = {}) {
       incident.lng = incident.lng ?? prev.lng ?? null;
       incident.boatCode = incident.boatCode || prev.boatCode || null;
       incident.replacementBoatCode = incident.replacementBoatCode || prev.replacementBoatCode || null;
+      incident.rescueBoatCode = incident.rescueBoatCode || prev.rescueBoatCode || null;
     }
     if ((incident.lat == null || incident.lng == null) && incident.boatCode) {
       const hub = state.hubBoats.get(incident.boatCode);
@@ -2945,16 +3107,20 @@ async function assignReplacementBoat(incidentId, body = {}) {
   const id = String(incidentId || '').trim();
   if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId' };
 
-  const rescue = boatByIdOrCode(body.replacementBoatId || body.replacementBoatCode || body.boatCode);
+  const rescueBoatCode = pickRescueBoatCode(body)
+    || String(body.replacementBoatCode || body.boatCode || '').trim();
+  const replacementBoatCode = pickReplacementBoatCode(body) || null;
+  const rescue = boatByIdOrCode(body.replacementBoatId || rescueBoatCode);
   const replacementBoatId = body.replacementBoatId || rescue?.boatId;
-  if (!replacementBoatId) {
-    return { ok: false, status: 400, error: 'Thiếu replacementBoatId / boatCode tàu cứu' };
+  if (!rescueBoatCode && !replacementBoatId) {
+    return { ok: false, status: 400, error: 'Thiếu rescueBoatCode / replacementBoatCode' };
   }
 
   const payload = {
-    replacementBoatId,
+    replacementBoatId: replacementBoatId || undefined,
+    rescueBoatCode: rescueBoatCode || undefined,
     delayMinutes: body.delayMinutes == null ? null : Number(body.delayMinutes),
-    note: body.note || `Điều tàu ${rescue?.boatCode || replacementBoatId} cứu hộ từ Live GPS`,
+    note: body.note || `Điều tàu ${rescueBoatCode || replacementBoatId} cứu hộ từ Live GPS`,
   };
 
   let azure = { ok: false, status: 401, error: 'Thiếu TARGET_BEARER_TOKEN' };
@@ -2970,8 +3136,11 @@ async function assignReplacementBoat(incidentId, body = {}) {
   const existing = state.openIncidents.get(id) || { incidentId: id, resolutionStatus: 'Open' };
   const next = {
     ...existing,
-    replacementBoatId,
-    replacementBoatCode: rescue?.boatCode || body.replacementBoatCode || existing.replacementBoatCode || null,
+    replacementBoatId: replacementBoatId || existing.replacementBoatId || null,
+    rescueBoatCode: rescueBoatCode || rescue?.boatCode || existing.rescueBoatCode || null,
+    replacementBoatCode: replacementBoatCode && replacementBoatCode !== rescueBoatCode
+      ? replacementBoatCode
+      : (existing.replacementBoatCode || null),
     updatedAt: new Date().toISOString(),
     source: azure.ok ? 'api' : (existing.source || 'local'),
   };
@@ -2979,6 +3148,7 @@ async function assignReplacementBoat(incidentId, body = {}) {
     const fromAzure = normalizeIncident(azure.data, 'api');
     if (fromAzure) {
       Object.assign(next, fromAzure, {
+        rescueBoatCode: fromAzure.rescueBoatCode || next.rescueBoatCode,
         replacementBoatCode: fromAzure.replacementBoatCode || next.replacementBoatCode,
         lat: fromAzure.lat ?? next.lat,
         lng: fromAzure.lng ?? next.lng,
@@ -4468,6 +4638,7 @@ function snapshot() {
       resolutionStatus: row.resolutionStatus,
       replacementBoatId: row.replacementBoatId,
       replacementBoatCode: row.replacementBoatCode,
+      rescueBoatCode: row.rescueBoatCode || null,
       missionStatus: row.missionStatus || null,
       lat: row.lat == null ? null : round(row.lat, 7),
       lng: row.lng == null ? null : round(row.lng, 7),
