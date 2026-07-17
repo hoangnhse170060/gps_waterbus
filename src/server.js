@@ -963,6 +963,8 @@ function pruneStaleHubBoats() {
   for (const [code, boat] of [...state.hubBoats.entries()]) {
     // Tàu đang sự cố: luôn giữ marker (đỏ), không ẩn vì mất ping.
     if (hasOpenIncidentForBoat(code)) continue;
+    // SOS / tàu đang cứu hoặc còn gán trên sự cố mở — không prune (heartbeat bị skip khi cứu).
+    if (isBoatLinkedToOpenRescue(code)) continue;
     if (!isLiveMapBoatCode(code)) {
       state.hubBoats.delete(code);
       changed = true;
@@ -975,6 +977,22 @@ function pruneStaleHubBoats() {
     }
   }
   if (changed) broadcast();
+}
+
+function isBoatLinkedToOpenRescue(boatCode) {
+  const code = String(boatCode || '').trim();
+  if (!code) return false;
+  for (const mission of state.rescueMissions.values()) {
+    const status = String(mission?.status || '');
+    if (status === 'Completed') continue;
+    if (String(mission.rescueBoatCode || '').trim() === code) return true;
+    if (String(mission.incidentBoatCode || '').trim() === code) return true;
+  }
+  for (const row of state.openIncidents.values()) {
+    if (String(row.rescueBoatCode || '').trim() === code) return true;
+    if (String(row.replacementBoatCode || '').trim() === code) return true;
+  }
+  return false;
 }
 
 /**
@@ -2551,8 +2569,9 @@ function startRescueAutomation(incident) {
     { lat: startLat, lng: startLng },
     { lat: resolvedTargetLat, lng: resolvedTargetLng },
   );
-  // SOS đã sát hiện trường → Towing về bến đủ xa (không “về bến” ngay chỗ đứng).
-  const alreadyAtScene = distToScene <= Math.max(arrivalMeters * 2, 40);
+  // Chỉ bỏ qua đoạn ra hiện trường khi SOS đã ĐÚNG tại chỗ (< arrive). Không dùng ngưỡng 40m
+  // (dễ nhảy thẳng Towing về bến khác → FE không thấy chạy rồi mất badge CỨU).
+  const alreadyAtScene = distToScene <= arrivalMeters;
   let initialStatus = 'Dispatched';
   let missionTargetLat = resolvedTargetLat;
   let missionTargetLng = resolvedTargetLng;
@@ -2575,7 +2594,7 @@ function startRescueAutomation(incident) {
   }
 
   const now = new Date().toISOString();
-  const configuredSpeed = Math.max(1, Number(env.RESCUE_SPEED_KMH || env.DEFAULT_SPEED_KMH || 16));
+  const configuredSpeed = Math.max(1, Number(env.RESCUE_SPEED_KMH || 32));
   const rescueMaxSpeed = Number(rescueBoat?.maxSpeedKmh);
   const mission = {
     incidentId,
@@ -2587,10 +2606,13 @@ function startRescueAutomation(incident) {
     status: initialStatus,
     currentLat: startLat,
     currentLng: startLng,
+    startLat,
+    startLng,
     targetLat: missionTargetLat,
     targetLng: missionTargetLng,
     incidentLat: resolvedTargetLat,
     incidentLng: resolvedTargetLng,
+    traveledMeters: 0,
     speedKmh: Number.isFinite(rescueMaxSpeed)
       ? Math.min(configuredSpeed, rescueMaxSpeed)
       : configuredSpeed,
@@ -2635,6 +2657,29 @@ function startRescueAutomation(incident) {
     `[rescue-gps] START ${rescueBoatCode} → ${incidentBoatCode || incidentId} `
     + `@ ${resolvedTargetLat},${resolvedTargetLng} (${initialStatus}, ${Math.round(distToScene)}m)`,
   );
+
+  // Publish ngay điểm xuất phát — FE/SSE nhận SOS trước tick 2s (tránh đứng rồi "biến mất").
+  publishLiveGpsPosition({
+    boatCode: rescueBoatCode,
+    lat: startLat,
+    lng: startLng,
+    heading: destinationMeta
+      ? bearingDegrees(
+        { lat: startLat, lng: startLng },
+        { lat: missionTargetLat, lng: missionTargetLng },
+      )
+      : bearingDegrees(
+        { lat: startLat, lng: startLng },
+        { lat: resolvedTargetLat, lng: resolvedTargetLng },
+      ),
+    speedKmh: mission.speedKmh,
+    status: 'moving',
+    sendToTarget: true,
+    fromRescue: true,
+  }).catch((error) => {
+    console.warn(`[rescue-gps] publish start failed: ${error.message}`);
+  });
+  broadcast();
 
   // Có tàu thay khách riêng → điều thêm (không kéo tàu sự cố).
   let transferAutomation = null;
@@ -2844,12 +2889,14 @@ async function tickRescueMissions() {
 
       mission.currentLat = lat;
       mission.currentLng = lng;
+      const stepMoved = distanceMeters(current, { lat, lng });
+      mission.traveledMeters = Number(mission.traveledMeters || 0) + stepMoved;
       if (!arrived) {
         mission.status = mission.status === 'Towing' ? 'Towing' : 'InTransit';
       } else if (mission.status === 'Towing') {
         mission.status = 'AtStation';
         mission.stationArrivedAt = mission.updatedAt;
-        // Nhả tàu cứu: về trạng thái bình thường trên map / hub.
+        // Nhả BE status nhưng GIỮ mission AtStation (badge CỨU) đến khi đóng sự cố — tránh "xóa" khi FE chưa kịp thấy chạy.
         clearBeBoatStatus(mission.rescueBoatCode);
         const rescueBoat = boatByIdOrCode(mission.rescueBoatCode);
         if (rescueBoat && normalizeBoatStatus(rescueBoat.dbStatus) !== 'incident') {
@@ -2862,6 +2909,7 @@ async function tickRescueMissions() {
         if (hubRescue) {
           hubRescue.boatStatus = rescueBoat?.dbStatus || 'Active';
           hubRescue.beStatus = null;
+          hubRescue.updatedAt = new Date().toISOString();
         }
         console.log(
           `[rescue-gps] đã về ${mission.destinationStationCode || 'bến'} — `

@@ -168,8 +168,8 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
   let changed = false;
   for (const mission of missions) {
     const status = String(mission.status);
-    // Chỉ bám path khi đang chạy. AtStation/Completed: giữ GPS hub / pin user — không kéo về.
-    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) continue;
+    // Bám path khi đang chạy + AtStation (đưa pin SOS đúng bến thật, không kẹt pin cũ).
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status)) continue;
 
     const rescueCode = String(mission.rescueBoatCode || '').trim();
     const incidentCode = String(mission.incidentBoatCode || '').trim();
@@ -207,12 +207,23 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
     }
 
     const local = rescueMissions.get(String(mission.incidentId || '').trim());
-    if (local && status === 'Towing') {
-      local.phase = 'returning';
-      local.departureStationCode = mission.destinationStationCode || null;
-      local.departureStationName = mission.destinationStationName || 'bến gần nhất';
-      local.departureLat = Number(mission.targetLat);
-      local.departureLng = Number(mission.targetLng);
+    if (local) {
+      if (status === 'Dispatched' || status === 'InTransit') {
+        local.phase = 'to_incident';
+        local.departureStationName = mission.destinationStationName || local.departureStationName;
+      } else if (status === 'Towing') {
+        local.phase = 'returning';
+        local.departureStationCode = mission.destinationStationCode || null;
+        local.departureStationName = mission.destinationStationName || 'bến gần nhất';
+        local.departureLat = Number(mission.targetLat);
+        local.departureLng = Number(mission.targetLng);
+      } else if (status === 'AtStation') {
+        local.phase = 'completed';
+        local.departureStationCode = mission.destinationStationCode || local.departureStationCode;
+        local.departureStationName = mission.destinationStationName || local.departureStationName || 'bến';
+      }
+      rescueMissions.set(local.incidentId, local);
+      changed = true;
     }
   }
   if (changed) {
@@ -344,6 +355,18 @@ function syncRescueMissionsFromIncidents(data = latest) {
 }
 
 function rescuePhaseLabel(code) {
+  const key = String(code || '').trim();
+  const auto = (latest?.rescueMissions || []).find(
+    (mission) => String(mission.rescueBoatCode || '').trim() === key,
+  );
+  if (auto) {
+    const st = String(auto.status || '');
+    const dep = auto.destinationStationName || auto.destinationStationCode || 'bến';
+    if (st === 'Dispatched' || st === 'InTransit') return 'Cứu hộ → hiện trường';
+    if (st === 'Towing') return `Đang về ${dep}`;
+    if (st === 'AtStation') return `Đã về ${dep}`;
+    if (st === 'Completed') return `Đã về ${dep}`;
+  }
   const m = missionForRescue(code);
   if (!m) return null;
   const dep = m.departureStationName || m.departureStationCode || 'bến xuất phát';
@@ -728,18 +751,13 @@ function isRescueBoat(code) {
     (mission) => String(mission.rescueBoatCode || '').trim() === key,
   );
   if (automated) {
-    // Về bến / xong → trả về tàu bình thường (không còn tím).
-    return ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(String(automated.status));
+    // Giữ badge CỨU đến AtStation (sự cố còn mở) — không tắt sớm nhìn như bị xóa.
+    const status = String(automated.status || '');
+    return ['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status);
   }
   return openIncidentsList().some((row) => {
     const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
-    if (rescue !== key) return false;
-    // Có mission AtStation cùng incident → đã nhả tàu cứu.
-    const mission = (latest?.rescueMissions || []).find(
-      (m) => String(m.incidentId || '') === String(row.incidentId || ''),
-    );
-    if (mission && ['AtStation', 'Completed'].includes(String(mission.status))) return false;
-    return true;
+    return rescue === key;
   });
 }
 
