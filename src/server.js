@@ -1627,6 +1627,18 @@ async function publishLiveGpsPosition(body = {}) {
     };
   }
 
+  // FE heartbeat / Gửi GPS tay không được đè SOS đang cứu hộ (kéo về bến).
+  const fromRescue = body.fromRescue === true || body._fromRescue === true;
+  if (!fromRescue && isBoatInActiveRescueMission(boatCode)) {
+    return {
+      ok: true,
+      skipped: true,
+      status: 200,
+      mode: 'rescue-owned',
+      warning: `Đang cứu hộ tự động — bỏ qua GPS tay/heartbeat cho ${boatCode}`,
+    };
+  }
+
   const matched = [...state.boats.values()].find((boat) => (
     String(boat.boatCode) === boatCode
     && !String(boat.boatId || '').startsWith('collector-')
@@ -2786,6 +2798,7 @@ async function tickRescueMissions() {
         speedKmh: arrived ? 0 : mission.speedKmh,
         status: arrived ? 'idle' : 'moving',
         sendToTarget: true,
+        fromRescue: true,
       });
       let incidentResult = null;
       if (mission.status === 'Towing' && mission.incidentBoatCode) {
@@ -2807,6 +2820,7 @@ async function tickRescueMissions() {
           speedKmh: arrived ? 0 : mission.speedKmh,
           status: arrived ? 'idle' : 'moving',
           sendToTarget: true,
+          fromRescue: true,
         });
       } else {
         mission.lastHeading = heading;
@@ -2890,6 +2904,7 @@ async function tickRescueMissions() {
               speedKmh: mission.speedKmh,
               status: 'moving',
               sendToTarget: true,
+              fromRescue: true,
             });
             if (towStart.ok) mission.incidentBoatSequence = towStart.sequence || null;
           }

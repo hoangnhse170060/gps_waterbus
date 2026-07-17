@@ -81,6 +81,7 @@ let unlockedBoatCode = ''; // chỉ tàu này mới kéo được
 let contextMenuBoatCode = '';
 let sending = false;
 let dragging = false;
+let draggingBoatCode = '';
 let hasFitRoutes = false;
 let heartbeatTimer = null;
 let heartbeatBusy = false;
@@ -140,6 +141,18 @@ function missionForIncident(incidentId) {
   return rescueMissions.get(String(incidentId || '').trim()) || null;
 }
 
+function isBoatInActiveAutomatedRescue(code, data = latest) {
+  const key = String(code || '').trim();
+  if (!key) return false;
+  return (data?.rescueMissions || []).some((mission) => {
+    const status = String(mission?.status || '');
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) return false;
+    if (String(mission.rescueBoatCode || '').trim() === key) return true;
+    if (status === 'Towing' && String(mission.incidentBoatCode || '').trim() === key) return true;
+    return false;
+  });
+}
+
 function syncAutomatedRescuePins(hubBoats, data = latest) {
   const missions = Array.isArray(data?.rescueMissions) ? data.rescueMissions : [];
   if (!missions.length) return;
@@ -158,14 +171,16 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
     const rescueLng = Number(mission.currentLng ?? hubByCode.get(rescueCode)?.lng);
     if (!rescueCode || !Number.isFinite(rescueLat) || !Number.isFinite(rescueLng)) continue;
 
-    // User đang kéo tay → không snap về.
-    if (!pinnedFor(rescueCode)?.user) {
+    // Đang kéo tay SOS → không snap. Heartbeat/user pin cũ KHÔNG được chặn cứu hộ.
+    const rescueDragging = dragging && draggingBoatCode === rescueCode;
+    if (!rescueDragging) {
       pinnedPositions.set(rescueCode, { lat: rescueLat, lng: rescueLng, at: Date.now(), user: false });
       changed = true;
     }
 
     // Đang kéo: tàu lỗi nối đuôi — không đè cùng điểm rồi bị cluster nhảy.
-    if (status === 'Towing' && incidentCode && !pinnedFor(incidentCode)?.user) {
+    const incidentDragging = dragging && draggingBoatCode === incidentCode;
+    if (status === 'Towing' && incidentCode && !incidentDragging) {
       let lat = Number(mission.incidentCurrentLat);
       let lng = Number(mission.incidentCurrentLng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -620,12 +635,15 @@ function syncSurveyCollectorPin(data = latest) {
   pinBoatPosition(code, lat, lng, { user: false });
 }
 
-/** Cập nhật pin từ hub GPS — trừ khi user đang khóa kéo tay. */
+/** Cập nhật pin từ hub GPS — trừ khi user đang kéo tay hoặc đang cứu hộ tự động. */
 function syncLiveHubPins(hubBoats) {
   let changed = false;
   for (const boat of hubBoats || []) {
     const code = String(boat?.boatCode || '').trim();
     if (!code) continue;
+    if (dragging && draggingBoatCode === code) continue;
+    // Mission cứu hộ tự set pin từ currentLat — không để hub/Azure kéo về bến.
+    if (isBoatInActiveAutomatedRescue(code)) continue;
     const pin = pinnedFor(code);
     if (pin?.user) continue;
     const lat = Number(boat.lat);
@@ -1635,10 +1653,12 @@ function bindDragHandlers(marker, code) {
     }
     hideBoatContextMenu();
     dragging = true;
+    draggingBoatCode = String(code || '').trim();
   });
   marker.on('drag', () => {
     if (!canDragBoat(code)) return;
     dragging = true;
+    draggingBoatCode = String(code || '').trim();
     const { lat, lng } = marker.getLatLng();
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
     if (boatPhaseStatusEl) boatPhaseStatusEl.textContent = phaseStatusText(code, lat, lng) || '—';
@@ -1646,6 +1666,7 @@ function bindDragHandlers(marker, code) {
   marker.on('dragend', async () => {
     if (!canDragBoat(code) && !dragging) return;
     dragging = false;
+    draggingBoatCode = '';
     if (!canDragBoat(code)) {
       const pin = pinnedFor(code);
       if (pin) marker.setLatLng([pin.lat, pin.lng]);
@@ -1679,11 +1700,14 @@ function bindDragHandlers(marker, code) {
 
 async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
   if (!quiet && sending) return;
+  // Đang cứu hộ tự động: server publish GPS — FE heartbeat/Gửi GPS không được đè về bến.
+  if (quiet && isBoatInActiveAutomatedRescue(boatCode)) return false;
   if (!quiet) {
     sending = true;
     sendStatusEl.textContent = 'Đang gửi…';
   }
-  pinBoatPosition(boatCode, lat, lng, { user: true });
+  // Heartbeat không khóa pin user — nếu không, syncAutomatedRescuePins bị chặn và SOS đứng yên.
+  pinBoatPosition(boatCode, lat, lng, { user: !quiet });
   const st = getStatus(boatCode);
   const phase = autoPhaseForBoat(boatCode, lat, lng);
   const cruise = getBoatSpeedKmh(boatCode);
@@ -1720,7 +1744,7 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
       return false;
     }
     markSignal(boatCode);
-    pinBoatPosition(boatCode, lat, lng, { user: true });
+    pinBoatPosition(boatCode, lat, lng, { user: !quiet });
     if (!quiet) {
       const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
       sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
@@ -1750,6 +1774,8 @@ async function heartbeatAllBoats() {
     const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
+      // SOS / tàu đang kéo: server rescue tick publish — không heartbeat đè về bến.
+      if (isBoatInActiveAutomatedRescue(code)) continue;
       const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
       ensureSeedPin(code, pin.lat, pin.lng);
       const fixed = pinnedFor(code) || pin;
