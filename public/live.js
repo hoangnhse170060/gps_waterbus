@@ -149,7 +149,8 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
   let changed = false;
   for (const mission of missions) {
     const status = String(mission.status);
-    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status)) continue;
+    // Chỉ bám path khi đang chạy. AtStation/Completed: giữ GPS hub / pin user — không kéo về.
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) continue;
 
     const rescueCode = String(mission.rescueBoatCode || '').trim();
     const incidentCode = String(mission.incidentBoatCode || '').trim();
@@ -157,11 +158,14 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
     const rescueLng = Number(mission.currentLng ?? hubByCode.get(rescueCode)?.lng);
     if (!rescueCode || !Number.isFinite(rescueLat) || !Number.isFinite(rescueLng)) continue;
 
-    pinnedPositions.set(rescueCode, { lat: rescueLat, lng: rescueLng, at: Date.now(), user: false });
-    changed = true;
+    // User đang kéo tay → không snap về.
+    if (!pinnedFor(rescueCode)?.user) {
+      pinnedPositions.set(rescueCode, { lat: rescueLat, lng: rescueLng, at: Date.now(), user: false });
+      changed = true;
+    }
 
-    // Đang kéo / đã về bến: tàu lỗi nối đuôi — không đè cùng điểm rồi bị cluster nhảy.
-    if ((status === 'Towing' || status === 'AtStation') && incidentCode) {
+    // Đang kéo: tàu lỗi nối đuôi — không đè cùng điểm rồi bị cluster nhảy.
+    if (status === 'Towing' && incidentCode && !pinnedFor(incidentCode)?.user) {
       let lat = Number(mission.incidentCurrentLat);
       let lng = Number(mission.incidentCurrentLng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -172,7 +176,7 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
         const heading = (Number.isFinite(station.lat) && Number.isFinite(station.lng))
           ? bearingDegreesLocal({ lat: rescueLat, lng: rescueLng }, station)
           : Number(mission.lastHeading || 0);
-        const gap = status === 'AtStation' ? 16 : 35;
+        const gap = 35;
         const behind = pointBehindLocal({ lat: rescueLat, lng: rescueLng }, heading, gap);
         lat = behind.lat;
         lng = behind.lng;
@@ -188,8 +192,6 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
       local.departureStationName = mission.destinationStationName || 'bến gần nhất';
       local.departureLat = Number(mission.targetLat);
       local.departureLng = Number(mission.targetLng);
-    } else if (local && status === 'AtStation') {
-      local.phase = 'completed';
     }
   }
   if (changed) {
