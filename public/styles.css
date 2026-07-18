@@ -1443,36 +1443,39 @@ input.is-invalid {
   border-color: #ffffff;
 }
 
+.collector-marker-wrap {
+  background: transparent !important;
+  border: none !important;
+}
+
 .collector-marker {
   position: relative;
-  width: 58px;
-  height: 58px;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
 }
 
 .collector-marker-inner {
   position: absolute;
-  left: 13px;
-  top: 13px;
-  width: 32px;
-  height: 32px;
-  transform: rotate(var(--heading));
-  transform-origin: center;
+  left: 0;
+  top: 0;
+  width: 28px;
+  height: 28px;
+  transform: rotate(var(--heading, 0deg));
+  transform-origin: 50% 50%;
   z-index: 2;
 }
 
 .collector-marker-inner svg {
-  width: 32px;
-  height: 32px;
-  filter: drop-shadow(0 7px 12px rgba(20, 42, 50, 0.35));
+  display: block;
+  width: 28px;
+  height: 28px;
+  filter: drop-shadow(0 2px 4px rgba(20, 42, 50, 0.4));
 }
 
 .collector-marker-pulse {
-  position: absolute;
-  inset: 8px;
-  border: 2px solid rgba(17, 24, 39, 0.35);
-  border-radius: 50%;
-  background: rgba(17, 24, 39, 0.13);
-  animation: mapPulse 1.4s infinite;
+  display: none;
 }
 
 .route-card,

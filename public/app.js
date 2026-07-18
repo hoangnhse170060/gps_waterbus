@@ -1774,12 +1774,12 @@ function getPathCoordinates() {
   if (Array.isArray(lockedSurveyPath) && lockedSurveyPath.length >= 2) {
     return lockedSurveyPath.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
   }
-  // WYSIWYG: đúng polyline đang vẽ. Densify nhẹ để GPS chạy mượt — không đổi hình.
+  // WYSIWYG: đúng polyline đang vẽ (không densify — densify làm lệch cảm giác “giữa đường”).
   const expanded = expandPath(captureState.points);
-  if (expanded.length < 2) {
-    return captureState.points.map(({ lat, lng }) => ({ lat: Number(lat), lng: Number(lng) }));
+  if (expanded.length >= 2) {
+    return expanded.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
   }
-  return densifyPolyline(expanded, 8);
+  return captureState.points.map(({ lat, lng }) => ({ lat: Number(lat), lng: Number(lng) }));
 }
 
 /** Chiếu điểm lên polyline đã vẽ — marker luôn nằm trên đường. */
@@ -2440,11 +2440,12 @@ async function startRecording() {
   routeResultEl?.classList.add('hidden');
   updateWorkflow('run');
   const plannedCoords = getPathCoordinates();
-  lockedSurveyPath = plannedCoords.map((p) => ({ lat: p.lat, lng: p.lng }));
-  showPlannedRoute(lockedSurveyPath);
+  lockedSurveyPath = plannedCoords.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
   recordingActive = true;
   recordingStartedAt = Date.now();
   rebuildCaptureMarkers(); // ẩn điểm số — chỉ còn đường khi tàu chạy
+  clearPlannedRoute();
+  renderCaptureLine();
   try {
     await fetch('/api/sender', {
       method: 'PATCH',
@@ -2900,19 +2901,21 @@ function renderCollector(collector, lastCollectorSend, session) {
 }
 
 function collectorIcon(heading) {
+  const h = Number(heading);
+  const deg = Number.isFinite(h) ? h : 0;
   return L.divIcon({
-    className: '',
+    className: 'collector-marker-wrap',
     html: `
       <div class="collector-marker">
-        <div class="collector-marker-inner" style="--heading:${heading}deg">
+        <div class="collector-marker-inner" style="--heading:${deg}deg">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path fill="#111827" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
           </svg>
         </div>
       </div>
     `,
-    iconSize: [40, 40],
-    iconAnchor: [20, 20],
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
   });
 }
 
