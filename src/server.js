@@ -458,6 +458,31 @@ const server = createServer(async (req, res) => {
         }, error.status || 500);
       }
     }
+    if (url.pathname === '/api/live/resync-positions' && req.method === 'POST') {
+      // Ép đọc lại vị trí Azure — local/Railway cùng map ngay.
+      hubLiveAuthorityUntil.clear();
+      azurePositionsSeeded = false;
+      try {
+        await pollLatestBoatLocations({ force: true });
+        const hubs = [...state.hubBoats.values()].map((b) => ({
+          boatCode: b.boatCode,
+          lat: b.lat,
+          lng: b.lng,
+          source: b.source || null,
+          recordedAt: b.recordedAt || null,
+        }));
+        return sendJson(res, {
+          ok: true,
+          seeded: azurePositionsSeeded,
+          count: hubs.length,
+          boats: hubs,
+          commit: buildInfo.commitShort,
+          liveAzureWrite: liveAzureWriteEnabled(),
+        });
+      } catch (error) {
+        return sendJson(res, { ok: false, error: error.message }, 502);
+      }
+    }
     if (url.pathname === '/api/incidents/hook' && req.method === 'POST') {
       const body = await readJson(req);
       const result = ingestIncidentHook(body, req);
@@ -1051,6 +1076,15 @@ function upsertHubBoat(payload) {
     hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 8000));
   }
   rememberLastPosition(code, state.hubBoats.get(code));
+  // Đồng bộ lat/lng vào state.boats — snapshot/FE không còn dùng vị trí stagger route giả.
+  const boat = [...state.boats.values()].find((b) => String(b.boatCode || '').trim() === code);
+  if (boat) {
+    boat.lat = lat;
+    boat.lng = lng;
+    if (Number.isFinite(Number(heading))) boat.heading = Number(heading);
+    if (Number.isFinite(Number(incoming.speedKmh))) boat.speedKmh = Number(incoming.speedKmh);
+    boat.updatedAt = new Date().toISOString();
+  }
 }
 
 function clearHubBoat(boatCode, { suppressMs = 120_000 } = {}) {

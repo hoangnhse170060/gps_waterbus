@@ -13,7 +13,7 @@ const ROUTE_STYLE = {
 const WATERBUS_CORRIDOR_CODES = [
   'ST-BD', 'ST-TT', 'ST-BA', 'ST-TD2', 'ST-TD', 'ST-HBC', 'ST-LD',
 ];
-const STORAGE_PINS = 'liveGpsBoatPins.v1';
+const STORAGE_PINS = 'liveGpsBoatPins.v3'; // v3: luôn bám hub/Azure — bỏ pin lệch theo domain local/Railway
 const STORAGE_STATUS = 'liveGpsBoatStatus.v1';
 const STORAGE_SPEEDS = 'liveGpsBoatSpeeds.v1';
 const STORAGE_RESCUE = 'liveGpsRescueMissions.v1';
@@ -100,6 +100,13 @@ let snapshotPollTimer = null;
 let snapshotPollBusy = false;
 let sseAlive = false;
 const pinnedPositions = loadJsonMap(STORAGE_PINS);
+// Pin v1/v2 từng làm local ≠ Railway (mỗi domain nhớ vị trí riêng).
+try {
+  localStorage.removeItem('liveGpsBoatPins.v1');
+  localStorage.removeItem('liveGpsBoatPins.v2');
+} catch {
+  /* ignore */
+}
 const boatStatuses = loadJsonMap(STORAGE_STATUS);
 const boatSpeeds = loadJsonMap(STORAGE_SPEEDS);
 const rescueMissions = loadJsonMap(STORAGE_RESCUE);
@@ -1143,10 +1150,16 @@ function escapeHtml(value) {
 
 function fallbackLatLngForBoat(code, index, data = latest) {
   const pin = pinnedFor(code);
-  if (pin) return { lat: pin.lat, lng: pin.lng };
+  // Chỉ dùng pin user khi đang kéo tay — còn lại ưu tiên hub/Azure.
+  if (pin?.user && dragging && draggingBoatCode === code) {
+    return { lat: pin.lat, lng: pin.lng };
+  }
   const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === code);
   if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
     return { lat: Number(hub.lat), lng: Number(hub.lng) };
+  }
+  if (pin && Number.isFinite(Number(pin.lat)) && Number.isFinite(Number(pin.lng)) && !pin.user) {
+    return { lat: Number(pin.lat), lng: Number(pin.lng) };
   }
   const corridor = corridorStations(data?.stations);
   if (corridor.length) {
@@ -1161,6 +1174,25 @@ function fallbackLatLngForBoat(code, index, data = latest) {
     return { lat: Number(s.lat), lng: Number(s.lng) };
   }
   return { lat: 10.776, lng: 106.708 };
+}
+
+/** Vị trí hiện map: hub/Azure là SoT. Pin user chỉ khi đang kéo. */
+function boatMapLatLng(code, hub, index, data = latest) {
+  if (dragging && draggingBoatCode === code) {
+    const pin = pinnedFor(code);
+    if (pin && Number.isFinite(Number(pin.lat)) && Number.isFinite(Number(pin.lng))) {
+      return { lat: Number(pin.lat), lng: Number(pin.lng), source: 'drag' };
+    }
+  }
+  if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+    return { lat: Number(hub.lat), lng: Number(hub.lng), source: hub.source || 'hub' };
+  }
+  const open = openIncidentForBoat(code, data);
+  if (open && Number.isFinite(Number(open.lat)) && Number.isFinite(Number(open.lng))) {
+    return { lat: Number(open.lat), lng: Number(open.lng), source: 'incident' };
+  }
+  const fb = fallbackLatLngForBoat(code, index, data);
+  return { ...fb, source: 'fallback' };
 }
 
 function resolveUniqueSeed(code, lat, lng, occupied) {
@@ -1586,20 +1618,22 @@ function renderHubBoats(hubBoats) {
     } else {
       seed = fallbackLatLngForBoat(code, index, latest);
     }
-    if (!pinnedFor(code)) {
-      const unique = resolveUniqueSeed(code, seed.lat, seed.lng, occupied);
-      ensureSeedPin(code, unique.lat, unique.lng);
-    } else {
-      occupied.push({ ...pinnedFor(code), code });
+    // Luôn neo pin theo hub/Azure (trừ đang kéo user).
+    if (!(dragging && draggingBoatCode === code && pinnedFor(code)?.user)) {
+      pinBoatPosition(code, seed.lat, seed.lng, { user: false });
     }
+    occupied.push({ ...seed, code });
     index += 1;
   }
 
-  // Hiển thị đúng GPS — cho phép nhiều tàu sát/chồng cùng bến, không tách offset.
+  // Hiển thị đúng GPS hub — không dùng pin localStorage lệch domain.
   const displayPos = new Map();
+  index = 0;
   for (const code of codes) {
-    const pin = pinnedFor(code);
-    if (pin) displayPos.set(code, { lat: pin.lat, lng: pin.lng });
+    const hub = hubByCode.get(code);
+    const pos = boatMapLatLng(code, hub, index, latest);
+    displayPos.set(code, { lat: pos.lat, lng: pos.lng });
+    index += 1;
   }
 
   const seen = new Set();
@@ -1611,11 +1645,10 @@ function renderHubBoats(hubBoats) {
   for (const code of codes) {
     const hub = hubByCode.get(code);
     const catalogBoat = catalog.find((b) => String(b.boatCode) === code);
-    const fixed = pinnedFor(code) || fallbackLatLngForBoat(code, index, latest);
-    ensureSeedPin(code, fixed.lat, fixed.lng);
+    const fixed = displayPos.get(code) || boatMapLatLng(code, hub, index, latest);
     const trueLat = fixed.lat;
     const trueLng = fixed.lng;
-    const show = displayPos.get(code) || fixed;
+    const show = fixed;
     seen.add(code);
     index += 1;
 
@@ -1946,7 +1979,9 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
     if (!quiet) {
       pinBoatPosition(boatCode, lat, lng, { user: true });
     }
-    const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
+    const mode = body.mode === 'follow-azure'
+      ? 'follow Azure'
+      : (body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`);
     if (!quiet) {
       sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
       if (body.warning) toast(body.warning, 'warn');
@@ -2779,6 +2814,33 @@ try {
   setLivePanelCollapsed(false);
 }
 
+async function resyncAzurePositions() {
+  try {
+    const response = await fetch('/api/live/resync-positions', { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.ok === false) {
+      console.warn('[resync]', body.error || response.status);
+      return false;
+    }
+    // Xóa pin user cũ — map bám hub Azure vừa seed.
+    for (const [code, pin] of [...pinnedPositions.entries()]) {
+      if (!pin?.user) pinnedPositions.delete(code);
+      else if (!(dragging && draggingBoatCode === code)) pinnedPositions.delete(code);
+    }
+    persistPins();
+    await pullSnapshot({ force: true });
+    if (gpsScanSummaryEl) {
+      gpsScanSummaryEl.textContent = `Đồng bộ Azure · ${body.count || 0} tàu · ${body.commit || ''}`;
+    }
+    return true;
+  } catch (error) {
+    console.warn('[resync]', error.message);
+    return false;
+  }
+}
+
 connectEvents();
 startSnapshotPoll();
-startHeartbeat();
+resyncAzurePositions().finally(() => {
+  startHeartbeat();
+});
