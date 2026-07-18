@@ -2201,17 +2201,29 @@ function exactDurationMinutes(value) {
   return Number(n.toFixed(2));
 }
 
-/** Tốc độ chạy survey: body → session → không mặc định 16 nếu đã có tốc độ ghi. */
+/** Tốc độ chạy survey: ưu tiên tốc độ cài lúc vẽ/ghi — bỏ 0/1 (sau khi tàu dừng). */
 function resolveSurveySpeedKmh(body = {}, session = null, boatCode = null) {
   const maxSpeed = maxSpeedForBoatCode(boatCode || body.boatCode || session?.boatCode);
-  const raw = Number(
-    body.averageSpeedKmh
-    ?? body.speedKmh
-    ?? session?.averageSpeedKmh
-    ?? session?.speedKmh
-    ?? env.DEFAULT_SPEED_KMH
-    ?? 16,
-  );
+  const candidates = [
+    body.averageSpeedKmh,
+    body.speedKmh,
+    body.cruiseSpeedKmh,
+    session?.cruiseSpeedKmh,
+    session?.averageSpeedKmh,
+    session?.speedKmh,
+    env.DEFAULT_SPEED_KMH,
+    16,
+  ];
+  let raw = null;
+  for (const value of candidates) {
+    const n = Number(value);
+    // 0 = đã dừng; clamp min=1 biến 0 → 1 (sai). Chỉ nhận tốc độ chạy thật.
+    if (Number.isFinite(n) && n >= 2) {
+      raw = n;
+      break;
+    }
+  }
+  if (raw == null) raw = Number(env.DEFAULT_SPEED_KMH || 16);
   return clampSpeedToBoatMax(raw, maxSpeed);
 }
 
@@ -4426,9 +4438,10 @@ async function finalizeCollectorRecording() {
     createReverseRoute: Boolean(stopped.createReverseRoute),
     reverseRouteCode: stopped.reverseRouteCode || null,
     reverseRouteName: stopped.reverseRouteName || null,
-    averageSpeedKmh: stopped.speedKmh || null,
+    averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
     estimatedDurationMin: stopped.estimatedDurationMin ?? null,
-    speedKmh: stopped.speedKmh || null,
+    cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
+    speedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
     stoppedAt: new Date().toISOString(),
     targetSessionStarted: Boolean(stopped.targetSessionStarted),
   };
@@ -4460,7 +4473,8 @@ async function finalizeCollectorRecording() {
       boatCode: stopped.boatCode,
       description: 'Auto-saved after GPS recording completed',
       status: 'Active',
-      averageSpeedKmh: stopped.speedKmh,
+      averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh,
+      cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
       estimatedDurationMin: stopped.estimatedDurationMin ?? null,
       startStationId: stopped.startStationId || null,
       endStationId: stopped.endStationId || null,
@@ -4537,9 +4551,10 @@ async function saveRecordedRoute(body) {
         plannedCoordinates: state.collector.coordinates,
         startStationId: state.collector.startStationId,
         endStationId: state.collector.endStationId,
-        averageSpeedKmh: state.collector.speedKmh,
+        averageSpeedKmh: state.collector.cruiseSpeedKmh || state.collector.speedKmh,
         estimatedDurationMin: state.collector.estimatedDurationMin,
-        speedKmh: state.collector.speedKmh,
+        cruiseSpeedKmh: state.collector.cruiseSpeedKmh,
+        speedKmh: state.collector.cruiseSpeedKmh || state.collector.speedKmh,
       }
     : state.lastRecordingSession;
   if (!session?.recordedPoints?.length && !(session?.plannedCoordinates?.length >= 2)) {
@@ -5108,6 +5123,7 @@ function startCollector(body) {
     signalStrength: 4,
     gpsFixQuality: 'good',
     speedKmh,
+    cruiseSpeedKmh: speedKmh,
     maxSpeedKmh,
     estimatedDurationMin,
     heading: start.heading,
