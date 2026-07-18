@@ -2132,12 +2132,14 @@ async function resolveOpenIncident(incidentId) {
   if (!incidentId || incidentBusy) return;
   incidentBusy = true;
   try {
+    // Backup resolve khi GPS callback lỗi — body khớp contract BE.
     const res = await fetch(`/api/incidents/${encodeURIComponent(incidentId)}/resolve`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        resolutionNote: 'Đã xử lý từ Live GPS',
-        boatStatus: 'Active',
+        resolutionNote: 'Tàu đã được kéo về bến và chuyển sang bảo trì.',
+        boatStatus: 'UnderMaintenance',
+        tripStatus: null,
       }),
     });
     const body = await res.json().catch(() => ({}));
@@ -2151,7 +2153,12 @@ async function resolveOpenIncident(incidentId) {
     if (body.warning) toast(body.warning, 'warn');
     else toast('Đã đóng sự cố', 'ok');
     syncBoatControls();
-    if (latest) renderHubBoats(latest.hubBoats);
+    await pullSnapshot({ force: true });
+    // BE có thể cập nhật boat/incident chậm vài giây sau resolve.
+    setTimeout(() => {
+      fetch('/api/incidents/refresh', { method: 'POST' }).catch(() => {});
+      pullSnapshot({ force: true }).catch(() => {});
+    }, 2500);
   } catch (error) {
     toast(error.message, 'err');
   } finally {

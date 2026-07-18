@@ -2561,14 +2561,12 @@ async function notifyBeRescueMissionCompleted(mission) {
   const path = String(env.RESCUE_COMPLETED_PATH || '/api/incidents/rescue-mission-completed').trim()
     || '/api/incidents/rescue-mission-completed';
   const url = targetApiUrl(path);
+  // Body đúng contract BE — dùng boatCode/rescueBoatCode (không dùng boatName).
   const payload = {
     incidentId,
     boatCode: mission.incidentBoatCode || null,
     rescueBoatCode: mission.rescueBoatCode || null,
-    replacementBoatCode: mission.replacementBoatCode || null,
     completedAt: formatRecordedAt(new Date()),
-    destinationStationCode: mission.destinationStationCode || null,
-    destinationStationName: mission.destinationStationName || null,
     note: mission.destinationStationName
       ? `Tàu đã được kéo về ${mission.destinationStationName}`
       : 'Tàu đã được kéo về bến',
@@ -2610,6 +2608,20 @@ async function notifyBeRescueMissionCompleted(mission) {
       `[rescue-callback] ${ok ? 'OK' : 'FAIL'} ${response.status} `
       + `${mission.rescueBoatCode} · ${mission.incidentBoatCode} · ${incidentId}`,
     );
+    // BE đã Resolved — đồng bộ local (không chờ IncidentResolved hook).
+    if (ok) {
+      state.openIncidents.delete(incidentId);
+      state.resolvedIncidentIds.set(incidentId, Date.now());
+      clearBeBoatStatus(mission.rescueBoatCode);
+      if (mission.incidentBoatCode) {
+        applyBeBoatStatus({
+          boatCode: mission.incidentBoatCode,
+          status: 'UnderMaintenance',
+          source: 'rescue-mission-completed',
+        });
+      }
+      broadcast();
+    }
     return { ok, status: response.status, data, error: mission.beCallbackError };
   } catch (error) {
     mission.beCallbackSent = true;
@@ -3681,9 +3693,11 @@ async function resolveIncident(incidentId, body = {}) {
   if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId' };
 
   const payload = {
-    resolutionNote: body.resolutionNote || 'Đã xử lý sự cố từ Live GPS',
-    boatStatus: body.boatStatus || 'Active',
-    tripStatus: body.tripStatus || undefined,
+    resolutionNote: body.resolutionNote || 'Tàu đã được kéo về bến và chuyển sang bảo trì.',
+    boatStatus: body.boatStatus || 'UnderMaintenance',
+    tripStatus: Object.prototype.hasOwnProperty.call(body, 'tripStatus')
+      ? body.tripStatus
+      : null,
   };
 
   let azure = { ok: false, status: 401, error: 'Thiếu TARGET_BEARER_TOKEN' };
@@ -3702,7 +3716,7 @@ async function resolveIncident(incidentId, body = {}) {
   completeRescueMission(id);
   const nextStatus = canonicalBoatStatus(
     azure.data?.boatStatus || azure.data?.BoatStatus || payload.boatStatus,
-  ) || 'Active';
+  ) || 'UnderMaintenance';
   applyBeBoatStatus({
     boatId: existing?.boatId,
     boatCode: existing?.boatCode,
