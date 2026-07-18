@@ -4,6 +4,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
 import pg from 'pg';
 import { waterbusSchedulePublic } from './waterbus-schedule.js';
 import { createSignalRRelay } from './signalr-relay.js';
@@ -28,6 +29,7 @@ if (parseBool(env.TARGET_GPS_ALLOW_SELF_SIGNED)) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 const port = Number(env.PORT || 5177);
+const buildInfo = resolveBuildInfo(env, rootDir);
 const sequenceState = await loadSequenceState();
 let sequenceSaveTimer = null;
 const lastPositions = await loadLastPositions();
@@ -361,6 +363,9 @@ const server = createServer(async (req, res) => {
         ok: true,
         service: 'waterbus-gps-simulator',
         time: new Date().toISOString(),
+        commit: buildInfo.commit,
+        commitShort: buildInfo.commitShort,
+        builtAt: buildInfo.builtAt,
         hasDatabase: Boolean(env.DATABASE_URL || env.DB_HOST),
         senderEnabled: state.senderEnabled,
         collectorRunning: Boolean(state.collector),
@@ -644,6 +649,7 @@ server.on('error', (error) => {
 
 server.listen(port, '0.0.0.0', () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
+  console.log(`[build] commit ${buildInfo.commitShort} (${buildInfo.commit})`);
   const hookMode = Boolean(String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim());
   const jwtMode = Boolean(state.targetBearerToken);
   if (hookMode) {
@@ -5645,6 +5651,9 @@ function snapshot() {
 function publicConfig() {
   const endpoint = getTargetEndpoint();
   return {
+    commit: buildInfo.commit,
+    commitShort: buildInfo.commitShort,
+    builtAt: buildInfo.builtAt,
     senderEnabled: state.senderEnabled,
     targetEndpoint: endpoint,
     targetEndpointMasked: endpoint ? maskEndpoint(endpoint) : '',
@@ -5765,7 +5774,16 @@ async function serveStatic(pathname, res) {
   if (!filePath.startsWith(publicDir)) return sendJson(res, { error: 'Forbidden' }, 403);
   try {
     const content = await readFile(filePath);
-    res.writeHead(200, { 'Content-Type': contentType(filePath) });
+    const type = contentType(filePath);
+    const headers = { 'Content-Type': type };
+    // HTML luôn lấy bản mới; JS/CSS đã có ?v= cache-bust.
+    if (filePath.endsWith('.html')) {
+      headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
+      headers.Pragma = 'no-cache';
+    } else if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
+      headers['Cache-Control'] = 'public, max-age=60, must-revalidate';
+    }
+    res.writeHead(200, headers);
     res.end(content);
   } catch {
     sendJson(res, { error: 'Not found' }, 404);
@@ -5815,6 +5833,35 @@ function round(value, digits) {
 
 function parseBool(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+/** Commit đang chạy — Railway set RAILWAY_GIT_COMMIT_SHA; local lấy từ git. */
+function resolveBuildInfo(envVars, projectRoot) {
+  const raw = String(
+    envVars.RAILWAY_GIT_COMMIT_SHA
+    || process.env.RAILWAY_GIT_COMMIT_SHA
+    || envVars.GIT_COMMIT
+    || process.env.GIT_COMMIT
+    || '',
+  ).trim();
+  let commit = raw;
+  if (!commit) {
+    try {
+      commit = execSync('git rev-parse HEAD', {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch {
+      commit = 'unknown';
+    }
+  }
+  const commitShort = commit.length > 7 ? commit.slice(0, 7) : commit;
+  return {
+    commit,
+    commitShort,
+    builtAt: new Date().toISOString(),
+  };
 }
 
 /** Fallback device khi tàu chưa có dòng gps_devices. */

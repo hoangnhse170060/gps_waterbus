@@ -404,6 +404,14 @@ body.survey-open {
   color: var(--muted);
 }
 
+.live-build {
+  margin: 8px 0 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
 .live-legend i {
   display: inline-block;
   width: 10px;

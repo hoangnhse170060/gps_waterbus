@@ -2405,6 +2405,11 @@ function maybeToastNewIncidents(data) {
 
 function render(data) {
   latest = data;
+  const stamp = document.querySelector('#buildStamp');
+  if (stamp && data?.config?.commitShort) {
+    stamp.textContent = `build ${data.config.commitShort}`;
+    stamp.title = data.config.commit || data.config.commitShort;
+  }
   // Tàu vừa nhận trip / cứu hộ → thu hồi unlock tay.
   if (unlockedBoatCode) {
     const unlocked = String(unlockedBoatCode).trim();
