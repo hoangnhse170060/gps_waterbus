@@ -520,7 +520,13 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === '/api/collector/start' && req.method === 'POST') {
       const body = await readJson(req);
-      state.collector = startCollector(body);
+      let collector;
+      try {
+        collector = startCollector(body);
+      } catch (error) {
+        return sendJson(res, { error: error.message }, error.status || 400);
+      }
+      state.collector = collector;
       state.collectorQueue = [];
       state.lastCollectorSend = null;
       state.lastAutoSavedRoute = null;
@@ -4960,6 +4966,12 @@ function enrichStopsAlongPath(coordinates, rawStops, startStationId = '', endSta
 function startCollector(body) {
   const routeCode = cleanRouteText(body.routeCode, 'Route code');
   const routeName = cleanRouteText(body.routeName || body.routeCode, 'Route name');
+  const boatCodeEarly = cleanOptionalText(body.boatCode) || `SURVEY-${routeCode}`;
+  if (tripAutorun.isBoatInActiveTripMission(boatCodeEarly)) {
+    const err = new Error(`Tàu ${boatCodeEarly} đang chạy trip — không ghi GPS survey.`);
+    err.status = 409;
+    throw err;
+  }
   const keepDrawnPath = body.keepDrawnPath === true || body.followRiver === false;
   let coordinates = validateRoutePoints(body.coordinates);
   if (!keepDrawnPath) {
@@ -4971,7 +4983,7 @@ function startCollector(body) {
   }
   const lengthMeters = routeLength(coordinates);
   const start = pointAtDistance(coordinates, 0);
-  const boatCode = cleanOptionalText(body.boatCode) || `SURVEY-${routeCode}`;
+  const boatCode = boatCodeEarly;
   // Dùng device đã đăng ký trong gps_devices cho đúng tàu (vd WB_005 → gps-wb-005).
   const deviceId = deviceIdForBoat({ boatCode });
   const seedSequence = Math.max(

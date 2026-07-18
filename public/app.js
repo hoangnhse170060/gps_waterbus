@@ -442,6 +442,13 @@ clearCaptureEl.addEventListener('click', () => {
 saveCapturedRouteEl.addEventListener('click', saveCapturedRoute);
 toolPanEl?.addEventListener('click', () => setDrawTool('pan'));
 toolDrawEl?.addEventListener('click', () => {
+  const block = surveyDrawBlocked();
+  if (block) {
+    setDrawTool('pan');
+    captureStatusEl.textContent = `Không vẽ: ${block}`;
+    notifyWarn(`Không vẽ: ${block}`);
+    return;
+  }
   captureState.finished = false;
   clearCompletedRouteLine();
   setDrawTool('draw');
@@ -710,9 +717,23 @@ function upsertSignalRBoatLocation(_payload) {
 }
 
 /** Tàu đang chạy (live GPS) hoặc đang sự cố/bảo trì → không cho đi dò (survey). */
+function activeTripForSurveyBoat(boatCode, data = latest) {
+  const code = String(boatCode || '').trim();
+  if (!code) return null;
+  const list = Array.isArray(data?.tripMissions) ? data.tripMissions : [];
+  return list.find((row) => {
+    if (String(row?.boatCode || '').trim() !== code) return false;
+    return ['Pending', 'ToDeparture', 'Boarding', 'Running', 'WaitingAtStop', 'Paused']
+      .includes(String(row?.status || ''));
+  }) || null;
+}
+
 function boatSurveyBlockReason(boatCode, data = latest) {
   const code = String(boatCode || '').trim();
   if (!code) return '';
+
+  const trip = activeTripForSurveyBoat(code, data);
+  if (trip) return `đang trip (${trip.status}) · không vẽ / không đi dò`;
 
   const open = (data?.openIncidents || []).find((row) => String(row.boatCode || '').trim() === code);
   if (open) return `đang sự cố · không đi dò`;
@@ -748,11 +769,30 @@ function boatSurveyBlockReason(boatCode, data = latest) {
   return '';
 }
 
+function surveyDrawBlocked(data = latest) {
+  const code = String(collectorBoatCodeEl?.value || selectedCollectorBoatCode || '').trim();
+  if (!code) return '';
+  return boatSurveyBlockReason(code, data);
+}
+
 function isBoatAvailableForSurvey(boatCode, data = latest) {
   return !boatSurveyBlockReason(boatCode, data);
 }
 
 function setDrawTool(tool) {
+  if (tool === 'draw') {
+    const block = surveyDrawBlocked();
+    if (block) {
+      captureState.enabled = false;
+      toolPanEl?.classList.toggle('is-active', true);
+      toolDrawEl?.classList.toggle('is-active', false);
+      map.getContainer().style.cursor = '';
+      captureStatusEl.textContent = `Không vẽ: ${block}`;
+      notifyWarn(`Không vẽ: ${block}`);
+      renderCaptureState();
+      return;
+    }
+  }
   captureState.enabled = tool === 'draw';
   toolPanEl?.classList.toggle('is-active', tool === 'pan');
   toolDrawEl?.classList.toggle('is-active', tool === 'draw');
@@ -887,6 +927,12 @@ function checkRouteCodeDuplicate() {
 
 map.on('click', (event) => {
   if (!captureState.enabled) return;
+  const block = surveyDrawBlocked();
+  if (block) {
+    setDrawTool('pan');
+    captureStatusEl.textContent = `Không vẽ: ${block}`;
+    return;
+  }
   addCapturePoint(event.latlng, { source: 'manual' });
 });
 
@@ -2013,19 +2059,37 @@ function clearCapturePoints() {
 
 function renderCaptureState() {
   captureCountEl.textContent = `${captureState.points.length} điểm`;
-  if (toggleCaptureEl) toggleCaptureEl.textContent = captureState.enabled ? 'Đang vẽ...' : 'Bắt đầu';
-  if (undoCapturePointEl) undoCapturePointEl.disabled = !captureState.points.length;
+  const tripBlock = surveyDrawBlocked();
+  if (tripBlock && captureState.enabled) {
+    captureState.enabled = false;
+    map.getContainer().style.cursor = '';
+    toolDrawEl?.classList.remove('is-active');
+    toolPanEl?.classList.add('is-active');
+  }
+  if (toggleCaptureEl) {
+    toggleCaptureEl.textContent = captureState.enabled ? 'Đang vẽ...' : 'Bắt đầu';
+    toggleCaptureEl.disabled = Boolean(tripBlock) || recordingActive;
+  }
+  if (toolDrawEl) toolDrawEl.disabled = Boolean(tripBlock) || recordingActive;
+  if (finishDrawEl) {
+    finishDrawEl.disabled = captureState.points.length < 2 || captureState.finished || Boolean(tripBlock);
+  }
+  if (undoCapturePointEl) undoCapturePointEl.disabled = !captureState.points.length || Boolean(tripBlock);
   if (clearCaptureEl) clearCaptureEl.disabled = !captureState.points.length;
   if (saveCapturedRouteEl) saveCapturedRouteEl.disabled = captureState.points.length < 2;
-  if (toolUndoEl) toolUndoEl.disabled = !captureState.points.length;
+  if (toolUndoEl) toolUndoEl.disabled = !captureState.points.length || Boolean(tripBlock);
   const canClear = captureState.points.length > 0
     || Boolean(lockedSurveyPath)
     || Boolean(plannedRouteLine)
     || Boolean(completedRouteLine)
     || Boolean(selectedRouteId);
   if (toolClearEl) toolClearEl.disabled = !canClear;
-  if (finishDrawEl) {
-    finishDrawEl.disabled = captureState.points.length < 2 || captureState.finished;
+  if (startCollectorEl && !recordingActive) {
+    const code = String(collectorBoatCodeEl?.value || '').trim();
+    const block = code ? boatSurveyBlockReason(code) : 'chưa chọn tàu';
+    startCollectorEl.disabled = Boolean(block) || captureState.points.length < 2;
+    if (block && code) startCollectorEl.title = block;
+    else startCollectorEl.title = '';
   }
   updateDrawStats();
   // Lưu bản vẽ theo đúng tàu đang chọn (đổi tàu = đổi route của tàu đó).
@@ -2376,10 +2440,6 @@ async function startRecording() {
   routeResultEl?.classList.add('hidden');
   updateWorkflow('run');
   const plannedCoords = getPathCoordinates();
-  const keepDrawnPath = isSightseeingLoop
-    || captureState.points.some((p) => p.source === 'manual')
-    || captureState.points.length > 2
-    || !riverPathOverride;
   lockedSurveyPath = plannedCoords.map((p) => ({ lat: p.lat, lng: p.lng }));
   showPlannedRoute(lockedSurveyPath);
   recordingActive = true;
@@ -2404,13 +2464,22 @@ async function startRecording() {
         sendToTarget: true,
         recording: true,
         isNewRouteSurvey: true,
-        keepDrawnPath,
+        keepDrawnPath: true,
         ...surveySaveFields(),
         coordinates: plannedCoords,
       }),
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || 'Không bắt đầu ghi được GPS');
+    // Đồng bộ đường hiển thị = path server đang chạy (tránh tàu lệch đường vẽ).
+    const runCoords = Array.isArray(body.coordinates) && body.coordinates.length >= 2
+      ? body.coordinates.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }))
+        .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng))
+      : plannedCoords;
+    lockedSurveyPath = runCoords;
+    riverPathOverride = runCoords;
+    showPlannedRoute(lockedSurveyPath);
+    renderCaptureLine();
     const warn = body.targetSessionWarning ? ` ${body.targetSessionWarning}` : '';
     const startName = startStation?.stationName || startStation?.stationCode || 'điểm đầu đường vẽ';
     captureStatusEl.textContent = `Tàu nhảy tới ${startName} rồi ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
