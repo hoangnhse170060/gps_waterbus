@@ -1591,103 +1591,21 @@ function renderRoutes(routes, stations, riverCorridor) {
   const seen = new Set();
   const bounds = [];
 
-  // Neon routes — mờ hơn để không át vạch sông OSM.
-  for (const route of routes || []) {
-    const id = route.routeId;
-    const latlngs = (route.coordinates || [])
-      .map((p) => [Number(p.lat), Number(p.lng)])
-      .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng));
-    if (!id || latlngs.length < 2) continue;
-    seen.add(id);
-
-    let layer = routeLayers.get(id);
-    const tip = [route.routeCode, route.routeName].filter(Boolean).join(' · ');
-    if (!layer) {
-      layer = L.polyline(latlngs, { ...ROUTE_STYLE, opacity: 0.08 }).addTo(map);
-      if (tip) layer.bindTooltip(tip);
-      routeLayers.set(id, layer);
-    } else {
-      layer.setLatLngs(latlngs);
-      layer.setStyle({ ...ROUTE_STYLE, opacity: 0.08 });
-      if (!map.hasLayer(layer)) layer.addTo(map);
-    }
-    for (const p of latlngs) bounds.push(p);
+  // Live: không vẽ đường Neon / corridor đè lên map (tàu vẫn bám path phía server).
+  // Chỉ fit bounds theo bến nếu chưa fit.
+  for (const [id, layer] of [...routeLayers.entries()]) {
+    layer.remove();
+    routeLayers.delete(id);
   }
 
-  // Vạch sông OSM Saigon Waterbus (ưu tiên từ snapshot).
-  const corridorPts = (Array.isArray(riverCorridor) && riverCorridor.length >= 2)
-    ? riverCorridor
-    : null;
-  if (corridorPts) {
-    const id = '__osm-waterbus-corridor__';
-    const latlngs = corridorPts
-      .map((p) => [Number(p.lat), Number(p.lng)])
-      .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng));
-    if (latlngs.length >= 2) {
-      seen.add(id);
-      let layer = routeLayers.get(id);
-      const style = {
-        color: '#2563eb',
-        weight: 4,
-        opacity: 0.85,
-        dashArray: '12 8',
-        interactive: false,
-        smoothFactor: 1,
-      };
-      if (!layer) {
-        layer = L.polyline(latlngs, style).addTo(map);
-        layer.bindTooltip('Saigon Waterbus (OSM)');
-        routeLayers.set(id, layer);
-      } else {
-        layer.setLatLngs(latlngs);
-        layer.setStyle(style);
-        if (!map.hasLayer(layer)) layer.addTo(map);
-      }
-      for (const p of latlngs) bounds.push(p);
-    }
-  } else if (!seen.size) {
-    const byCode = new Map(
-      (stations || [])
-        .filter((s) => s?.stationCode && Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)))
-        .map((s) => [String(s.stationCode).toUpperCase(), s]),
-    );
-    const latlngs = WATERBUS_CORRIDOR_CODES
-      .map((code) => byCode.get(code))
-      .filter(Boolean)
-      .map((s) => [Number(s.lat), Number(s.lng)]);
-    const id = '__waterbus-corridor__';
-    if (latlngs.length >= 2) {
-      seen.add(id);
-      let layer = routeLayers.get(id);
-      if (!layer) {
-        layer = L.polyline(latlngs, {
-          ...ROUTE_STYLE,
-          dashArray: '10 10',
-          opacity: 0.35,
-          color: '#2563eb',
-        }).addTo(map);
-        layer.bindTooltip('Hành lang Waterbus (bến DB)');
-        routeLayers.set(id, layer);
-      } else {
-        layer.setLatLngs(latlngs);
-        layer.setStyle({
-          ...ROUTE_STYLE,
-          dashArray: '10 10',
-          opacity: 0.35,
-          color: '#2563eb',
-        });
-        if (!map.hasLayer(layer)) layer.addTo(map);
-      }
-      for (const p of latlngs) bounds.push(p);
-    }
+  for (const station of stations || []) {
+    if (!Number.isFinite(Number(station?.lat)) || !Number.isFinite(Number(station?.lng))) continue;
+    bounds.push([Number(station.lat), Number(station.lng)]);
   }
-
-  for (const [id, layer] of routeLayers) {
-    if (!seen.has(id)) {
-      layer.remove();
-      routeLayers.delete(id);
-    }
-  }
+  // Giữ tham số để tương thích caller — không render polyline.
+  void routes;
+  void riverCorridor;
+  void seen;
 
   if (!hasFitRoutes && bounds.length) {
     hasFitRoutes = true;
