@@ -8,6 +8,7 @@ import pg from 'pg';
 import { scheduleTravelMinutes, waterbusSchedulePublic } from './waterbus-schedule.js';
 import { createSignalRRelay } from './signalr-relay.js';
 import { distanceMeters, routeLength } from './geo-distance.js';
+import { createTripAutorun } from './trip-autorun.js';
 
 const { Pool } = pg;
 
@@ -51,6 +52,7 @@ const state = {
   hubBoats: new Map(),
   openIncidents: new Map(),
   rescueMissions: new Map(),
+  tripMissions: new Map(),
   resolvedIncidentIds: new Map(),
   beBoatStatuses: new Map(), // boatCode|boatId → { status, boatId, boatCode, source, updatedAt }
   signalrStatus: {
@@ -288,6 +290,44 @@ setInterval(() => {
 }, Math.max(1000, Number(env.RESCUE_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
 // BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
 setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
+
+// Trip theo lịch BE (function decls bên dưới đã hoist — an toàn gọi create tại đây).
+const tripAutorun = createTripAutorun({
+  state,
+  env,
+  parseBool,
+  cleanOptionalText,
+  clampSpeedToBoatMax,
+  maxSpeedForBoatCode,
+  pointAtDistance,
+  parseRouteCoordinates,
+  requestTargetApi,
+  publishLiveGpsPosition,
+  isBoatInActiveRescueMission,
+  hasOpenIncidentForBoat,
+  isActiveBoatCode,
+  deviceIdForBoat,
+  boatByIdOrCode,
+  normalizeBoatStatus,
+  effectiveBoatStatus,
+  formatRecordedAt,
+});
+setInterval(() => {
+  tripAutorun.pollDueTrips().catch((error) => {
+    console.warn(`[trip-gps] poll: ${error.message}`);
+  });
+}, Math.max(5000, Number(env.TRIP_DUE_POLL_MS || 30000)));
+setInterval(() => {
+  tripAutorun.tickTripMissions().catch((error) => {
+    console.warn(`[trip-gps] tick: ${error.message}`);
+  });
+}, Math.max(1000, Number(env.TRIP_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
+// Seed poll due sau khi server lên.
+setTimeout(() => {
+  tripAutorun.pollDueTrips().catch((error) => {
+    console.warn(`[trip-gps] seed: ${error.message}`);
+  });
+}, 4000);
 
 const server = createServer(async (req, res) => {
   try {
@@ -883,8 +923,9 @@ function upsertHubBoat(payload) {
   if (state.collector && String(state.collector.boatCode || '').trim() === code) return;
 
   const forceAccept = payload.forceAccept === true || payload._forceAccept === true;
-  // Đang cứu hộ tự động: chỉ nhận GPS từ publishLiveGpsPosition (forceAccept), bỏ echo Azure cũ kéo về bến.
+  // Đang cứu hộ / trip lịch: chỉ nhận GPS từ publishLiveGpsPosition (forceAccept), bỏ echo Azure cũ.
   if (!forceAccept && isBoatInActiveRescueMission(code)) return;
+  if (!forceAccept && tripAutorun.isBoatInActiveTripMission(code)) return;
 
   const prev = state.hubBoats.get(code);
   const incoming = {
@@ -1648,6 +1689,7 @@ async function publishLiveGpsPosition(body = {}) {
 
   // FE heartbeat / Gửi GPS tay không được đè SOS đang cứu hộ (kéo về bến).
   const fromRescue = body.fromRescue === true || body._fromRescue === true;
+  const fromTrip = body.fromTrip === true || body._fromTrip === true;
   if (!fromRescue && isBoatInActiveRescueMission(boatCode)) {
     return {
       ok: true,
@@ -1655,6 +1697,16 @@ async function publishLiveGpsPosition(body = {}) {
       status: 200,
       mode: 'rescue-owned',
       warning: `Đang cứu hộ tự động — bỏ qua GPS tay/heartbeat cho ${boatCode}`,
+    };
+  }
+  // Trip autorun sở hữu GPS khi đang chạy lịch (trừ chính tick trip).
+  if (!fromTrip && !fromRescue && tripAutorun.isBoatInActiveTripMission(boatCode)) {
+    return {
+      ok: true,
+      skipped: true,
+      status: 200,
+      mode: 'trip-owned',
+      warning: `Đang chạy trip theo lịch — bỏ qua GPS tay/heartbeat cho ${boatCode}`,
     };
   }
 
@@ -1676,6 +1728,12 @@ async function publishLiveGpsPosition(body = {}) {
     speedKmh,
   });
   const status = cleanOptionalText(body.status) || (speedKmh > 0.5 ? 'moving' : 'idle');
+  const tripId = fromTrip
+    ? (cleanOptionalText(body.tripId) || null)
+    : null;
+  const routeCode = fromTrip
+    ? (cleanOptionalText(body.routeCode) || null)
+    : null;
 
   const sequence = bumpDeviceSequence(deviceId, matched || null);
   const payload = {
@@ -1684,9 +1742,9 @@ async function publishLiveGpsPosition(body = {}) {
     boatId: matched?.boatId || body.boatId || null,
     boatCode,
     boatName: matched?.boatName || body.boatName || null,
-    tripId: null,
+    tripId,
     routeId: null,
-    routeCode: null,
+    routeCode,
     lat: round(lat, 7),
     lng: round(lng, 7),
     speedKmh: round(speedKmh, 1),
@@ -1729,7 +1787,7 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   try {
-    const azurePayload = sanitizeGpsPayloadForAzure(payload);
+    const azurePayload = sanitizeGpsPayloadForAzure(payload, { keepTrip: fromTrip });
     const response = await fetch(getTargetEndpoint(), {
       method: 'POST',
       headers: buildGpsHeaders(azurePayload),
@@ -1889,15 +1947,31 @@ function buildGpsHeaders(payload) {
 /**
  * BE routes đang trống: gửi routeId/routeCode sẽ 404 → vị trí không cập nhật.
  * Mặc định luôn null trên POST /tracking/locations (tắt bằng AZURE_GPS_OMIT_ROUTE=false).
+ * Trip autorun: keepTrip=true giữ tripId (+ routeCode) để BE chuyển InProgress.
  */
-function sanitizeGpsPayloadForAzure(payload) {
+function sanitizeGpsPayloadForAzure(payload, { keepTrip = false } = {}) {
   const out = { ...payload };
+  if (keepTrip) {
+    out.routeId = null;
+    return out;
+  }
   if (parseBool(env.AZURE_GPS_OMIT_ROUTE ?? 'true')) {
     out.routeId = null;
     out.routeCode = null;
     out.tripId = null;
   }
   return out;
+}
+
+function buildHookHeaders() {
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  const secret = String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim();
+  if (secret) headers['X-Live-Hook-Secret'] = secret;
+  if (state.targetApiKey) headers['X-Api-Key'] = state.targetApiKey;
+  return headers;
 }
 
 function getTargetEndpoint() {
@@ -2088,7 +2162,10 @@ async function requestTargetApi({
     return result;
   }
   try {
-    const headers = auth === 'bearer' ? buildBearerHeaders() : buildGpsHeaders({ deviceId });
+    let headers;
+    if (auth === 'bearer') headers = buildBearerHeaders();
+    else if (auth === 'hook') headers = buildHookHeaders();
+    else headers = buildGpsHeaders({ deviceId });
     const init = { method, headers };
     if (payload != null && method !== 'GET' && method !== 'HEAD') {
       init.body = JSON.stringify(payload);
@@ -2111,6 +2188,9 @@ async function requestTargetApi({
       result.error = formatTargetApiError(data, response.status);
       if (response.status === 401 && auth === 'bearer') {
         result.error = `${result.error} · Cần TARGET_BEARER_TOKEN (JWT Staff/Admin)`;
+      }
+      if ((response.status === 401 || response.status === 403) && auth === 'hook') {
+        result.error = `${result.error} · Cần LIVE_HOOK_SECRET khớp BE`;
       }
     }
     if (!silent) {
@@ -5165,6 +5245,7 @@ function snapshot() {
       source: row.source,
     })),
     rescueMissions: [...state.rescueMissions.values()].map(rescueMissionPublic),
+    tripMissions: tripAutorun.tripMissionsPublic(),
     routes: [...state.routes.values()].map((route) => ({
       routeId: route.routeId,
       routeCode: route.routeCode,
@@ -5298,6 +5379,12 @@ function publicConfig() {
       ? 'hook'
       : (state.targetBearerToken ? 'jwt' : 'local'),
     openIncidentCount: state.openIncidents.size,
+    tripAutorun: parseBool(env.TRIP_AUTORUN ?? 'true'),
+    tripDuePollMs: Number(env.TRIP_DUE_POLL_MS || 30000),
+    tripGpsIntervalMs: Number(env.TRIP_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000),
+    tripLookaheadMinutes: Number(env.TRIP_LOOKAHEAD_MINUTES || 120),
+    activeTripCount: [...state.tripMissions.values()]
+      .filter((m) => !['Completed'].includes(String(m.status || ''))).length,
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),
