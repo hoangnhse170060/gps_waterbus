@@ -1246,7 +1246,7 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
     if (!(meters > 5)) return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     const km = meters / 1000;
     // Chỉ thời gian chạy GPS×tốc độ — không lấy lịch / BE.
-    const minutes = Number(((km / speed) * 60).toFixed(1));
+    const minutes = Number(((km / speed) * 60).toFixed(2));
     return {
       ...stop,
       standardTravelMin: minutes > 0 ? minutes : null,
@@ -1315,8 +1315,8 @@ function surveySaveFields() {
     startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
     endStationId: endStationEl.value || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId || null,
     stops: buildSurveyStops(),
-    // Đúng số trên panel lúc vẽ — (km ÷ tốc độ cài) × 60.
-    estimatedDurationMin: pathMinutes > 0 ? Number(pathMinutes.toFixed(1)) : null,
+    // Đúng số trên panel lúc vẽ — (km ÷ tốc độ cài) × 60 (vd 0.22).
+    estimatedDurationMin: pathMinutes > 0 ? Number(pathMinutes.toFixed(2)) : null,
   };
   const inferredType = getSurveyRouteType();
   const wantReverse = Boolean(createReverseRouteEl?.checked)
@@ -2257,7 +2257,7 @@ function updateDrawStats() {
   if (drawDistanceEl) drawDistanceEl.textContent = kmText;
   if (drawDurationEl) {
     drawDurationEl.textContent = meters > 0
-      ? `${minutesExact.toFixed(1)} phút`
+      ? `${minutesExact.toFixed(2)} phút`
       : '0 phút';
   }
   if (drawPointsEl) drawPointsEl.textContent = `${captureState.points.length} điểm`;
@@ -2732,7 +2732,7 @@ function renderRouteResult(body) {
     ? Number(body.estimatedDurationMin)
     : null;
   const durationText = Number.isFinite(duration) && duration > 0
-    ? (Number.isInteger(duration) ? `${duration}` : duration.toFixed(1))
+    ? Number(duration.toFixed(2)).toString()
     : null;
   const stopLines = stops
     .slice()

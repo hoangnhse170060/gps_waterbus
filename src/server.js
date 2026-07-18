@@ -2186,12 +2186,11 @@ function formatTargetApiError(data, status) {
   return data.error || data.message || data.title || data.detail || `BE tra ${status}`;
 }
 
-/** Azure thường bắt standardTravelMin là int ≥ 1. */
-function azureTravelMinutes(value) {
-  if (value == null || value === '') return null;
+/** Giữ đúng phút lúc vẽ (vd 0.22) — không làm tròn lên 1. */
+function exactDurationMinutes(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.max(1, Math.round(n));
+  return Number(n.toFixed(2));
 }
 
 async function getFromTargetApi(pathname, deviceId, { silent = false } = {}) {
@@ -4147,7 +4146,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
       lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
       isPickupAllowed: stop.isPickupAllowed !== false,
       isDropoffAllowed: stop.isDropoffAllowed !== false,
-      standardTravelMin: azureTravelMinutes(stop.standardTravelMin),
+      standardTravelMin: exactDurationMinutes(stop.standardTravelMin),
       segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
     }));
     payload.stops = stops;
@@ -4158,14 +4157,14 @@ async function saveRouteFromGpsOnTarget(session, body) {
       sequence: index + 1,
       recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
     }));
-    // Thời gian chạy = (quãng đường vẽ ÷ tốc độ cài) × 60 — khớp panel lúc vẽ.
+    // Thời gian chạy = đúng số panel lúc vẽ (vd 0.22) — không ép int ≥ 1.
     const pathKm = routeLength(snapped) / 1000;
     const pathMinutes = Number(body.estimatedDurationMin) > 0
       ? Number(body.estimatedDurationMin)
       : ((pathKm / azureSpeedKmh) * 60);
-    payload.estimatedDurationMin = Math.max(1, Math.round(Number(pathMinutes.toFixed(1))));
+    payload.estimatedDurationMin = exactDurationMinutes(pathMinutes);
     console.log(
-      `[from-gps] ${payload.routeCode} azureSpeed=${azureSpeedKmh} segments:`,
+      `[from-gps] ${payload.routeCode} azureSpeed=${azureSpeedKmh} duration=${payload.estimatedDurationMin} segments:`,
       stops.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
     );
   } else {
@@ -4174,7 +4173,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
     const pathMinutes = Number(body.estimatedDurationMin) > 0
       ? Number(body.estimatedDurationMin)
       : ((pathKm / azureSpeedKmh) * 60);
-    payload.estimatedDurationMin = Math.max(1, Math.round(Number(pathMinutes.toFixed(1))));
+    payload.estimatedDurationMin = exactDurationMinutes(pathMinutes);
   }
 
   const targetResult = await postToTargetApi(
@@ -4258,9 +4257,10 @@ async function persistRecordingSession(body, sessionInput = null) {
           });
         }
       }
-      // Giữ đúng phút (km ÷ tốc độ) lúc vẽ — không lấy estimatedDurationMin của BE.
-      if (Number(targetSave.outboundEstimatedDurationMin) > 0) {
-        route.estimatedDurationMin = Math.max(1, Math.round(Number(targetSave.outboundEstimatedDurationMin)));
+      // Giữ đúng phút panel (vd 0.22) — không lấy / làm tròn estimatedDurationMin của BE.
+      const outboundMin = exactDurationMinutes(targetSave.outboundEstimatedDurationMin);
+      if (outboundMin != null) {
+        route.estimatedDurationMin = outboundMin;
       }
       if (!route.reverseRoute && targetSave.data?.reverseRoute) {
         route.reverseRoute = targetSave.data.reverseRoute;
@@ -4529,14 +4529,17 @@ async function createCapturedRoute(body) {
   );
   points = snapCoordinatesToStops(points, normalizedStops, detectRadius);
   const lengthMeters = routeLength(points);
-  // phút = (km / tốc_độ_chạy) × 60 · khớp panel lúc vẽ — không lấy lịch/tổng đoạn.
+  // phút = (km / tốc_độ_chạy) × 60 · khớp panel lúc vẽ (vd 0.22) — không ép int ≥ 1.
   const baseDistanceKm = round(lengthMeters / 1000, 3);
   const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh);
-  const estimatedDurationExact = Number(body.estimatedDurationMin) > 0
-    ? Number(body.estimatedDurationMin)
-    : Number(((baseDistanceKm / averageSpeedKmh) * 60).toFixed(1));
-  // Cột DB estimated_duration_min là int — làm tròn cận số đúng.
-  const estimatedDurationMin = Math.max(1, Math.round(estimatedDurationExact));
+  const estimatedDurationExact = exactDurationMinutes(
+    Number(body.estimatedDurationMin) > 0
+      ? Number(body.estimatedDurationMin)
+      : ((baseDistanceKm / averageSpeedKmh) * 60),
+  ) || 0;
+  // Cột DB estimated_duration_min là int — chỉ làm tròn khi ghi DB; API trả số thập phân đúng.
+  const estimatedDurationMinDb = Math.max(1, Math.round(estimatedDurationExact || 1));
+  const estimatedDurationMin = estimatedDurationExact || estimatedDurationMinDb;
   const pointSql = points
     .map((point) => `ST_MakePoint(${point.lng}, ${point.lat})::geometry`)
     .join(', ');
@@ -4622,7 +4625,7 @@ with route_input as (
     ${sqlLiteral(routeName)} as route_name,
     ${sqlLiteral(description)} as description,
     ${sqlLiteral(status)} as status,
-    ${estimatedDurationMin}::int as estimated_duration_min,
+    ${estimatedDurationMinDb}::int as estimated_duration_min,
     ${baseDistanceKm}::numeric as base_distance_km,
     ST_SetSRID(ST_MakeLine(array[${pointSql}]), 4326)::geography as route_geometry
 ),
@@ -4662,7 +4665,7 @@ select jsonb_build_object(
   'status', i.status,
   'routeType', ${sqlLiteral(routeType)},
   'baseDistanceKm', i.base_distance_km,
-  'estimatedDurationMin', i.estimated_duration_min,
+  'estimatedDurationMin', ${estimatedDurationExact}::numeric,
   'distanceKm', i.base_distance_km,
   'description', i.description,
   'geojson', i.geojson,
@@ -5257,7 +5260,7 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
       return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
     const km = meters / 1000;
-    const minutes = Number(((km / speed) * 60).toFixed(1));
+    const minutes = Number(((km / speed) * 60).toFixed(2));
     return {
       ...stop,
       standardTravelMin: minutes > 0 ? minutes : null,
