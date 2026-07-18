@@ -98,7 +98,13 @@ const signalrRelay = createSignalRRelay({
     {
       names: ['boatLocation', 'BoatLocationUpdated'],
       onEvent: (payload) => {
-        upsertHubBoat(payload);
+        // Azure SignalR = SoT vị trí chung cho local + Railway (idle).
+        upsertHubBoat({
+          ...payload,
+          fromAzure: true,
+          source: 'azure-signalr',
+          forceAccept: shouldForceAcceptAzurePosition(payload),
+        });
         // Gộp broadcast để không flood SSE khi GPS ping dày.
         if (hubBroadcastTimer) return;
         hubBroadcastTimer = setTimeout(() => {
@@ -281,6 +287,8 @@ const hubLiveAuthorityUntil = new Map();
 let boatsLatestPollBusy = false;
 let boatsLatestLastOkAt = null;
 let boatsLatestLastError = null;
+/** Đã seed vị trí từ Azure — mới cho heartbeat ghi Azure (tránh Railway/local đè bằng last-pos cũ). */
+let azurePositionsSeeded = false;
 
 // Trip autorun trước refresh/broadcast — snapshot dùng tripMissionsPublic().
 const tripAutorun = createTripAutorun({
@@ -650,6 +658,7 @@ server.on('error', (error) => {
 server.listen(port, '0.0.0.0', () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
   console.log(`[build] commit ${buildInfo.commitShort} (${buildInfo.commit})`);
+  console.log(`[gps-write] Azure write ${liveAzureWriteEnabled() ? 'ON (primary)' : 'OFF (follow Azure only)'}`);
   const hookMode = Boolean(String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim());
   const jwtMode = Boolean(state.targetBearerToken);
   if (hookMode) {
@@ -1034,9 +1043,11 @@ function upsertHubBoat(payload) {
     receivedAt: incoming.receivedAt || new Date().toISOString(),
     sequence: incoming.sequence,
     isOnline: payload.isOnline !== false,
+    source: payload.source || (payload.fromAzure ? 'azure' : (prev?.source || null)),
     updatedAt: new Date().toISOString(),
   });
-  if (forceAccept) {
+  // Chỉ giữ quyền Live khi user kéo / trip / rescue — không phải heartbeat quiet.
+  if (forceAccept && payload.holdAuthority === true) {
     hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 8000));
   }
   rememberLastPosition(code, state.hubBoats.get(code));
@@ -1116,16 +1127,30 @@ async function pollLatestBoatLocations({ force = false } = {}) {
     }
     const rows = normalizeLatestBoatRows(result.data);
     let changed = false;
+    const firstSeed = !azurePositionsSeeded;
     for (const row of rows) {
-      const before = state.hubBoats.get(String(row.boatCode || '').trim());
-      upsertHubBoat(row);
-      const after = state.hubBoats.get(String(row.boatCode || '').trim());
+      const code = String(row.boatCode || '').trim();
+      const before = state.hubBoats.get(code);
+      if (firstSeed && code) hubLiveAuthorityUntil.delete(code);
+      upsertHubBoat({
+        ...row,
+        fromAzure: true,
+        source: 'azure-latest',
+        // Lần seed đầu: luôn nhận Azure để local/Railway cùng map.
+        forceAccept: firstSeed || shouldForceAcceptAzurePosition(row),
+        holdAuthority: false,
+      });
+      const after = state.hubBoats.get(code);
       if (after && (!before || before.lat !== after.lat || before.lng !== after.lng || before.updatedAt !== after.updatedAt)) {
         changed = true;
       }
     }
     boatsLatestLastOkAt = new Date().toISOString();
     boatsLatestLastError = null;
+    if (rows.length) azurePositionsSeeded = true;
+    if (firstSeed && rows.length) {
+      console.log(`[boats-latest] seeded ${rows.length} boat position(s) from Azure`);
+    }
     if (changed || force) broadcast();
   } catch (error) {
     boatsLatestLastError = error.message;
@@ -1822,29 +1847,51 @@ async function publishLiveGpsPosition(body = {}) {
     capturedRoute: null,
   };
 
-  const sendToTarget = body.sendToTarget !== undefined
-    ? Boolean(body.sendToTarget)
-    : Boolean(state.senderEnabled && getTargetEndpoint());
-
   // Optimistic local hub marker (SSE) — BE sẽ đồng bộ lại qua SignalR / boats/latest.
   hubBoatSuppressUntil.delete(boatCode);
-  upsertHubBoat({
-    ...payload,
-    isOnline: true,
-    recordedAt: payload.recordedAt,
-    receivedAt: new Date().toISOString(),
-    forceAccept: true, // kéo/gửi tay Live — không lọc nhảy
-  });
-  broadcast();
+  const allowAzureWrite = liveAzureWriteEnabled();
+  const holdAuthority = body.holdAuthority === true
+    || body.fromTrip === true
+    || body.fromRescue === true
+    || body._fromTrip === true
+    || body._fromRescue === true
+    || (body.quiet !== true && body.holdAuthority !== false);
+
+  // Local follow-only: heartbeat quiet không đè vị trí Azure (tránh lệch map với Railway).
+  const followOnlyQuiet = !allowAzureWrite && body.quiet === true && !fromTrip && !fromRescue;
+  if (!followOnlyQuiet) {
+    upsertHubBoat({
+      ...payload,
+      isOnline: true,
+      recordedAt: payload.recordedAt,
+      receivedAt: new Date().toISOString(),
+      forceAccept: true,
+      holdAuthority,
+      source: holdAuthority ? 'live' : 'live-heartbeat',
+    });
+    broadcast();
+  }
+
+  const sendToTarget = allowAzureWrite
+    && (azurePositionsSeeded || fromTrip || fromRescue)
+    && (
+      body.sendToTarget !== undefined
+        ? Boolean(body.sendToTarget)
+        : Boolean(state.senderEnabled && getTargetEndpoint())
+    );
 
   if (!sendToTarget || !getTargetEndpoint()) {
     return {
       ok: true,
       status: 200,
-      mode: 'local',
+      mode: followOnlyQuiet ? 'follow-azure' : 'local',
       sequence: payload.sequence,
       payload,
-      warning: 'Chưa gửi Azure (SEND_TO_TARGET tắt hoặc chưa cấu hình endpoint).',
+      warning: !allowAzureWrite
+        ? 'Local chỉ đọc vị trí Azure (LIVE_AZURE_WRITE=false) — Railway ghi GPS.'
+        : (!azurePositionsSeeded && !fromTrip && !fromRescue
+          ? 'Chưa seed boats/latest từ Azure — tạm chưa ghi GPS.'
+          : 'Chưa gửi Azure (SEND_TO_TARGET tắt hoặc chưa cấu hình endpoint).'),
     };
   }
 
@@ -5654,6 +5701,7 @@ function publicConfig() {
     commit: buildInfo.commit,
     commitShort: buildInfo.commitShort,
     builtAt: buildInfo.builtAt,
+    liveAzureWrite: liveAzureWriteEnabled(),
     senderEnabled: state.senderEnabled,
     targetEndpoint: endpoint,
     targetEndpointMasked: endpoint ? maskEndpoint(endpoint) : '',
@@ -5833,6 +5881,30 @@ function round(value, digits) {
 
 function parseBool(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+/**
+ * Local mặc định KHÔNG ghi GPS lên Azure — chỉ Railway ghi.
+ * Tránh local + deploy đụng nhau → vị trí tàu khác nhau.
+ * Bật tay: LIVE_AZURE_WRITE=true
+ */
+function liveAzureWriteEnabled() {
+  if (env.LIVE_AZURE_WRITE != null && String(env.LIVE_AZURE_WRITE).trim() !== '') {
+    return parseBool(env.LIVE_AZURE_WRITE);
+  }
+  return Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+}
+
+/** Azure boats/latest + SignalR: nhận vị trí idle để local/prod cùng map. */
+function shouldForceAcceptAzurePosition(payload) {
+  const code = String(payload?.boatCode || payload?.BoatCode || '').trim();
+  if (!code) return false;
+  if (activeSurveyBoatCode() === code) return false;
+  if (isBoatInActiveRescueMission(code)) return false;
+  if (tripAutorun.isBoatInActiveTripMission(code)) return false;
+  const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
+  if (liveAuthUntil > Date.now()) return false;
+  return true;
 }
 
 /** Commit đang chạy — Railway set RAILWAY_GIT_COMMIT_SHA; local lấy từ git. */

@@ -640,12 +640,7 @@ function syncLiveHubPins(hubBoats) {
     if (pin && Number.isFinite(prevLat) && Number.isFinite(prevLng)) {
       const moved = distMeters({ lat: prevLat, lng: prevLng }, { lat, lng });
       if (moved < 1.5) continue;
-      const speed = Number(boat.speedKmh);
-      const moving = Number.isFinite(speed) && speed >= 2;
-      // Đứng yên mà nhảy > 40m → giữ pin cũ (vị trí cuối).
-      if (!moving && moved > 40) continue;
-      // Nhảy quá xa so với tốc độ hợp lý → giữ pin cũ.
-      if (moved > 250 && !(moving && speed >= 8)) continue;
+      // Hub/Azure là SoT — luôn bám (trừ pin user). Tránh local/prod lệch vị trí.
     }
     pinnedPositions.set(code, { lat, lng, at: Date.now(), user: false });
     changed = true;
@@ -1904,6 +1899,8 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
         heading: getBoatHeading(boatCode),
         status,
         sendToTarget,
+        quiet,
+        holdAuthority: !quiet,
       }),
     });
     const body = await response.json();
@@ -2113,7 +2110,9 @@ function renderStatus(data) {
   }
 
   if (sendAzureSelectEl.dataset.seeded !== '1') {
-    sendAzureSelectEl.value = data?.config?.senderEnabled === false ? 'off' : 'on';
+    // Local mặc định tắt ghi Azure (theo config.liveAzureWrite) — tránh lệch vị trí với Railway.
+    const canWrite = data?.config?.liveAzureWrite !== false && data?.config?.senderEnabled !== false;
+    sendAzureSelectEl.value = canWrite ? 'on' : 'off';
     sendAzureSelectEl.dataset.seeded = '1';
   }
 }
