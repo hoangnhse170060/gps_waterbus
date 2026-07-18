@@ -750,14 +750,19 @@ function markSignal(code) {
 }
 
 function hasSignal(code, hub) {
-  // Heartbeat liên tục → mặc định coi là có tín hiệu; chỉ đỏ khi sự cố.
+  // Hub/SSE gần đây = còn tín hiệu; không cần heartbeat POST.
   if (openIncidentForBoat(code)) return false;
   const st = getStatus(code);
   if (st.incident) return false;
   const key = String(code || '').trim();
   const sent = lastSignalAt.get(key) || 0;
   if (Date.now() - sent < SIGNAL_TTL_MS) return true;
-  if (hub && hub.isOnline !== false) return true;
+  if (hub && hub.isOnline !== false) {
+    const hubMs = Date.parse(hub.receivedAt || hub.recordedAt || hub.updatedAt || '');
+    if (Number.isFinite(hubMs) && Date.now() - hubMs < SIGNAL_TTL_MS) return true;
+    if (hub.isOnline !== false) return true;
+  }
+  if (activeTripForBoat(key) || isBoatInActiveAutomatedRescue(key)) return true;
   return Boolean(pinnedFor(key));
 }
 
@@ -2075,21 +2080,21 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
 }
 
 async function heartbeatAllBoats() {
+  // Không POST heartbeat khi Gửi Azure bật: trip/rescue/SSE đã đẩy GPS.
+  // Heartbeat đụng sequence Azure → browser spam 409.
   if (heartbeatBusy || dragging || sending) return;
-  if (sendAzureSelectEl?.value !== 'on') return;
+  if (sendAzureSelectEl?.value === 'on') return;
   heartbeatBusy = true;
   try {
     const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
-      // Trip / cứu hộ: server tự publish — heartbeat FE gây 409 sequence.
       if (activeTripForBoat(code)) continue;
       if (isBoatInActiveAutomatedRescue(code)) continue;
       const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
       ensureSeedPin(code, pin.lat, pin.lng);
       const fixed = pinnedFor(code) || pin;
       await sendLiveGps(code, fixed.lat, fixed.lng, { quiet: true });
-      // Nhịp nhẹ tránh đụng sequence cùng lúc.
       await new Promise((r) => setTimeout(r, 120));
     }
     if (latest) renderHubBoats(latest.hubBoats);

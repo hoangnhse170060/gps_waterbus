@@ -430,7 +430,11 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       try {
         const result = await publishLiveGpsPosition(body);
-        return sendJson(res, result, result.ok ? 200 : (result.status || 400));
+        // Không trả HTTP 409 ra browser (Azure sequence) — map local vẫn cập nhật.
+        const httpStatus = result.ok || result.soft || result.skipped
+          ? 200
+          : (Number(result.status) === 409 ? 200 : (result.status || 400));
+        return sendJson(res, result, httpStatus);
       } catch (error) {
         return sendJson(res, {
           ok: false,
@@ -1705,7 +1709,9 @@ async function publishLiveGpsPosition(body = {}) {
   if (state.collector && String(state.collector.boatCode || '').trim() === boatCode) {
     return {
       ok: false,
-      status: 409,
+      skipped: true,
+      soft: true,
+      status: 200,
       error: `Tàu ${boatCode} đang ghi GPS survey — không kéo live cùng lúc (tránh đụng sequence).`,
     };
   }
@@ -1858,10 +1864,23 @@ async function publishLiveGpsPosition(body = {}) {
         return {
           ok: true,
           soft: true,
-          status: 409,
+          status: 200,
+          azureStatus: 409,
           sequence: payload.sequence,
           payload,
           warning: 'Sequence lệch BE — điểm đã cập nhật local map.',
+        };
+      }
+      // Soft fail không còn — vẫn không trả HTTP 409 cho trình duyệt (tránh spam console).
+      if (!ok) {
+        return {
+          ok: true,
+          soft: true,
+          status: 200,
+          azureStatus: 409,
+          sequence: payload.sequence,
+          payload,
+          warning: errorText || 'Sequence conflict — giữ vị trí local.',
         };
       }
     }
