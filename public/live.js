@@ -2418,46 +2418,6 @@ refreshBtn.addEventListener('click', async () => {
   }
 });
 
-document.querySelector('#restartRescueBtn')?.addEventListener('click', async () => {
-  try {
-    const res = await fetch('/api/rescue/restart', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok || !body.ok) {
-      toast(body.error || 'Không chạy lại cứu hộ được', 'warn');
-      return;
-    }
-    const started = (body.restarted || []).filter((r) => r.started);
-    if (started.length) {
-      for (const row of started) {
-        if (row.incidentId) rescueMissions.delete(String(row.incidentId));
-      }
-      persistRescueMissions();
-      const first = started[0];
-      toast(
-        `Cứu hộ lại: ${first.rescueBoatCode} → ${first.boatCode} (đang chạy ra hiện trường)`,
-        'ok',
-        6000,
-      );
-      if (first.rescueBoatCode) {
-        selectBoat(first.rescueBoatCode, { toastMessage: false });
-        setTimeout(() => {
-          const marker = hubMarkers.get(first.rescueBoatCode);
-          if (marker) map.setView(marker.getLatLng(), Math.max(map.getZoom(), 15), { animate: true });
-        }, 800);
-      }
-    } else {
-      const err = body.restarted?.[0]?.error || body.message || 'Mission không start';
-      toast(err, 'warn', 6000);
-    }
-  } catch (error) {
-    toast(error.message, 'err');
-  }
-});
-
 const openSurveyBtn = document.querySelector('#openSurveyBtn');
 const closeSurveyBtn = document.querySelector('#closeSurveyBtn');
 const surveyOverlayEl = document.querySelector('#surveyOverlay');
