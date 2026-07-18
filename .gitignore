@@ -4,6 +4,7 @@ client/node_modules/
 npm-debug.log*
 .env
 .simulator-sequences.json
+.simulator-last-positions.json
 *.log
 .cursor/
 dist/

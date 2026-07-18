@@ -15,6 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const publicDir = path.join(rootDir, 'public');
 const sequenceStatePath = path.join(rootDir, '.simulator-sequences.json');
+const lastPositionsPath = path.join(rootDir, '.simulator-last-positions.json');
 
 const env = await loadEnv();
 if (parseBool(env.TARGET_GPS_ALLOW_SELF_SIGNED)) {
@@ -23,6 +24,8 @@ if (parseBool(env.TARGET_GPS_ALLOW_SELF_SIGNED)) {
 const port = Number(env.PORT || 5177);
 const sequenceState = await loadSequenceState();
 let sequenceSaveTimer = null;
+const lastPositions = await loadLastPositions();
+let lastPositionsSaveTimer = null;
 const dbPool = createDbPool(env);
 
 const clients = new Set();
@@ -940,6 +943,7 @@ function upsertHubBoat(payload) {
     isOnline: payload.isOnline !== false,
     updatedAt: new Date().toISOString(),
   });
+  rememberLastPosition(code, state.hubBoats.get(code));
 }
 
 function clearHubBoat(boatCode, { suppressMs = 120_000 } = {}) {
@@ -1320,10 +1324,12 @@ async function refreshFromDatabase() {
     }
     // Neon là nguồn truth; bỏ cache Bảo trì/sự cố hook khi DB đã Active.
     reapplyBeBoatStatusesToCatalog();
+    restoreLastPositionsToHub();
     broadcast();
   } catch (error) {
     state.dbStatus = { ok: false, message: error.message, loadedAt: new Date().toISOString() };
     ensureFallbackData();
+    restoreLastPositionsToHub();
     broadcast();
   }
 }
@@ -5271,6 +5277,93 @@ async function loadSequenceState() {
   } catch {
     return {};
   }
+}
+
+async function loadLastPositions() {
+  try {
+    const raw = JSON.parse(await readFile(lastPositionsPath, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberLastPosition(boatCode, boat) {
+  const code = String(boatCode || '').trim();
+  const lat = Number(boat?.lat);
+  const lng = Number(boat?.lng);
+  if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  lastPositions[code] = {
+    boatCode: code,
+    boatName: boat.boatName || lastPositions[code]?.boatName || null,
+    boatId: boat.boatId || lastPositions[code]?.boatId || null,
+    lat,
+    lng,
+    heading: Number.isFinite(Number(boat.heading)) ? Number(boat.heading) : (lastPositions[code]?.heading ?? 0),
+    speedKmh: Number.isFinite(Number(boat.speedKmh)) ? Number(boat.speedKmh) : 0,
+    recordedAt: boat.recordedAt || null,
+    receivedAt: boat.receivedAt || null,
+    sequence: boat.sequence ?? null,
+    updatedAt: boat.updatedAt || new Date().toISOString(),
+  };
+  scheduleLastPositionsSave();
+}
+
+/** Seed hub từ vị trí cuối đã ghi — tránh restart/SSE làm tàu nhảy về bến/seed. */
+function restoreLastPositionsToHub() {
+  let restored = 0;
+  for (const [code, row] of Object.entries(lastPositions || {})) {
+    const lat = Number(row?.lat);
+    const lng = Number(row?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    if (!isLiveMapBoatCode(code) && !hasOpenIncidentForBoat(code)) continue;
+    const prev = state.hubBoats.get(code);
+    if (prev && Number.isFinite(Number(prev.lat)) && Number.isFinite(Number(prev.lng))) {
+      // Đã có hub mới hơn file → giữ hub, cập nhật file.
+      const prevAt = Date.parse(prev.updatedAt || prev.receivedAt || '') || 0;
+      const savedAt = Date.parse(row.updatedAt || row.receivedAt || '') || 0;
+      if (prevAt >= savedAt) {
+        rememberLastPosition(code, prev);
+        continue;
+      }
+    }
+    state.hubBoats.set(code, {
+      ...(prev || {}),
+      boatCode: code,
+      boatName: row.boatName || prev?.boatName || null,
+      boatId: row.boatId || prev?.boatId || null,
+      lat,
+      lng,
+      heading: Number.isFinite(Number(row.heading)) ? Number(row.heading) : (prev?.heading ?? 0),
+      speedKmh: Number.isFinite(Number(row.speedKmh)) ? Number(row.speedKmh) : 0,
+      recordedAt: row.recordedAt || null,
+      receivedAt: row.receivedAt || null,
+      sequence: row.sequence ?? null,
+      isOnline: true,
+      source: 'last-position',
+      updatedAt: row.updatedAt || new Date().toISOString(),
+    });
+    const boat = boatByIdOrCode(code);
+    if (boat) {
+      boat.lat = lat;
+      boat.lng = lng;
+      if (Number.isFinite(Number(row.heading))) boat.heading = Number(row.heading);
+    }
+    restored += 1;
+  }
+  if (restored) {
+    console.log(`[last-pos] restore ${restored} boat position(s) from disk`);
+  }
+}
+
+function scheduleLastPositionsSave() {
+  if (lastPositionsSaveTimer) return;
+  lastPositionsSaveTimer = setTimeout(() => {
+    lastPositionsSaveTimer = null;
+    writeFile(lastPositionsPath, `${JSON.stringify(lastPositions, null, 2)}\n`).catch((error) => {
+      console.error(`Cannot save last positions: ${error.message}`);
+    });
+  }, 400);
 }
 
 function initialSequence() {

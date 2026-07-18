@@ -654,7 +654,9 @@ function syncSurveyCollectorPin(data = latest) {
   pinBoatPosition(code, lat, lng, { user: false });
 }
 
-/** Cập nhật pin từ hub GPS — trừ khi user đang kéo tay hoặc đang cứu hộ tự động. */
+/** Cập nhật pin từ hub GPS — trừ khi user đang kéo tay hoặc đang cứu hộ tự động.
+ *  Giữ vị trí cuối nếu hub nhảy xa bất thường (tránh teleport khi Azure/SSE lệch).
+ */
 function syncLiveHubPins(hubBoats) {
   let changed = false;
   for (const boat of hubBoats || []) {
@@ -670,13 +672,15 @@ function syncLiveHubPins(hubBoats) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
     const prevLat = Number(pin?.lat);
     const prevLng = Number(pin?.lng);
-    if (
-      pin
-      && Number.isFinite(prevLat)
-      && Number.isFinite(prevLng)
-      && distMeters({ lat: prevLat, lng: prevLng }, { lat, lng }) < 1.5
-    ) {
-      continue;
+    if (pin && Number.isFinite(prevLat) && Number.isFinite(prevLng)) {
+      const moved = distMeters({ lat: prevLat, lng: prevLng }, { lat, lng });
+      if (moved < 1.5) continue;
+      const speed = Number(boat.speedKmh);
+      const moving = Number.isFinite(speed) && speed >= 2;
+      // Đứng yên mà nhảy > 40m → giữ pin cũ (vị trí cuối).
+      if (!moving && moved > 40) continue;
+      // Nhảy quá xa so với tốc độ hợp lý → giữ pin cũ.
+      if (moved > 250 && !(moving && speed >= 8)) continue;
     }
     pinnedPositions.set(code, { lat, lng, at: Date.now(), user: false });
     changed = true;
