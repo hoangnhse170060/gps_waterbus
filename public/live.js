@@ -492,11 +492,18 @@ function renderRescueOverlays(data = latest) {
     if (
       (autoStatus === 'Dispatched' || autoStatus === 'InTransit')
       && rescuePin
-      && Number.isFinite(Number(autoMission?.targetLat))
     ) {
+      // Ưu tiên pin tàu sự cố live (gần nhất) — không bám targetLat stale.
+      const destLat = Number(
+        incidentPin?.lat ?? autoMission?.targetLat ?? target.lat,
+      );
+      const destLng = Number(
+        incidentPin?.lng ?? autoMission?.targetLng ?? target.lng,
+      );
+      if (!Number.isFinite(destLat) || !Number.isFinite(destLng)) continue;
       const toPoints = [
         [rescuePin.lat, rescuePin.lng],
-        [Number(autoMission.targetLat), Number(autoMission.targetLng)],
+        [destLat, destLng],
       ];
       if (!overlay.toLine) {
         overlay.toLine = L.polyline(toPoints, {
