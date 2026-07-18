@@ -451,35 +451,17 @@ function renderRescueOverlays(data = latest) {
 
     let overlay = rescueOverlays.get(row.incidentId);
     if (!overlay) {
-      const dotLat = (autoStatus === 'Towing' && incidentPin)
-        ? incidentPin.lat
-        : target.lat;
-      const dotLng = (autoStatus === 'Towing' && incidentPin)
-        ? incidentPin.lng
-        : target.lng;
       overlay = {
         toLine: null,
         returnLine: null,
         towLine: null,
-        incidentDot: L.circleMarker([dotLat, dotLng], {
-          radius: 10,
-          color: '#dc2626',
-          fillColor: '#ef4444',
-          fillOpacity: 0.9,
-          weight: 2,
-        }).addTo(map),
       };
-      overlay.incidentDot.bindTooltip(
-        `Sự cố · ${row.boatName || row.boatCode || 'tàu'}`,
-        { direction: 'top', offset: [0, -8] },
-      );
       rescueOverlays.set(row.incidentId, overlay);
-    } else if (autoStatus === 'Towing' && incidentPin) {
-      overlay.incidentDot.setLatLng([incidentPin.lat, incidentPin.lng]);
-    } else if (autoStatus === 'AtStation' && rescuePin) {
-      overlay.incidentDot.setLatLng([rescuePin.lat, rescuePin.lng]);
-    } else {
-      overlay.incidentDot.setLatLng([target.lat, target.lng]);
+    }
+    // Bỏ chấm đỏ scene thừa — tàu sự cố đã có badge SC trên marker.
+    if (overlay.incidentDot) {
+      overlay.incidentDot.remove();
+      overlay.incidentDot = null;
     }
 
     // Đã về bến (server hoặc local): xóa đường — không để localMission vẽ tím khi SOS đứng yên.
@@ -497,8 +479,6 @@ function renderRescueOverlays(data = latest) {
       overlay.returnLine = null;
       overlay.towLine?.remove();
       overlay.towLine = null;
-      const dockPin = incidentPin || rescuePin;
-      if (dockPin) overlay.incidentDot.setLatLng([dockPin.lat, dockPin.lng]);
       if (localMission) {
         localMission.phase = 'completed';
         rescueMissions.set(row.incidentId, localMission);
