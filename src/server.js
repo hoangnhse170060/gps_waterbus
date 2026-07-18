@@ -5,7 +5,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { scheduleTravelMinutes, waterbusSchedulePublic } from './waterbus-schedule.js';
+import { waterbusSchedulePublic } from './waterbus-schedule.js';
 import { createSignalRRelay } from './signalr-relay.js';
 import { distanceMeters, routeLength } from './geo-distance.js';
 import { createTripAutorun } from './trip-autorun.js';
@@ -4158,15 +4158,23 @@ async function saveRouteFromGpsOnTarget(session, body) {
       sequence: index + 1,
       recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
     }));
-    const segmentTotal = sumTravelMinutes(stops);
-    payload.estimatedDurationMin = Math.max(
-      1,
-      Math.round(segmentTotal || ((routeLength(snapped) / 1000 / azureSpeedKmh) * 60)),
-    );
+    // Thời gian chạy = (quãng đường vẽ ÷ tốc độ cài) × 60 — khớp panel lúc vẽ.
+    const pathKm = routeLength(snapped) / 1000;
+    const pathMinutes = Number(body.estimatedDurationMin) > 0
+      ? Number(body.estimatedDurationMin)
+      : ((pathKm / azureSpeedKmh) * 60);
+    payload.estimatedDurationMin = Math.max(1, Math.round(Number(pathMinutes.toFixed(1))));
     console.log(
       `[from-gps] ${payload.routeCode} azureSpeed=${azureSpeedKmh} segments:`,
       stops.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
     );
+  } else {
+    // Không có stops — vẫn lấy thời gian từ quãng đường ÷ tốc độ lúc vẽ.
+    const pathKm = routeLength(coordinates) / 1000;
+    const pathMinutes = Number(body.estimatedDurationMin) > 0
+      ? Number(body.estimatedDurationMin)
+      : ((pathKm / azureSpeedKmh) * 60);
+    payload.estimatedDurationMin = Math.max(1, Math.round(Number(pathMinutes.toFixed(1))));
   }
 
   const targetResult = await postToTargetApi(
@@ -4177,6 +4185,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
   // Giữ stops đã gửi để UI/BE fallback nếu Azure không trả stops[].
   if (targetResult && typeof targetResult === 'object') {
     targetResult.outboundStops = stops;
+    targetResult.outboundEstimatedDurationMin = payload.estimatedDurationMin ?? null;
     targetResult.outboundCreateReverse = Boolean(payload.createReverseRoute);
   }
   return targetResult;
@@ -4226,7 +4235,7 @@ async function persistRecordingSession(body, sessionInput = null) {
         );
         if (details.ok && details.data) route = { ...route, ...details.data };
       }
-      // BE đôi khi không trả / không giữ phút từng đoạn — ưu tiên bản GPS đã tính.
+      // BE đôi khi không trả / không giữ phút từng đoạn — ưu tiên bản GPS đã tính (outbound).
       const outboundStops = Array.isArray(targetSave.outboundStops) ? targetSave.outboundStops : [];
       const returnedStops = Array.isArray(route.stops) ? route.stops : [];
       if (outboundStops.length) {
@@ -4238,14 +4247,20 @@ async function persistRecordingSession(body, sessionInput = null) {
               String(item.stationId) === String(stop.stationId)
               && Number(item.stopOrder) === Number(stop.stopOrder)
             )) || outboundStops[index];
-            const travel = stop.standardTravelMin ?? stop.standard_travel_min ?? out?.standardTravelMin;
+            // Ưu tiên phút GPS×tốc độ đã gửi — không lấy estimated/lịch BE đè.
+            const travel = out?.standardTravelMin ?? stop.standardTravelMin ?? stop.standard_travel_min;
             return {
               ...stop,
               standardTravelMin: travel == null || travel === '' ? null : Number(travel),
               segmentDistanceKm: out?.segmentDistanceKm ?? stop.segmentDistanceKm ?? null,
+              travelSource: out?.travelSource || stop.travelSource || null,
             };
           });
         }
+      }
+      // Giữ đúng phút (km ÷ tốc độ) lúc vẽ — không lấy estimatedDurationMin của BE.
+      if (Number(targetSave.outboundEstimatedDurationMin) > 0) {
+        route.estimatedDurationMin = Math.max(1, Math.round(Number(targetSave.outboundEstimatedDurationMin)));
       }
       if (!route.reverseRoute && targetSave.data?.reverseRoute) {
         route.reverseRoute = targetSave.data.reverseRoute;
@@ -4514,13 +4529,13 @@ async function createCapturedRoute(body) {
   );
   points = snapCoordinatesToStops(points, normalizedStops, detectRadius);
   const lengthMeters = routeLength(points);
-  // phút = (km / tốc_độ_chạy) × 60 · tốc độ ≤ max đăng ký
+  // phút = (km / tốc_độ_chạy) × 60 · khớp panel lúc vẽ — không lấy lịch/tổng đoạn.
   const baseDistanceKm = round(lengthMeters / 1000, 3);
   const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh);
-  const estimatedDurationExact = Number(
-    (sumTravelMinutes(stopsWithTravel) || ((baseDistanceKm / averageSpeedKmh) * 60)).toFixed(1),
-  );
-  // Cột DB estimated_duration_min là int — làm tròn cận số đúng, không ép floor = 1 cho đoạn ngắn.
+  const estimatedDurationExact = Number(body.estimatedDurationMin) > 0
+    ? Number(body.estimatedDurationMin)
+    : Number(((baseDistanceKm / averageSpeedKmh) * 60).toFixed(1));
+  // Cột DB estimated_duration_min là int — làm tròn cận số đúng.
   const estimatedDurationMin = Math.max(1, Math.round(estimatedDurationExact));
   const pointSql = points
     .map((point) => `ST_MakePoint(${point.lng}, ${point.lat})::geometry`)
@@ -5192,9 +5207,8 @@ function nearestPathProbe(path, stop) {
 }
 
 /**
- * Gắn standardTravelMin:
- * 1) nếu cặp bến có trong lịch Waterbus → lấy phút lịch (chuẩn đời thực)
- * 2) không thì phút = (km đường GPS ÷ tốc độ) × 60 (1 số thập phân)
+ * Gắn standardTravelMin = thời gian chạy GPS×tốc độ thôi:
+ * phút = (km đường GPS ÷ tốc độ) × 60 (1 số thập phân). Không lấy lịch / BE.
  */
 function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
   const path = Array.isArray(coordinates)
@@ -5203,7 +5217,6 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
   const list = Array.isArray(stops) ? stops.map((s) => ({ ...s })) : [];
   const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
   const nearM = Number(env.STOP_DETECT_RADIUS_M || 200);
-  const preferSchedule = parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true');
   if (!list.length) return [];
   if (list.length === 1 || path.length < 2) {
     return list.map((stop) => ({
@@ -5234,7 +5247,6 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
     if (index === 0) {
       return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
-    const prevStop = list[index - 1];
     const prev = probes[index - 1];
     const cur = probes[index];
     if (prev.distToPath > nearM || cur.distToPath > nearM) {
@@ -5245,17 +5257,6 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
       return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     }
     const km = meters / 1000;
-    const scheduled = preferSchedule
-      ? scheduleTravelMinutes(prevStop.stationCode, stop.stationCode)
-      : null;
-    if (scheduled != null) {
-      return {
-        ...stop,
-        standardTravelMin: scheduled,
-        segmentDistanceKm: round(km, 3),
-        travelSource: 'schedule',
-      };
-    }
     const minutes = Number(((km / speed) * 60).toFixed(1));
     return {
       ...stop,

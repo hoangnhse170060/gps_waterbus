@@ -1245,17 +1245,7 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
     const meters = cur.alongMeters - prev.alongMeters;
     if (!(meters > 5)) return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
     const km = meters / 1000;
-    const scheduled = preferWaterbusScheduleFe()
-      ? scheduleTravelMinutesFe(prevStop.stationCode, stop.stationCode)
-      : null;
-    if (scheduled != null) {
-      return {
-        ...stop,
-        standardTravelMin: scheduled,
-        segmentDistanceKm: roundNumber(km, 3),
-        travelSource: 'schedule',
-      };
-    }
+    // Chỉ thời gian chạy GPS×tốc độ — không lấy lịch / BE.
     const minutes = Number(((km / speed) * 60).toFixed(1));
     return {
       ...stop,
@@ -1320,10 +1310,13 @@ function updateStopChainPreview(orderedInput) {
 
 function surveySaveFields() {
   ensureEndStationFromPath({ quiet: true });
+  const pathMinutes = getSurveyPathEstimatedMinutes();
   const fields = {
     startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
     endStationId: endStationEl.value || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId || null,
     stops: buildSurveyStops(),
+    // Đúng số trên panel lúc vẽ — (km ÷ tốc độ cài) × 60.
+    estimatedDurationMin: pathMinutes > 0 ? Number(pathMinutes.toFixed(1)) : null,
   };
   const inferredType = getSurveyRouteType();
   const wantReverse = Boolean(createReverseRouteEl?.checked)
@@ -2176,6 +2169,14 @@ function getSurveySpeedKmh() {
   return clampNumber(Number(collectorSpeedEl?.value || 16), 0.1, max);
 }
 
+/** Thời gian chạy lúc vẽ = (quãng đường ÷ tốc độ cài) × 60 — không lấy lịch/BE. */
+function getSurveyPathEstimatedMinutes(points = null) {
+  const path = Array.isArray(points) && points.length >= 2
+    ? points
+    : (lockedSurveyPath?.length >= 2 ? lockedSurveyPath : getPathCoordinates());
+  return estimateTravelMinutes(pathLengthMeters(path), getSurveySpeedKmh());
+}
+
 function applyBoatSpeedLimits() {
   const boat = findBoatByCode(collectorBoatCodeEl?.value);
   const max = boat ? boatMaxSpeedKmh(boat) : 80;
@@ -2278,10 +2279,8 @@ function updateDrawStats() {
   const formulaEl = document.querySelector('#estimateFormula');
   if (formulaEl) {
     formulaEl.textContent = meters > 0
-      ? (preferWaterbusScheduleFe()
-        ? `Ưu tiên phút lịch Waterbus nếu khớp cặp bến; không có lịch → (${km.toFixed(3)} km ÷ ${speed} km/h) × 60 = ${minutesExact.toFixed(2)} phút`
-        : `(${km.toFixed(3)} km ÷ ${speed} km/h chạy) × 60 = ${minutesExact.toFixed(2)} phút · từng đoạn A→B tính riêng`)
-      : 'Ưu tiên lịch Waterbus khi khớp cặp bến; còn lại phút = (km ÷ tốc độ) × 60';
+      ? `(${km.toFixed(3)} km ÷ ${speed} km/h) × 60 = ${minutesExact.toFixed(2)} phút`
+      : 'phút = (km ÷ tốc độ chạy) × 60 · tốc độ ≤ max đăng ký';
   }
   updateStopChainPreview();
 }
@@ -2727,8 +2726,14 @@ function unlockSurveyPath() {
 function renderRouteResult(body) {
   if (!routeResultEl) return;
   const distance = body.baseDistanceKm ?? body.distanceKm;
-  const duration = body.estimatedDurationMin;
   const stops = Array.isArray(body.stops) ? body.stops : [];
+  // Thời gian chạy = (quãng đường ÷ tốc độ cài) lúc vẽ — không lấy lịch/BE/tổng đoạn.
+  const duration = body.estimatedDurationMin != null && body.estimatedDurationMin !== ''
+    ? Number(body.estimatedDurationMin)
+    : null;
+  const durationText = Number.isFinite(duration) && duration > 0
+    ? (Number.isInteger(duration) ? `${duration}` : duration.toFixed(1))
+    : null;
   const stopLines = stops
     .slice()
     .sort((a, b) => Number(a.stopOrder) - Number(b.stopOrder))
@@ -2738,7 +2743,7 @@ function renderRouteResult(body) {
       const prev = arr[index - 1];
       const segment = index > 0
         ? (stop.standardTravelMin != null
-          ? `<div class="route-result-seg">← ${stop.standardTravelMin} phút${stop.travelSource === 'schedule' ? ' (lịch Waterbus)' : ' (GPS×tốc độ)'}${stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : ''} từ ${escapeHtml(prev?.stationName || prev?.stationCode || `bến ${order - 1}`)}</div>`
+          ? `<div class="route-result-seg">← ${stop.standardTravelMin} phút (GPS×tốc độ)${stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : ''} từ ${escapeHtml(prev?.stationName || prev?.stationCode || `bến ${order - 1}`)}</div>`
           : `<div class="route-result-seg is-missing">← chưa đo được đoạn (đường không nối qua bến này)</div>`)
         : '';
       return `<li><strong>#${order}</strong> ${escapeHtml(stop.stationName || stop.stationCode || `Bến ${order}`)}${escapeHtml(code)}${segment}</li>`;
@@ -2752,7 +2757,7 @@ function renderRouteResult(body) {
     <div class="route-result-meta">
       <span>BE: <b>${escapeHtml(body.routeType || (getSurveyRouteType() === 'SightseeingLoop' ? 'SightseeingLoop' : 'route nguồn'))}</b></span>
       <span>Quãng đường: <b>${distance != null ? `${distance} km` : '?'}</b></span>
-      <span>Thời gian ước tính: <b>${duration != null ? `${duration} phút` : '?'}</b></span>
+      <span>Thời gian chạy: <b>${durationText != null ? `${durationText} phút` : '?'}</b></span>
       <span>Số bến: <b>${stops.length}</b></span>
     </div>
     ${stops.length
