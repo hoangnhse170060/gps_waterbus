@@ -54,9 +54,33 @@ export function createTripAutorun(ctx) {
 
   let pollBusy = false;
   let tickBusy = false;
+  /** Sau 401/403: tạm dừng poll due (ms epoch) — tránh spam log mỗi 30s. */
+  let dueAuthBlockedUntil = 0;
+  let dueAuthLastWarnAt = 0;
 
   function tripAutorunEnabled() {
     return parseBool(env.TRIP_AUTORUN ?? 'true');
+  }
+
+  function dueAuthBackoffMs() {
+    return Math.max(60_000, Number(env.TRIP_DUE_AUTH_BACKOFF_MS || 10 * 60 * 1000));
+  }
+
+  function noteDueAuthFailure(status, error) {
+    const now = Date.now();
+    dueAuthBlockedUntil = now + dueAuthBackoffMs();
+    if (now - dueAuthLastWarnAt < 60_000) return;
+    dueAuthLastWarnAt = now;
+    const mins = Math.round(dueAuthBackoffMs() / 60_000);
+    console.warn(
+      `[trip-gps] BE ${status || '401'} trên /trips/due — LIVE_HOOK_SECRET local ≠ secret Azure. `
+      + `Tạm dừng poll ${mins} phút. Đồng bộ App Setting LIVE_HOOK_SECRET trên BE rồi restart. `
+      + `(${error || 'empty body'})`,
+    );
+  }
+
+  function clearDueAuthFailure() {
+    dueAuthBlockedUntil = 0;
   }
 
   function lookAheadMinutes() {
@@ -367,7 +391,7 @@ export function createTripAutorun(ctx) {
     }
   }
 
-  async function fetchDueTrips({ boatCode, lookAheadMinutes: lookAhead } = {}) {
+  async function fetchDueTrips({ boatCode, lookAheadMinutes: lookAhead, silent = false } = {}) {
     const code = cleanOptionalText(boatCode);
     if (!code) return { ok: false, trips: [], error: 'missing boatCode' };
     const minutes = Number.isFinite(Number(lookAhead)) ? Number(lookAhead) : lookAheadMinutes();
@@ -376,11 +400,15 @@ export function createTripAutorun(ctx) {
       method: 'GET',
       pathname: path,
       auth: 'hook',
-      silent: false,
+      silent,
     });
     if (!result.ok) {
+      if (result.status === 401 || result.status === 403) {
+        noteDueAuthFailure(result.status, result.error);
+      }
       return { ok: false, trips: [], status: result.status, error: result.error, data: result.data };
     }
+    clearDueAuthFailure();
     return {
       ok: true,
       trips: normalizeDueTrips(result.data),
@@ -640,9 +668,12 @@ export function createTripAutorun(ctx) {
 
   function eligibleBoatCodes() {
     const codes = new Set();
+    const surveyCode = cleanOptionalText(state.collector?.boatCode);
     for (const boat of state.boats.values()) {
       const code = cleanOptionalText(boat.boatCode);
       if (!code || String(boat.boatId || '').startsWith('collector-')) continue;
+      // Tàu đang survey: không poll trip / không chạy lịch Live.
+      if (surveyCode && code === surveyCode) continue;
       if (!isActiveBoatCode(code)) continue;
       if (hasOpenIncidentForBoat(boat)) continue;
       if (isBoatInActiveRescueMission(code)) continue;
@@ -1145,15 +1176,27 @@ export function createTripAutorun(ctx) {
     if (!tripAutorunEnabled()) return;
     if (pollBusy) return;
     if (!state.liveHookSecret && !env.LIVE_HOOK_SECRET) return;
+    if (Date.now() < dueAuthBlockedUntil) return;
     pollBusy = true;
     try {
       pruneCompletedTrips();
       const codes = eligibleBoatCodes();
+      let loggedAuthToUi = false;
       for (const boatCode of codes) {
         if (isBoatInActiveTripMission(boatCode)) continue;
         if (isBoatInActiveRescueMission(boatCode)) continue;
-        const due = await fetchDueTrips({ boatCode, lookAheadMinutes: lookAheadMinutes() });
+        // Chỉ ghi 1 dòng đỏ vào API log khi auth sai — tránh flood mỗi tàu × mỗi 30s.
+        const silent = loggedAuthToUi;
+        const due = await fetchDueTrips({
+          boatCode,
+          lookAheadMinutes: lookAheadMinutes(),
+          silent,
+        });
         if (!due.ok) {
+          if (due.status === 401 || due.status === 403) {
+            loggedAuthToUi = true;
+            break;
+          }
           if (due.status !== 404) {
             console.warn(`[trip-gps] due ${boatCode}: ${due.error || due.status}`);
           }

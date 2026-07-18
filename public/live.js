@@ -45,6 +45,9 @@ const speedInputEl = document.querySelector('#speedInput');
 const deviceHintEl = document.querySelector('#deviceHint');
 const hubStatusEl = document.querySelector('#hubStatus');
 const sendStatusEl = document.querySelector('#sendStatus');
+const gpsScanSummaryEl = document.querySelector('#gpsScanSummary');
+const gpsScanDetailEl = document.querySelector('#gpsScanDetail');
+let lastGpsScan = null;
 const coordStatusEl = document.querySelector('#coordStatus');
 const boatPhaseStatusEl = document.querySelector('#boatPhaseStatus');
 const boatRouteStatusEl = document.querySelector('#boatRouteStatus');
@@ -284,6 +287,14 @@ function syncOpenIncidentPins(data = latest) {
     const lat = Number(incident.lat);
     const lng = Number(incident.lng);
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    // Có hub GPS mới (< 30s) → không kéo marker về tọa độ sự cố mỗi lần render (gây nhảy cũ↔mới).
+    const hub = (data?.hubBoats || []).find((b) => String(b.boatCode || '').trim() === code);
+    if (hub) {
+      const hubMs = Date.parse(hub.receivedAt || hub.recordedAt || hub.updatedAt || '');
+      if (Number.isFinite(hubMs) && Date.now() - hubMs < 30_000) continue;
+    }
+    const pin = pinnedFor(code);
+    if (pin?.user) continue;
     pinnedPositions.set(code, { lat, lng, at: Date.now(), user: false });
     changed = true;
   }
@@ -581,27 +592,41 @@ function ensureSeedPin(code, lat, lng) {
   pinBoatPosition(code, lat, lng, { user: false });
 }
 
-/** Khi đang ghi GPS survey — Live theo collector, không giữ tàu tại pin bến cũ. */
-function syncSurveyCollectorPin(data = latest) {
+/** Tàu đang ghi GPS survey — tạm ẩn khỏi Live map (chỉ hiện trên Survey). */
+function activeSurveyBoatCode(data = latest) {
   const collector = data?.collector;
   const code = String(collector?.boatCode || '').trim();
+  if (!code) return '';
+  const status = String(collector?.status || '').toLowerCase();
+  if (!['moving', 'paused', 'running', 'completed'].includes(status)) return '';
+  return code;
+}
+
+/** Khi đang ghi GPS survey — không hiện / không pin tàu đó trên Live. */
+function clearSurveyBoatFromLive(data = latest) {
+  const code = activeSurveyBoatCode(data);
   if (!code) return;
-  const lat = Number(collector.lat);
-  const lng = Number(collector.lng);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
-  const status = String(collector.status || '').toLowerCase();
-  if (!['moving', 'paused', 'completed'].includes(status)) return;
-  pinBoatPosition(code, lat, lng, { user: false });
+  pinnedPositions.delete(code);
+  const marker = hubMarkers.get(code);
+  if (marker) {
+    marker.remove();
+    hubMarkers.delete(code);
+  }
+  if (selectedBoatCode === code) {
+    selectedBoatCode = null;
+  }
 }
 
 /** Cập nhật pin từ hub GPS — trừ khi user đang kéo tay hoặc đang cứu hộ tự động.
  *  Giữ vị trí cuối nếu hub nhảy xa bất thường (tránh teleport khi Azure/SSE lệch).
  */
 function syncLiveHubPins(hubBoats) {
+  const surveyCode = activeSurveyBoatCode();
   let changed = false;
   for (const boat of hubBoats || []) {
     const code = String(boat?.boatCode || '').trim();
     if (!code) continue;
+    if (surveyCode && code === surveyCode) continue;
     if (dragging && draggingBoatCode === code) continue;
     // Mission cứu hộ tự set pin từ currentLat — không để hub/Azure kéo về bến.
     if (isBoatInActiveAutomatedRescue(code)) continue;
@@ -799,21 +824,24 @@ function boatUpdateMs(code, hubByCode = null, data = latest) {
 }
 
 function mapBoatCodes(data = latest, hubBoats = null) {
+  const surveyCode = activeSurveyBoatCode(data);
   const codes = new Set(
     catalogBoats(data).map((b) => String(b.boatCode).trim()).filter(Boolean),
   );
+  if (surveyCode) codes.delete(surveyCode);
   for (const row of openIncidentsList(data)) {
     const code = String(row.boatCode || '').trim();
-    if (code) codes.add(code);
+    if (code && code !== surveyCode) codes.add(code);
     const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
-    if (rescue) codes.add(rescue);
+    if (rescue && rescue !== surveyCode) codes.add(rescue);
     const transfer = String(row.replacementBoatCode || '').trim();
-    if (transfer) codes.add(transfer);
+    if (transfer && transfer !== surveyCode) codes.add(transfer);
   }
   const hubByCode = new Map();
   for (const boat of (hubBoats || data?.hubBoats || [])) {
     const code = String(boat?.boatCode || '').trim();
-    if (code) hubByCode.set(code, boat);
+    if (!code || code === surveyCode) continue;
+    hubByCode.set(code, boat);
   }
   return [...codes].sort((a, b) => {
     const diff = boatUpdateMs(b, hubByCode, data) - boatUpdateMs(a, hubByCode, data);
@@ -1527,12 +1555,13 @@ function renderHubBoats(hubBoats) {
   syncLiveHubPins(hubBoats);
   // Mission cứu hộ ghi đè sau — bám currentLat/incidentCurrentLat khi đang kéo.
   syncAutomatedRescuePins(hubBoats);
-  // Đang survey: Live bám collector theo đường vẽ (ghi đè pin kéo tay tại bến cũ).
-  syncSurveyCollectorPin();
+  // Đang survey: tạm ẩn tàu đó khỏi Live (Survey vẫn gửi GPS riêng).
+  clearSurveyBoatFromLive();
   const hubByCode = new Map();
   for (const boat of hubBoats || []) {
     const code = String(boat.boatCode || '').trim();
     if (!code) continue;
+    if (code === activeSurveyBoatCode()) continue;
     hubByCode.set(code, boat);
   }
 
@@ -1832,18 +1861,21 @@ function bindDragHandlers(marker, code) {
 }
 
 async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
-  if (!quiet && sending) return;
+  if (!quiet && sending) return { ok: false, skipped: true, reason: 'busy' };
   // Kéo/gửi tay: không đè trip/rescue. Heartbeat (quiet) vẫn gửi liên tục.
   if (!quiet && (activeTripForBoat(boatCode) || isBoatInActiveAutomatedRescue(boatCode))) {
     toast(dragLockReason(boatCode) || 'GPS đang tự chạy — không gửi tay', 'warn');
-    return false;
+    return { ok: false, skipped: true, reason: 'locked' };
   }
   if (!quiet) {
     sending = true;
     sendStatusEl.textContent = 'Đang gửi…';
   }
-  // Heartbeat không khóa pin user — nếu không, syncAutomatedRescuePins bị chặn và SOS đứng yên.
-  pinBoatPosition(boatCode, lat, lng, { user: !quiet });
+  // Heartbeat: không pin trước POST — tránh đè marker bằng hub cũ rồi Azure mới (nhảy qua lại).
+  // Chỉ pin khi user kéo/gửi tay.
+  if (!quiet) {
+    pinBoatPosition(boatCode, lat, lng, { user: true });
+  }
   const st = getStatus(boatCode);
   const phase = autoPhaseForBoat(boatCode, lat, lng);
   const cruise = getBoatSpeedKmh(boatCode);
@@ -1875,6 +1907,28 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
       }),
     });
     const body = await response.json();
+    if (body?.skipped) {
+      if (!quiet && sendStatusEl) {
+        sendStatusEl.textContent = body.soft
+          ? `Skip survey · ${boatCode}`
+          : `Skip · ${body.mode || 'owned'}`;
+      } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
+        sendStatusEl.textContent = body.soft
+          ? `Đang survey — tạm dừng Live GPS`
+          : `Skip · ${body.mode || 'owned'}`;
+      }
+      const reason = body.soft
+        ? 'survey'
+        : (body.mode === 'rescue-owned' ? 'rescue' : (body.mode === 'trip-owned' ? 'trip' : 'skip'));
+      return {
+        ok: Boolean(body.ok) || Boolean(body.soft),
+        skipped: true,
+        soft: Boolean(body.soft),
+        reason,
+        status: body.status || response.status,
+        error: body.error || null,
+      };
+    }
     if (!response.ok || body.ok === false) {
       if (!quiet) {
         const msg = body.error || `HTTP ${response.status}`;
@@ -1883,21 +1937,35 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
       } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
         sendStatusEl.textContent = `Heartbeat lỗi · ${body.status || response.status}`;
       }
-      return false;
+      return {
+        ok: false,
+        skipped: false,
+        reason: 'error',
+        status: body.status || response.status,
+        error: body.error || `HTTP ${response.status}`,
+      };
     }
     markSignal(boatCode);
-    pinBoatPosition(boatCode, lat, lng, { user: !quiet });
     if (!quiet) {
-      const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
+      pinBoatPosition(boatCode, lat, lng, { user: true });
+    }
+    const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
+    if (!quiet) {
       sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
       if (body.warning) toast(body.warning, 'warn');
       else toast(`Đã gửi GPS ${boatDisplayName(boatCode)}`, 'ok');
       if (latest) renderHubBoats(latest.hubBoats);
     } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
-      const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
       sendStatusEl.textContent = `Heartbeat · seq ${body.sequence || '—'} · ${mode}`;
     }
-    return true;
+    return {
+      ok: true,
+      skipped: false,
+      reason: 'sent',
+      sequence: body.sequence || null,
+      mode: body.mode || null,
+      status: body.status || response.status,
+    };
   } catch (error) {
     if (!quiet) {
       sendStatusEl.textContent = 'Lỗi mạng';
@@ -1905,20 +1973,76 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
     } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
       sendStatusEl.textContent = 'Heartbeat lỗi mạng';
     }
-    return false;
+    return { ok: false, skipped: false, reason: 'network', error: error.message };
   } finally {
     if (!quiet) sending = false;
   }
+}
+
+function renderGpsScan(scan) {
+  lastGpsScan = scan;
+  if (!gpsScanSummaryEl) return;
+  if (!scan) {
+    gpsScanSummaryEl.textContent = 'Chưa quét';
+    if (gpsScanDetailEl) {
+      gpsScanDetailEl.hidden = true;
+      gpsScanDetailEl.innerHTML = '';
+    }
+    return;
+  }
+  const ok = scan.results.filter((r) => r.reason === 'sent').length;
+  const skip = scan.results.filter((r) => r.skipped).length;
+  const fail = scan.results.filter((r) => !r.ok && !r.skipped).length;
+  const time = new Date(scan.at).toLocaleTimeString('vi-VN', { hour12: false });
+  const parts = [`${scan.results.length} tàu`, `${ok} OK`];
+  if (skip) parts.push(`${skip} skip`);
+  if (fail) parts.push(`${fail} lỗi`);
+  parts.push(time);
+  gpsScanSummaryEl.textContent = parts.join(' · ');
+
+  if (!gpsScanDetailEl) return;
+  gpsScanDetailEl.hidden = false;
+  gpsScanDetailEl.innerHTML = scan.results.map((r) => {
+    let cls = 'is-fail';
+    let mark = '✗';
+    let note = r.status || r.error || '';
+    if (r.reason === 'sent') {
+      cls = 'is-ok';
+      mark = '✓';
+      note = r.status || '200';
+    } else if (r.skipped) {
+      cls = 'is-skip';
+      mark = '⊘';
+      note = r.reason || 'skip';
+    }
+    return `<span class="live-scan-chip ${cls}" title="${escapeHtml(r.error || r.reason || '')}">${escapeHtml(r.boatCode)} ${mark} ${escapeHtml(String(note))}</span>`;
+  }).join('');
 }
 
 async function heartbeatAllBoats() {
   // Gửi GPS liên tục mọi tàu (kể cả đang trip / sắp cập bến) — không để "Chưa gửi".
   if (heartbeatBusy || dragging || sending) return;
   heartbeatBusy = true;
+  const results = [];
   try {
+    const surveyCode = activeSurveyBoatCode();
     const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
+    if (gpsScanSummaryEl) {
+      gpsScanSummaryEl.textContent = `Đang quét ${codes.length} tàu…`;
+    }
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
+      if (surveyCode && code === surveyCode) {
+        results.push({
+          boatCode: code,
+          ok: true,
+          skipped: true,
+          reason: 'survey',
+          status: 200,
+          error: 'Đang survey — tạm dừng Live GPS',
+        });
+        continue;
+      }
       const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
       ensureSeedPin(code, pin.lat, pin.lng);
       const fixed = pinnedFor(code) || pin;
@@ -1927,14 +2051,24 @@ async function heartbeatAllBoats() {
       const lat = Number(hub?.lat);
       const lng = Number(hub?.lng);
       const useHub = Number.isFinite(lat) && Number.isFinite(lng);
-      await sendLiveGps(
+      const result = await sendLiveGps(
         code,
         useHub ? lat : fixed.lat,
         useHub ? lng : fixed.lng,
         { quiet: true },
       );
+      results.push({
+        boatCode: code,
+        ok: Boolean(result?.ok),
+        skipped: Boolean(result?.skipped),
+        reason: result?.reason || (result?.ok ? 'sent' : 'error'),
+        status: result?.status || null,
+        sequence: result?.sequence || null,
+        error: result?.error || null,
+      });
       await new Promise((r) => setTimeout(r, 120));
     }
+    renderGpsScan({ at: Date.now(), results });
     if (latest) renderHubBoats(latest.hubBoats);
   } finally {
     heartbeatBusy = false;

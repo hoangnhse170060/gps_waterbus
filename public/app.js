@@ -414,8 +414,16 @@ startCollectorEl.addEventListener('click', startRecording);
 pauseCollectorEl.addEventListener('click', pauseCollector);
 stopCollectorEl.addEventListener('click', stopRecording);
 saveRouteGeometryEl.addEventListener('click', saveRouteGeometry);
+createReverseRouteEl?.addEventListener('change', () => {
+  updateReverseRouteUi({ suggest: true });
+});
 captureRouteCodeEl?.addEventListener('input', () => {
   checkRouteCodeDuplicate();
+  maybeSuggestReverseRoute();
+  validateReverseRouteCode();
+});
+captureRouteNameEl?.addEventListener('input', () => {
+  maybeSuggestReverseRoute();
 });
 toggleCaptureEl.addEventListener('click', () => {
   captureState.enabled = !captureState.enabled;
@@ -1309,8 +1317,19 @@ function surveySaveFields() {
     stops: buildSurveyStops(),
     // Đúng số trên panel lúc vẽ — (km ÷ tốc độ cài) × 60 (vd 0.22).
     estimatedDurationMin: pathMinutes > 0 ? Number(pathMinutes.toFixed(2)) : null,
-    createReverseRoute: false,
   };
+  const inferredType = getSurveyRouteType();
+  const wantReverse = Boolean(createReverseRouteEl?.checked)
+    && inferredType !== 'SightseeingLoop'
+    && (fields.stops?.length || 0) >= 2;
+  if (wantReverse) {
+    fields.createReverseRoute = true;
+    const ensured = ensureReverseRouteFields();
+    fields.reverseRouteCode = ensured.reverseCode;
+    fields.reverseRouteName = ensured.reverseName;
+  } else {
+    fields.createReverseRoute = false;
+  }
   return fields;
 }
 
@@ -2353,6 +2372,11 @@ async function startRecording() {
     collectorBoatCodeEl?.focus();
     return;
   }
+  if (!validateReverseRouteCode()) {
+    captureStatusEl.textContent = 'Mã chiều về không hợp lệ — phải khác mã tuyến chính.';
+    reverseRouteCodeEl?.focus();
+    return;
+  }
   applyBoatSpeedLimits();
   if (!(getSurveySpeedKmh() > 0)) {
     captureStatusEl.textContent = 'Nhập tốc độ chạy hợp lệ (≤ max đăng ký).';
@@ -2525,6 +2549,11 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
   }
   if (!checkRouteCodeDuplicate()) {
     captureStatusEl.textContent = 'Mã tuyến bị trùng — đổi mã rồi lưu lại.';
+    return false;
+  }
+  if (!validateReverseRouteCode()) {
+    captureStatusEl.textContent = 'Mã chiều về trùng mã tuyến chính — đổi trước khi lưu.';
+    reverseRouteCodeEl?.focus();
     return false;
   }
   autoSaveInFlight = true;
@@ -2735,9 +2764,18 @@ function renderRouteResult(body) {
     ${stops.length
       ? `<div class="route-result-stops-title">Thứ tự bến đã đẩy lên BE</div><ol class="route-result-stops">${stopLines}</ol>`
       : '<p class="meta">Chưa có station trong route_stops — kiểm tra payload stops[] gửi BE.</p>'}
-    ${body.warning
-      ? `<p class="meta is-error">${escapeHtml(body.warning)}</p>`
-      : ''}
+    ${body.reverseRoute
+      ? `<div class="route-result-stops-title">Đã tạo chiều về</div>
+      <div class="route-result-meta">
+        <span><b>${escapeHtml(body.reverseRoute.routeCode || '')}</b></span>
+        <span>${escapeHtml(body.reverseRoute.routeName || '')}</span>
+        <span>id: ${escapeHtml(body.reverseRoute.routeId || body.reverseRoute.id || '')}</span>
+      </div>`
+      : (body.reverseWarning || body.warning
+        ? `<p class="meta is-error">${escapeHtml(body.reverseWarning || body.warning)}</p>`
+        : (body.createReverseRoute
+          ? '<p class="meta">Đã gửi createReverseRoute nhưng BE chưa trả reverseRoute.</p>'
+          : ''))}
     <p class="meta"><a href="/api-log.html" target="_blank" rel="noopener">Xem log API đẩy BE →</a></p>
   `;
   routeResultEl.classList.remove('hidden');

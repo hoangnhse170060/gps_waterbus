@@ -274,6 +274,8 @@ where coalesce(d.is_active, true) = true
 
 /** Sau khi dừng ghi survey, ignore echo SignalR một lúc để marker không hiện lại. */
 const hubBoatSuppressUntil = new Map();
+/** Sau GPS Live/trip forceAccept — bỏ echo Azure cũ trong vài giây (tránh nhảy về chỗ cũ). */
+const hubLiveAuthorityUntil = new Map();
 let boatsLatestPollBusy = false;
 let boatsLatestLastOkAt = null;
 let boatsLatestLastError = null;
@@ -532,7 +534,7 @@ const server = createServer(async (req, res) => {
       state.lastAutoSavedRoute = null;
       // Đồng bộ sequence cao hơn mọi bản tin cũ trên Azure (tránh 409 "sequence cũ").
       bumpDeviceSequence(state.collector.deviceId, state.collector);
-      syncCollectorToHub();
+      hideSurveyBoatFromLiveHub();
       broadcast();
       if (state.collector.sendToTarget && getTargetApiRoot()) {
         const sessionResult = await startTrackingSessionOnTarget(state.collector);
@@ -580,9 +582,9 @@ const server = createServer(async (req, res) => {
           endStationId: stopped.endStationId || null,
           routeType: stopped.routeType || null,
           stops: Array.isArray(stopped.stops) ? stopped.stops : null,
-          createReverseRoute: false,
-          reverseRouteCode: null,
-          reverseRouteName: null,
+          createReverseRoute: Boolean(stopped.createReverseRoute),
+          reverseRouteCode: stopped.reverseRouteCode || null,
+          reverseRouteName: stopped.reverseRouteName || null,
           averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
           cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
           estimatedDurationMin: stopped.estimatedDurationMin ?? null,
@@ -916,8 +918,9 @@ function shouldAcceptHubJump(prev, next) {
     ? Number(next.speedKmh)
     : (Number.isFinite(Number(prev.speedKmh)) ? Number(prev.speedKmh) : 0);
 
-  const prevAt = Date.parse(prev.recordedAt || prev.receivedAt || prev.updatedAt || '') || 0;
-  const nextAt = Date.parse(next.recordedAt || next.receivedAt || '') || Date.now();
+  const prevAt = Date.parse(prev.recordedAt || '') || 0;
+  const nextAt = Date.parse(next.recordedAt || '') || Date.now();
+  // Chỉ dùng recordedAt cho Δt — không dùng receivedAt (reject path từng refresh receivedAt → teleport ảo).
   const dtSec = prevAt > 0 ? Math.max(0.5, (nextAt - prevAt) / 1000) : 5;
 
   // Đứng yên / tốc thấp: không nhận lệch > 40m (tránh nhảy ~350m speed=0).
@@ -957,13 +960,19 @@ function upsertHubBoat(payload) {
   const suppressUntil = hubBoatSuppressUntil.get(code) || 0;
   if (suppressUntil > Date.now()) return;
   if (suppressUntil) hubBoatSuppressUntil.delete(code);
-  // Đang hoặc vừa survey cùng mã → không giữ twin live trên map (marker collector/route xong sẽ ẩn).
-  if (state.collector && String(state.collector.boatCode || '').trim() === code) return;
+  // Đang survey cùng mã → không hiện / không nhận GPS Live (Azure echo / heartbeat).
+  if (activeSurveyBoatCode() === code) {
+    state.hubBoats.delete(code);
+    return;
+  }
 
   const forceAccept = payload.forceAccept === true || payload._forceAccept === true;
   // Đang cứu hộ / trip lịch: chỉ nhận GPS từ publishLiveGpsPosition (forceAccept), bỏ echo Azure cũ.
   if (!forceAccept && isBoatInActiveRescueMission(code)) return;
   if (!forceAccept && tripAutorun.isBoatInActiveTripMission(code)) return;
+  // Vừa nhận GPS Live/trip: bỏ Azure echo cũ trong cửa sổ ngắn.
+  const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
+  if (!forceAccept && liveAuthUntil > Date.now()) return;
 
   const prev = state.hubBoats.get(code);
   const incoming = {
@@ -980,12 +989,11 @@ function upsertHubBoat(payload) {
     if (gate.reason && !String(gate.reason).startsWith('stale')) {
       console.warn(`[hub-jump] ${code}: keep previous — ${gate.reason}`);
     }
-    // Cập nhật metadata online/time nhưng giữ lat/lng cũ.
+    // Chỉ đánh dấu online — KHÔNG refresh receivedAt (tránh dtSec phình → teleport sau này).
     if (prev) {
       state.hubBoats.set(code, {
         ...prev,
         isOnline: payload.isOnline !== false,
-        receivedAt: incoming.receivedAt || prev.receivedAt,
         updatedAt: new Date().toISOString(),
       });
     }
@@ -1017,11 +1025,14 @@ function upsertHubBoat(payload) {
     speedKmh: incoming.speedKmh,
     heading,
     recordedAt: incoming.recordedAt,
-    receivedAt: incoming.receivedAt,
+    receivedAt: incoming.receivedAt || new Date().toISOString(),
     sequence: incoming.sequence,
     isOnline: payload.isOnline !== false,
     updatedAt: new Date().toISOString(),
   });
+  if (forceAccept) {
+    hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 8000));
+  }
   rememberLastPosition(code, state.hubBoats.get(code));
 }
 
@@ -1443,46 +1454,38 @@ function tickCollector() {
   } else {
     collector.status = 'moving';
   }
-  syncCollectorToHub();
+  hideSurveyBoatFromLiveHub();
 }
 
-/** Live map theo dõi tàu đang survey theo đúng path vẽ (không giữ pin cũ / echo Azure). */
-function syncCollectorToHub() {
-  const collector = state.collector;
-  const code = String(collector?.boatCode || '').trim();
+/** Mã tàu đang ghi GPS survey (vẽ tuyến) — tạm ẩn khỏi Live + không đẩy GPS Live. */
+function activeSurveyBoatCode() {
+  const code = String(state.collector?.boatCode || '').trim();
+  if (!code) return '';
+  const status = String(state.collector?.status || '').toLowerCase();
+  if (!['moving', 'paused', 'running', 'completed'].includes(status)) return '';
+  return code;
+}
+
+/** Survey: ẩn tàu đó khỏi Live hub (marker/GPS Live). Survey vẫn gửi GPS riêng. */
+function hideSurveyBoatFromLiveHub() {
+  const code = activeSurveyBoatCode();
   if (!code) return;
-  const lat = Number(collector.lat);
-  const lng = Number(collector.lng);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
-  const prev = state.hubBoats.get(code);
-  state.hubBoats.set(code, {
-    ...(prev || {}),
-    boatCode: code,
-    boatName: collector.boatName || prev?.boatName || code,
-    boatId: prev?.boatId || null,
-    deviceId: collector.deviceId || prev?.deviceId || null,
-    routeCode: collector.routeCode || prev?.routeCode || null,
-    lat,
-    lng,
-    speedKmh: Number(collector.speedKmh) || 0,
-    heading: Number(collector.heading) || 0,
-    isOnline: true,
-    source: 'survey-collector',
-    recordedAt: new Date().toISOString(),
-    receivedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
+  state.hubBoats.delete(code);
 }
 
 async function publishGpsPositions() {
   // Mặc định không POST tàu live — chỉ survey collector (tránh 400 spam trên Azure).
   if (!parseBool(env.PUBLISH_LIVE_BOATS || 'false')) return;
-  // Khi đang survey GPS, không POST tàu live — tránh đụng sequence/deviceId với collector.
-  if (state.collector) {
-    return;
-  }
 
-  const payloads = [...state.boats.values()].map(buildTargetPayload);
+  const surveyCode = activeSurveyBoatCode();
+  const payloads = [...state.boats.values()]
+    .filter((boat) => {
+      const code = String(boat.boatCode || '').trim();
+      // Chỉ loại tàu đang survey — tàu khác vẫn cập nhật GPS.
+      if (surveyCode && code === surveyCode) return false;
+      return true;
+    })
+    .map(buildTargetPayload);
   state.lastGps = { at: new Date().toISOString(), payloads };
 
   if (!state.senderEnabled || !getTargetEndpoint()) {
@@ -1717,13 +1720,14 @@ async function publishLiveGpsPosition(body = {}) {
     };
   }
 
-  if (state.collector && String(state.collector.boatCode || '').trim() === boatCode) {
+  if (activeSurveyBoatCode() === boatCode) {
+    hideSurveyBoatFromLiveHub();
     return {
       ok: false,
       skipped: true,
       soft: true,
       status: 200,
-      error: `Tàu ${boatCode} đang ghi GPS survey — không kéo live cùng lúc (tránh đụng sequence).`,
+      error: `Tàu ${boatCode} đang vẽ/ghi GPS survey — tạm ẩn trên Live và không cập nhật GPS Live (tránh đụng sequence). Các tàu khác vẫn chạy bình thường.`,
     };
   }
 
@@ -4122,7 +4126,36 @@ async function saveRouteFromGpsOnTarget(session, body) {
 
   // Contract mới: GPS không gửi routeType/isBookable — BE tự phân loại
   // (start≠end → route nguồn; start=end → sightseeing loop).
-  // Không gửi createReverseRoute.
+  const inferredLoop = Boolean(startStationId && endStationId && startStationId === endStationId);
+
+  const wantReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
+    && !inferredLoop;
+  if (wantReverse) {
+    let reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
+    let reverseName = cleanOptionalText(body.reverseRouteName || session?.reverseRouteName);
+    // BE bắt buộc reverseRouteCode khác routeCode — tự sửa nếu thiếu/trùng.
+    if (!reverseCode || reverseCode.toLowerCase() === String(payload.routeCode).toLowerCase()) {
+      const parts = String(payload.routeCode || '').split('-').map((s) => s.trim()).filter(Boolean);
+      reverseCode = parts.length >= 2
+        ? parts.reverse().join('-')
+        : `${payload.routeCode}-VE`;
+      if (reverseCode.toLowerCase() === String(payload.routeCode).toLowerCase()) {
+        reverseCode = `${payload.routeCode}-VE`;
+      }
+    }
+    if (!reverseName) {
+      const nameParts = String(payload.routeName || '').split(/\s+-\s+/).map((s) => s.trim()).filter(Boolean);
+      reverseName = nameParts.length >= 2
+        ? nameParts.reverse().join(' - ')
+        : `${payload.routeName || payload.routeCode} (chiều về)`;
+    }
+    payload.createReverseRoute = true;
+    payload.reverseRouteCode = reverseCode;
+    payload.reverseRouteName = reverseName;
+    console.log(
+      `[from-gps] reverse → ${reverseCode} (${reverseName}) for ${payload.routeCode}`,
+    );
+  }
 
   const detectRadius = Number(env.STOP_DETECT_RADIUS_M || 200);
   let stops = enrichStopsAlongPath(
@@ -4223,6 +4256,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
       body.estimatedDurationMin ?? session?.estimatedDurationMin ?? payload.estimatedDurationMin,
     );
     targetResult.outboundEstimatedDurationMin = uiDuration ?? payload.estimatedDurationMin ?? null;
+    targetResult.outboundCreateReverse = Boolean(payload.createReverseRoute);
     targetResult.outboundAverageSpeedKmh = averageSpeedKmh;
   }
   return targetResult;
@@ -4241,7 +4275,25 @@ async function persistRecordingSession(body, sessionInput = null) {
   const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && session?.targetSessionStarted);
 
   if (canTryAzure) {
-    const targetSave = await saveRouteFromGpsOnTarget(session, body);
+    let targetSave = await saveRouteFromGpsOnTarget(session, body);
+    let reverseError = null;
+    const wantedReverse = Boolean(body.createReverseRoute || session?.createReverseRoute);
+    if (
+      !targetSave.ok
+      && targetSave.status !== 409
+      && wantedReverse
+    ) {
+      reverseError = targetSave.error || `BE from-gps trả ${targetSave.status}`;
+      console.warn(`[save-route] from-gps failed with reverse (${targetSave.status}): ${reverseError}. Retry without createReverseRoute.`);
+      const retrySave = await saveRouteFromGpsOnTarget(
+        { ...session, createReverseRoute: false, reverseRouteCode: null, reverseRouteName: null },
+        { ...body, createReverseRoute: false, reverseRouteCode: null, reverseRouteName: null },
+      );
+      if (retrySave.ok) {
+        targetSave = retrySave;
+        warning = `Chiều đi đã lên BE; chiều về lỗi: ${reverseError}`;
+      }
+    }
 
     if (targetSave.ok) {
       route = targetSave.data || {};
@@ -4265,7 +4317,6 @@ async function persistRecordingSession(body, sessionInput = null) {
               String(item.stationId) === String(stop.stationId)
               && Number(item.stopOrder) === Number(stop.stopOrder)
             )) || outboundStops[index];
-            // Ưu tiên phút GPS×tốc độ đã gửi — không lấy estimated/lịch BE đè.
             const travel = out?.standardTravelMin ?? stop.standardTravelMin ?? stop.standard_travel_min;
             return {
               ...stop,
@@ -4276,10 +4327,19 @@ async function persistRecordingSession(body, sessionInput = null) {
           });
         }
       }
-      // Giữ đúng phút panel (vd 0.22) — không lấy / làm tròn estimatedDurationMin của BE.
       const outboundMin = exactDurationMinutes(targetSave.outboundEstimatedDurationMin);
       if (outboundMin != null) {
         route.estimatedDurationMin = outboundMin;
+      }
+      if (!route.reverseRoute && targetSave.data?.reverseRoute) {
+        route.reverseRoute = targetSave.data.reverseRoute;
+      }
+      if (route.createReverseRoute == null) {
+        route.createReverseRoute = Boolean(targetSave.outboundCreateReverse);
+      }
+      if (warning && !route.reverseRoute) {
+        route.createReverseRoute = false;
+        route.reverseWarning = warning;
       }
       savedTo = 'target';
       state.lastRecordingSession = null;
@@ -4302,7 +4362,6 @@ async function persistRecordingSession(body, sessionInput = null) {
           ?? session?.speedKmh,
       });
       await refreshFromDatabase();
-      // Luôn hiện đúng phút panel — không để DB int / DEFAULT 16 đè.
       const lockedMin = exactDurationMinutes(
         body.estimatedDurationMin
         ?? targetSave.outboundEstimatedDurationMin
@@ -4392,9 +4451,9 @@ async function finalizeCollectorRecording() {
     endStationId: stopped.endStationId || null,
     routeType: stopped.routeType || null,
     stops: Array.isArray(stopped.stops) ? stopped.stops : null,
-    createReverseRoute: false,
-    reverseRouteCode: null,
-    reverseRouteName: null,
+    createReverseRoute: Boolean(stopped.createReverseRoute),
+    reverseRouteCode: stopped.reverseRouteCode || null,
+    reverseRouteName: stopped.reverseRouteName || null,
     averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
     estimatedDurationMin: stopped.estimatedDurationMin ?? null,
     cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
@@ -4437,9 +4496,9 @@ async function finalizeCollectorRecording() {
       endStationId: stopped.endStationId || null,
       routeType: stopped.routeType || null,
       stops: stopped.stops || null,
-      createReverseRoute: false,
-      reverseRouteCode: null,
-      reverseRouteName: null,
+      createReverseRoute: Boolean(stopped.createReverseRoute),
+      reverseRouteCode: stopped.reverseRouteCode || null,
+      reverseRouteName: stopped.reverseRouteName || null,
     }, state.lastRecordingSession);
     state.lastAutoSavedRoute = {
       ...result,
@@ -5097,9 +5156,9 @@ function startCollector(body) {
     endStationId,
     routeType,
     stops,
-    createReverseRoute: false,
-    reverseRouteCode: null,
-    reverseRouteName: null,
+    createReverseRoute: Boolean(body.createReverseRoute) && routeType !== 'SightseeingLoop',
+    reverseRouteCode: cleanOptionalText(body.reverseRouteCode) || null,
+    reverseRouteName: cleanOptionalText(body.reverseRouteName) || null,
     sendIntervalMs: clamp(Number(body.sendIntervalMs || 5000), 3000, 10000),
     recordedPoints: [],
     lastPublishAt: 0,
@@ -5438,7 +5497,13 @@ function snapshot() {
         speedKmh: round(boat.speedKmh, 1),
       };
     }),
-    hubBoats: [...state.hubBoats.values()].map((boat) => {
+    hubBoats: [...state.hubBoats.values()]
+      .filter((boat) => {
+        const surveyCode = activeSurveyBoatCode();
+        if (!surveyCode) return true;
+        return String(boat.boatCode || '').trim() !== surveyCode;
+      })
+      .map((boat) => {
       const beStatus = beStatusForBoat(boat.boatCode) || boat.beStatus || boat.boatStatus || null;
       return {
         ...boat,

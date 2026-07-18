@@ -344,6 +344,49 @@ body.survey-open {
   word-break: break-word;
 }
 
+.live-scan-summary b {
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.live-scan-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 2px;
+}
+
+.live-scan-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+}
+
+.live-scan-chip.is-ok {
+  color: #0f5c45;
+  background: #d9f3e8;
+  border-color: #b5e4d1;
+}
+
+.live-scan-chip.is-skip {
+  color: #6b5a1e;
+  background: #f7efc8;
+  border-color: #ead98a;
+}
+
+.live-scan-chip.is-fail {
+  color: #8a1f1f;
+  background: #f8dede;
+  border-color: #efb4b4;
+}
+
 .live-help {
   margin: 0;
   font-size: 12px;
