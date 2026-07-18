@@ -824,12 +824,20 @@ function finishDraw() {
   clearCompletedRouteLine();
   const type = getSurveyRouteType();
   const stopCount = buildSurveyStops().length;
-  // A→B: snap lên hành lang sông (vạch Waterbus).
-  ensureRiverPathForRun({ quiet: true }).then((ok) => {
-    captureStatusEl.textContent = ok
-      ? `Đã xong — bám vạch sông (${stopCount} bến, loại ${type}). Bấm ghi GPS để chạy.`
-      : `Đã xong (${stopCount} bến, loại ${type}). Đường liền sẵn sàng — bấm ghi GPS để chạy.`;
-  });
+  // Chỉ auto-snap sông khi path 2 bến (chưa vẽ tay). Có freehand → giữ đúng đường vẽ.
+  const freehand = captureState.points.some((p) => p.source === 'manual')
+    || captureState.points.filter((p) => p.source !== 'station' && p.source !== 'station-end').length > 0
+    || captureState.points.length > 2;
+  if (!freehand) {
+    ensureRiverPathForRun({ quiet: true }).then((ok) => {
+      captureStatusEl.textContent = ok
+        ? `Đã xong — bám vạch sông (${stopCount} bến, loại ${type}). Bấm ghi GPS để chạy.`
+        : `Đã xong (${stopCount} bến, loại ${type}). Đường liền sẵn sàng — bấm ghi GPS để chạy.`;
+    });
+  } else {
+    riverPathOverride = null;
+    captureStatusEl.textContent = `Đã xong (${stopCount} bến, loại ${type}). Giữ đúng đường bạn vẽ — bấm ghi GPS để chạy.`;
+  }
   updateWorkflow('run');
   updateRouteTypeHint();
   checkRouteCodeDuplicate();
@@ -951,9 +959,6 @@ function render(data) {
   if (routesFp !== lastRoutesFingerprint) {
     lastRoutesFingerprint = routesFp;
     renderRoutes(data.routes);
-  }
-  if (Array.isArray(data.riverCorridor) && data.riverCorridor.length >= 2) {
-    renderRiverCorridorGuide(data.riverCorridor);
   }
   // Chỉ vẽ tàu DB/simulator nếu không trùng mã đang live GPS / đang ghi.
   const liveCodes = activeLiveBoatCodes(data);
@@ -1567,6 +1572,15 @@ function seedToEndStation() {
     renderCaptureState();
     return;
   }
+  // Có điểm vẽ tay giữa 2 bến → giữ path user; chỉ 2 điểm bến → bám sông.
+  const freehand = captureState.points.some((p) => p.source === 'manual')
+    || captureState.points.length > 2;
+  if (freehand) {
+    riverPathOverride = null;
+    captureStatusEl.textContent = `Đã nối tới ${endStation.stationName} — giữ đường bạn vẽ.`;
+    renderCaptureState();
+    return;
+  }
   captureStatusEl.textContent = `Đang bám hành lang sông tới ${endStation.stationName}...`;
   renderCaptureState();
   ensureRiverPathForRun({ quiet: true }).then((ok) => {
@@ -1800,25 +1814,11 @@ async function ensureRiverPathForRun({ quiet = false } = {}) {
   }
 }
 
-function renderRiverCorridorGuide(coords) {
+function renderRiverCorridorGuide() {
   if (riverCorridorLine) {
     riverCorridorLine.remove();
     riverCorridorLine = null;
   }
-  const path = Array.isArray(coords) ? coords : [];
-  if (path.length < 2) return;
-  riverCorridorLine = L.polyline(
-    path.map((p) => [Number(p.lat), Number(p.lng)]),
-    {
-      color: '#2563eb',
-      weight: 3,
-      opacity: 0.55,
-      dashArray: '10 8',
-      interactive: false,
-      smoothFactor: 1,
-    },
-  ).addTo(map);
-  riverCorridorLine.bringToBack();
 }
 
 function renderCaptureLine() {
@@ -2345,9 +2345,13 @@ async function startRecording() {
     return;
   }
 
-  // Ép path lên hành lang sông trước khi ghi (trừ vòng sightseeing).
-  if (!isSightseeingLoop) {
+  // Chỉ ép sông khi chưa vẽ tay (2 bến). Freehand / loop → giữ đường vẽ.
+  const freehand = captureState.points.some((p) => p.source === 'manual')
+    || captureState.points.length > 2;
+  if (!isSightseeingLoop && !freehand) {
     await ensureRiverPathForRun({ quiet: true });
+  } else {
+    riverPathOverride = null;
   }
 
   const plannedCheck = getPathCoordinates();
@@ -2372,6 +2376,10 @@ async function startRecording() {
   routeResultEl?.classList.add('hidden');
   updateWorkflow('run');
   const plannedCoords = getPathCoordinates();
+  const keepDrawnPath = isSightseeingLoop
+    || captureState.points.some((p) => p.source === 'manual')
+    || captureState.points.length > 2
+    || !riverPathOverride;
   lockedSurveyPath = plannedCoords.map((p) => ({ lat: p.lat, lng: p.lng }));
   showPlannedRoute(lockedSurveyPath);
   recordingActive = true;
@@ -2396,6 +2404,7 @@ async function startRecording() {
         sendToTarget: true,
         recording: true,
         isNewRouteSurvey: true,
+        keepDrawnPath,
         ...surveySaveFields(),
         coordinates: plannedCoords,
       }),

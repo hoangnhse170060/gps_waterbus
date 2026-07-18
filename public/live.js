@@ -489,63 +489,21 @@ function renderRescueOverlays(data = latest) {
       continue;
     }
 
-    // Server đang chạy: vẽ đường theo autoMission (không phụ thuộc localMission).
+    // Server đang chạy: không vẽ đường corridor lên map (chỉ pin tàu).
     if (
       (autoStatus === 'Dispatched' || autoStatus === 'InTransit')
       && rescuePin
     ) {
-      // Ưu tiên pin tàu sự cố live (gần nhất) — không bám targetLat stale.
-      const destLat = Number(
-        incidentPin?.lat ?? autoMission?.targetLat ?? target.lat,
-      );
-      const destLng = Number(
-        incidentPin?.lng ?? autoMission?.targetLng ?? target.lng,
-      );
-      if (!Number.isFinite(destLat) || !Number.isFinite(destLng)) continue;
-      const pathPts = Array.isArray(autoMission?.pathCoordinates) ? autoMission.pathCoordinates : [];
-      let toPoints;
-      if (pathPts.length >= 2) {
-        toPoints = pathPts
-          .map((p) => [Number(p.lat), Number(p.lng)])
-          .filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-        if (toPoints.length >= 2) {
-          const head = toPoints[0];
-          const d0 = distMeters(
-            { lat: rescuePin.lat, lng: rescuePin.lng },
-            { lat: head[0], lng: head[1] },
-          );
-          if (d0 > 25) toPoints = [[rescuePin.lat, rescuePin.lng], ...toPoints];
-        }
-      } else {
-        toPoints = [
-          [rescuePin.lat, rescuePin.lng],
-          [destLat, destLng],
-        ];
-      }
-      if (toPoints.length < 2) continue;
-      if (!overlay.toLine) {
-        overlay.toLine = L.polyline(toPoints, {
-          color: '#7c3aed',
-          weight: 4,
-          dashArray: '10 8',
-          opacity: 0.85,
-        }).addTo(map);
-      } else {
-        overlay.toLine.setLatLngs(toPoints);
-        if (!map.hasLayer(overlay.toLine)) overlay.toLine.addTo(map);
-      }
-      if (overlay.returnLine) {
-        overlay.returnLine.remove();
-        overlay.returnLine = null;
-      }
-      if (overlay.towLine) {
-        overlay.towLine.remove();
-        overlay.towLine = null;
-      }
+      overlay.toLine?.remove();
+      overlay.toLine = null;
+      overlay.returnLine?.remove();
+      overlay.returnLine = null;
+      overlay.towLine?.remove();
+      overlay.towLine = null;
       continue;
     }
 
-    // Đang kéo: nối đuôi tàu cứu → tàu lỗi (dây kéo), rồi tới bến.
+    // Đang kéo: chỉ nối ngắn tàu cứu → tàu lỗi (dây kéo), không vẽ path sông.
     if (autoStatus === 'Towing' && rescuePin && incidentPin) {
       const towPoints = [
         [rescuePin.lat, rescuePin.lng],
@@ -554,39 +512,17 @@ function renderRescueOverlays(data = latest) {
       if (!overlay.towLine) {
         overlay.towLine = L.polyline(towPoints, {
           color: '#7c3aed',
-          weight: 5,
-          opacity: 0.95,
+          weight: 3,
+          opacity: 0.35,
         }).addTo(map);
       } else {
         overlay.towLine.setLatLngs(towPoints);
         if (!map.hasLayer(overlay.towLine)) overlay.towLine.addTo(map);
       }
-
-      const stationLat = Number(autoMission.targetLat ?? localMission?.departureLat);
-      const stationLng = Number(autoMission.targetLng ?? localMission?.departureLng);
-      if (Number.isFinite(stationLat) && Number.isFinite(stationLng)) {
-        const towPath = Array.isArray(autoMission?.pathCoordinates) ? autoMission.pathCoordinates : [];
-        let returnPoints;
-        if (towPath.length >= 2) {
-          returnPoints = towPath
-            .map((p) => [Number(p.lat), Number(p.lng)])
-            .filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-        } else {
-          returnPoints = [[rescuePin.lat, rescuePin.lng], [stationLat, stationLng]];
-        }
-        if (!overlay.returnLine) {
-          overlay.returnLine = L.polyline(returnPoints, {
-            color: '#0f766e',
-            weight: 3,
-            dashArray: '6 6',
-            opacity: 0.55,
-          }).addTo(map);
-        } else {
-          overlay.returnLine.setLatLngs(returnPoints);
-          if (!map.hasLayer(overlay.returnLine)) overlay.returnLine.addTo(map);
-        }
-      }
-      if (overlay.toLine) overlay.toLine.remove();
+      overlay.toLine?.remove();
+      overlay.toLine = null;
+      overlay.returnLine?.remove();
+      overlay.returnLine = null;
       continue;
     }
 
@@ -596,41 +532,12 @@ function renderRescueOverlays(data = latest) {
     }
 
     if (!localMission || localMission.phase === 'completed' || !rescueCode || !rescuePin) continue;
-    // Có server mission đang chạy / đã xong → không vẽ path local (tránh tím ảo khi SOS đứng bến).
+    // Không vẽ path local — chỉ pin tàu.
     if (autoMission && autoStatus) continue;
-
-    const toPoints = [[rescuePin.lat, rescuePin.lng], [target.lat, target.lng]];
-    const returnPoints = Number.isFinite(localMission.departureLat)
-      ? [[target.lat, target.lng], [localMission.departureLat, localMission.departureLng]]
-      : null;
-
-    if (!overlay.toLine) {
-      overlay.toLine = L.polyline(toPoints, {
-        color: '#7c3aed',
-        weight: 4,
-        dashArray: '10 8',
-        opacity: 0.85,
-      }).addTo(map);
-    } else {
-      overlay.toLine.setLatLngs(toPoints);
-      if (!map.hasLayer(overlay.toLine)) overlay.toLine.addTo(map);
-    }
-
-    if (localMission.phase === 'at_incident' || localMission.phase === 'returning') {
-      if (!overlay.returnLine && returnPoints) {
-        overlay.returnLine = L.polyline(returnPoints, {
-          color: '#0f766e',
-          weight: 3,
-          dashArray: '6 6',
-          opacity: 0.55,
-        }).addTo(map);
-      } else if (overlay.returnLine && returnPoints) {
-        overlay.returnLine.setLatLngs(returnPoints);
-        if (!map.hasLayer(overlay.returnLine)) overlay.returnLine.addTo(map);
-      }
-    } else if (overlay.returnLine) {
-      overlay.returnLine.remove();
-    }
+    overlay.toLine?.remove();
+    overlay.toLine = null;
+    overlay.returnLine?.remove();
+    overlay.returnLine = null;
   }
 
   for (const [id, overlay] of rescueOverlays) {
