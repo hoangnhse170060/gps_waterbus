@@ -4972,15 +4972,8 @@ function startCollector(body) {
     err.status = 409;
     throw err;
   }
-  const keepDrawnPath = body.keepDrawnPath === true || body.followRiver === false;
-  let coordinates = validateRoutePoints(body.coordinates);
-  if (!keepDrawnPath) {
-    const snapped = snapCoordinatesToRiver(coordinates);
-    if (snapped.length >= 2) {
-      coordinates = snapped;
-      console.log(`[collector] path bo sông: ${coordinates.length} pts · ${Math.round(routeLength(coordinates))}m`);
-    }
-  }
+  // Survey luôn giữ đúng đường FE vẽ — không snap corridor (tránh tàu lệch đường vẽ).
+  const coordinates = validateRoutePoints(body.coordinates);
   const lengthMeters = routeLength(coordinates);
   const start = pointAtDistance(coordinates, 0);
   const boatCode = boatCodeEarly;

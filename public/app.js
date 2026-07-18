@@ -864,20 +864,9 @@ function finishDraw() {
   clearCompletedRouteLine();
   const type = getSurveyRouteType();
   const stopCount = buildSurveyStops().length;
-  // Chỉ auto-snap sông khi path 2 bến (chưa vẽ tay). Có freehand → giữ đúng đường vẽ.
-  const freehand = captureState.points.some((p) => p.source === 'manual')
-    || captureState.points.filter((p) => p.source !== 'station' && p.source !== 'station-end').length > 0
-    || captureState.points.length > 2;
-  if (!freehand) {
-    ensureRiverPathForRun({ quiet: true }).then((ok) => {
-      captureStatusEl.textContent = ok
-        ? `Đã xong — bám vạch sông (${stopCount} bến, loại ${type}). Bấm ghi GPS để chạy.`
-        : `Đã xong (${stopCount} bến, loại ${type}). Đường liền sẵn sàng — bấm ghi GPS để chạy.`;
-    });
-  } else {
-    riverPathOverride = null;
-    captureStatusEl.textContent = `Đã xong (${stopCount} bến, loại ${type}). Giữ đúng đường bạn vẽ — bấm ghi GPS để chạy.`;
-  }
+  // Luôn giữ đúng đường đang vẽ — không ép sang corridor sông.
+  riverPathOverride = null;
+  captureStatusEl.textContent = `Đã xong (${stopCount} bến, loại ${type}). Giữ đúng đường bạn vẽ — bấm ghi GPS để chạy.`;
   updateWorkflow('run');
   updateRouteTypeHint();
   checkRouteCodeDuplicate();
@@ -1618,23 +1607,9 @@ function seedToEndStation() {
     renderCaptureState();
     return;
   }
-  // Có điểm vẽ tay giữa 2 bến → giữ path user; chỉ 2 điểm bến → bám sông.
-  const freehand = captureState.points.some((p) => p.source === 'manual')
-    || captureState.points.length > 2;
-  if (freehand) {
-    riverPathOverride = null;
-    captureStatusEl.textContent = `Đã nối tới ${endStation.stationName} — giữ đường bạn vẽ.`;
-    renderCaptureState();
-    return;
-  }
-  captureStatusEl.textContent = `Đang bám hành lang sông tới ${endStation.stationName}...`;
+  riverPathOverride = null;
+  captureStatusEl.textContent = `Đã nối tới ${endStation.stationName} — giữ đường bạn vẽ.`;
   renderCaptureState();
-  ensureRiverPathForRun({ quiet: true }).then((ok) => {
-    captureStatusEl.textContent = ok
-      ? `Đã nối theo vạch sông tới ${endStation.stationName}. Hoàn thành / ghi GPS để chạy.`
-      : `Đã nối tới bến kết thúc: ${endStation.stationName}.`;
-    renderCaptureState();
-  });
 }
 
 function maybeFillRouteCode() {
@@ -1795,12 +1770,9 @@ function densifyPolyline(points, segmentsPerEdge) {
 }
 
 function getPathCoordinates() {
-  // Ưu tiên hành lang sông khi đã snap A→B (không vòng sightseeing).
-  if (Array.isArray(riverPathOverride) && riverPathOverride.length >= 2) {
-    return densifyPolyline(
-      riverPathOverride.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) })),
-      4,
-    );
+  // Khi đang chạy: đúng path đã khóa (path GPS).
+  if (Array.isArray(lockedSurveyPath) && lockedSurveyPath.length >= 2) {
+    return lockedSurveyPath.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
   }
   // WYSIWYG: đúng polyline đang vẽ. Densify nhẹ để GPS chạy mượt — không đổi hình.
   const expanded = expandPath(captureState.points);
@@ -1808,6 +1780,35 @@ function getPathCoordinates() {
     return captureState.points.map(({ lat, lng }) => ({ lat: Number(lat), lng: Number(lng) }));
   }
   return densifyPolyline(expanded, 8);
+}
+
+/** Chiếu điểm lên polyline đã vẽ — marker luôn nằm trên đường. */
+function projectOntoPath(path, point) {
+  const pts = (path || [])
+    .map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }))
+    .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+  const lat = Number(point?.lat);
+  const lng = Number(point?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || pts.length < 1) {
+    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+  }
+  if (pts.length === 1) return { ...pts[0] };
+  let best = null;
+  for (let i = 1; i < pts.length; i += 1) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const abx = b.lng - a.lng;
+    const aby = b.lat - a.lat;
+    const apx = lng - a.lng;
+    const apy = lat - a.lat;
+    const denom = abx * abx + aby * aby;
+    const t = denom > 0 ? Math.max(0, Math.min(1, (apx * abx + apy * aby) / denom)) : 0;
+    const plat = a.lat + (b.lat - a.lat) * t;
+    const plng = a.lng + (b.lng - a.lng) * t;
+    const d = haversineMeters({ lat, lng }, { lat: plat, lng: plng });
+    if (!best || d < best.d) best = { lat: plat, lng: plng, d };
+  }
+  return best ? { lat: best.lat, lng: best.lng } : { lat, lng };
 }
 
 async function fetchRiverPath(from, to) {
@@ -1876,27 +1877,32 @@ function renderCaptureLine() {
     helperCurveLine.remove();
     helperCurveLine = null;
   }
-  if (captureState.points.length < 2 && !(riverPathOverride?.length >= 2)) return;
-  const path = (Array.isArray(riverPathOverride) && riverPathOverride.length >= 2)
-    ? riverPathOverride
-    : expandPath(captureState.points);
-  if (path.length < 2) return;
+  // Đang chạy / đã khóa: chỉ 1 đường = path GPS (lockedSurveyPath).
   const running = hideCaptureWaypointsForRun();
-  const style = (captureState.finished || running || riverPathOverride)
+  let path;
+  if (running && Array.isArray(lockedSurveyPath) && lockedSurveyPath.length >= 2) {
+    path = lockedSurveyPath;
+  } else if (Array.isArray(riverPathOverride) && riverPathOverride.length >= 2) {
+    path = riverPathOverride;
+  } else {
+    path = expandPath(captureState.points);
+  }
+  if (!path || path.length < 2) return;
+  const style = (captureState.finished || running)
     ? { ...SURVEY_ROUTE_STYLE }
     : { ...DRAFT_ROUTE_STYLE };
   captureLine = L.polyline(
     path.map((p) => [p.lat, p.lng]),
     {
       ...style,
-      weight: (captureState.finished || running || riverPathOverride) ? 6 : 4.5,
+      weight: (captureState.finished || running) ? 6 : 4.5,
       interactive: false,
       smoothFactor: 0,
     },
   ).addTo(map);
 
   const idx = captureState.selectedSegmentIndex;
-  if (!riverPathOverride && idx > 0 && captureState.points[idx]?.segmentType === 'curve') {
+  if (!running && !riverPathOverride && idx > 0 && captureState.points[idx]?.segmentType === 'curve') {
     const prev = captureState.points[idx - 1];
     const cur = captureState.points[idx];
     const control = getCurveControl(prev, cur);
@@ -2409,14 +2415,8 @@ async function startRecording() {
     return;
   }
 
-  // Chỉ ép sông khi chưa vẽ tay (2 bến). Freehand / loop → giữ đường vẽ.
-  const freehand = captureState.points.some((p) => p.source === 'manual')
-    || captureState.points.length > 2;
-  if (!isSightseeingLoop && !freehand) {
-    await ensureRiverPathForRun({ quiet: true });
-  } else {
-    riverPathOverride = null;
-  }
+  // Luôn chạy đúng đường đang vẽ (không ép corridor sông).
+  riverPathOverride = null;
 
   const plannedCheck = getPathCoordinates();
   const uniquePts = new Set(
@@ -2471,23 +2471,19 @@ async function startRecording() {
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || 'Không bắt đầu ghi được GPS');
-    // Đồng bộ đường hiển thị = path server đang chạy (tránh tàu lệch đường vẽ).
-    const runCoords = Array.isArray(body.coordinates) && body.coordinates.length >= 2
-      ? body.coordinates.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }))
-        .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng))
-      : plannedCoords;
-    lockedSurveyPath = runCoords;
-    riverPathOverride = runCoords;
-    showPlannedRoute(lockedSurveyPath);
+    // Path GPS = path đã gửi (đúng đường vẽ). Không dùng body.coordinates nếu server đổi hình.
+    lockedSurveyPath = plannedCoords.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+    riverPathOverride = null;
+    clearPlannedRoute(); // một đường duy nhất = captureLine
     renderCaptureLine();
     const warn = body.targetSessionWarning ? ` ${body.targetSessionWarning}` : '';
     const startName = startStation?.stationName || startStation?.stationCode || 'điểm đầu đường vẽ';
-    captureStatusEl.textContent = `Tàu nhảy tới ${startName} rồi ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
+    captureStatusEl.textContent = `Tàu chạy đúng đường vẽ · ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
     collectorStatusEl.textContent = `Đang chạy ${body.boatCode} · ${body.deviceId}`;
     gpsStatusEl.textContent = 'Đang ghi GPS';
     ensureSurveyPathVisible();
     if (body.targetSessionWarning) notifyWarn(`Ghi GPS: ${body.targetSessionWarning}`);
-    else notifyOk(`${body.boatCode} nhảy tới ${startName} · bắt đầu ghi GPS`);
+    else notifyOk(`${body.boatCode} chạy theo đường vẽ`);
   } catch (error) {
     recordingActive = false;
     recordingStartedAt = 0;
@@ -2712,13 +2708,13 @@ function tryRevealPendingRoute(routes = []) {
 }
 
 function ensureSurveyPathVisible() {
-  const path = lockedSurveyPath
-    || (captureState.points.length >= 2 ? getPathCoordinates() : null);
-  if (!path || path.length < 2) return;
-  showPlannedRoute(path);
-  if (captureState.points.length >= 2) renderCaptureLine();
+  // Một đường duy nhất khi chạy: captureLine theo lockedSurveyPath.
+  if (captureState.points.length >= 2 || (lockedSurveyPath && lockedSurveyPath.length >= 2)) {
+    renderCaptureLine();
+  }
   if (captureLine) captureLine.bringToFront();
-  if (plannedRouteLine) plannedRouteLine.bringToFront();
+  // Không chồng plannedRouteLine (tránh 2 đường lệch nhau).
+  clearPlannedRoute();
 }
 
 function unlockSurveyPath() {
@@ -2868,11 +2864,15 @@ function renderCollector(collector, lastCollectorSend, session) {
   const tip = String(collector.boatCode || '').trim() || 'GPS';
   // Collector là nguồn live khi survey → bỏ twin SignalR cùng mã.
   removeSignalRBoatMarker(String(collector.boatCode || '').trim());
+  const rawLat = Number(collector.lat);
+  const rawLng = Number(collector.lng);
+  const snapped = projectOntoPath(lockedSurveyPath || getPathCoordinates(), { lat: rawLat, lng: rawLng })
+    || { lat: rawLat, lng: rawLng };
   if (!collectorMarker) {
-    collectorMarker = L.marker([collector.lat, collector.lng], { icon, zIndexOffset: 800 }).addTo(map);
+    collectorMarker = L.marker([snapped.lat, snapped.lng], { icon, zIndexOffset: 800 }).addTo(map);
     collectorMarker.bindTooltip(tip, { direction: 'top', offset: [0, -18], opacity: 1 });
   } else {
-    collectorMarker.setLatLng([collector.lat, collector.lng]);
+    collectorMarker.setLatLng([snapped.lat, snapped.lng]);
     collectorMarker.setIcon(icon);
     collectorMarker.setTooltipContent(tip);
   }
