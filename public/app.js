@@ -2138,7 +2138,9 @@ function haversineMeters(a, b) {
 }
 
 function estimateTravelMinutes(meters, speedKmh) {
-  const speed = clampNumber(Number(speedKmh) || 16, 0.1, 80);
+  const boat = findBoatByCode(collectorBoatCodeEl?.value);
+  const max = boat ? boatMaxSpeedKmh(boat) : 80;
+  const speed = clampNumber(Number(speedKmh) || 16, 0.1, max);
   const km = Number(meters) / 1000;
   if (!(km > 0) || !(speed > 0)) return 0;
   // phút = (km / vận_tốc_đăng_ký_kmh) × 60

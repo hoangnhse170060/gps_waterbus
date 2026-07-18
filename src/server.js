@@ -2186,11 +2186,33 @@ function formatTargetApiError(data, status) {
   return data.error || data.message || data.title || data.detail || `BE tra ${status}`;
 }
 
+/** Azure thường bắt standardTravelMin là int ≥ 1 (segment). */
+function azureTravelMinutes(value) {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.max(1, Math.round(n));
+}
+
 /** Giữ đúng phút lúc vẽ (vd 0.22) — không làm tròn lên 1. */
 function exactDurationMinutes(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
   return Number(n.toFixed(2));
+}
+
+/** Tốc độ chạy survey: body → session → không mặc định 16 nếu đã có tốc độ ghi. */
+function resolveSurveySpeedKmh(body = {}, session = null, boatCode = null) {
+  const maxSpeed = maxSpeedForBoatCode(boatCode || body.boatCode || session?.boatCode);
+  const raw = Number(
+    body.averageSpeedKmh
+    ?? body.speedKmh
+    ?? session?.averageSpeedKmh
+    ?? session?.speedKmh
+    ?? env.DEFAULT_SPEED_KMH
+    ?? 16,
+  );
+  return clampSpeedToBoatMax(raw, maxSpeed);
 }
 
 async function getFromTargetApi(pathname, deviceId, { silent = false } = {}) {
@@ -4049,12 +4071,8 @@ function resolveSurveyPathCoordinates(session, body, averageSpeedKmh) {
 
 async function saveRouteFromGpsOnTarget(session, body) {
   const boatCode = cleanOptionalText(body.boatCode || session.boatCode);
-  const maxSpeed = maxSpeedForBoatCode(boatCode);
-  const averageSpeedKmh = clampSpeedToBoatMax(
-    Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16),
-    maxSpeed,
-  );
-  // BE thường giới hạn tốc độ/phút nguyên — không gửi 200 km/h hay 0.1 phút.
+  const averageSpeedKmh = resolveSurveySpeedKmh(body, session, boatCode);
+  // BE thường giới hạn tốc độ — không gửi quá AZURE_MAX_SPEED_KMH.
   const azureMaxSpeed = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
   const azureSpeedKmh = Math.min(averageSpeedKmh, azureMaxSpeed);
   const coordinates = resolveSurveyPathCoordinates(session, body, averageSpeedKmh);
@@ -4137,7 +4155,8 @@ async function saveRouteFromGpsOnTarget(session, body) {
   }));
   if (stops.length) {
     const snapped = snapCoordinatesToStops(coordinates, stops, detectRadius);
-    stops = attachSegmentTravelMinutes(snapped, stops, azureSpeedKmh).map((stop) => ({
+    // Phút đoạn = km ÷ tốc độ user cài (không dùng DEFAULT 16).
+    const stopsExact = attachSegmentTravelMinutes(snapped, stops, averageSpeedKmh).map((stop) => ({
       stationId: stop.stationId,
       stationCode: stop.stationCode || null,
       stationName: stop.stationName || null,
@@ -4148,8 +4167,25 @@ async function saveRouteFromGpsOnTarget(session, body) {
       isDropoffAllowed: stop.isDropoffAllowed !== false,
       standardTravelMin: exactDurationMinutes(stop.standardTravelMin),
       segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
+      travelSource: stop.travelSource || 'gps',
     }));
-    payload.stops = stops;
+    // Gửi BE: mặc định giữ thập phân đúng panel; đặt AZURE_EXACT_TRAVEL_MIN=false nếu BE bắt int ≥ 1.
+    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'true');
+    const stopsForAzure = stopsExact.map((stop) => ({
+      stationId: stop.stationId,
+      stationCode: stop.stationCode,
+      stationName: stop.stationName,
+      stopOrder: stop.stopOrder,
+      lat: stop.lat,
+      lng: stop.lng,
+      isPickupAllowed: stop.isPickupAllowed,
+      isDropoffAllowed: stop.isDropoffAllowed,
+      standardTravelMin: preferExactTravel
+        ? stop.standardTravelMin
+        : azureTravelMinutes(stop.standardTravelMin),
+      segmentDistanceKm: stop.segmentDistanceKm,
+    }));
+    payload.stops = stopsForAzure;
     payload.coordinates = snapped.map((point, index) => ({
       lat: round(Number(point.lat), 7),
       lng: round(Number(point.lng), 7),
@@ -4157,23 +4193,26 @@ async function saveRouteFromGpsOnTarget(session, body) {
       sequence: index + 1,
       recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
     }));
-    // Thời gian chạy = đúng số panel lúc vẽ (vd 0.22) — không ép int ≥ 1.
+    // Ưu tiên đúng số panel lúc vẽ (FE/session) — không tính lại với tốc độ mặc định.
     const pathKm = routeLength(snapped) / 1000;
-    const pathMinutes = Number(body.estimatedDurationMin) > 0
-      ? Number(body.estimatedDurationMin)
-      : ((pathKm / azureSpeedKmh) * 60);
-    payload.estimatedDurationMin = exactDurationMinutes(pathMinutes);
-    console.log(
-      `[from-gps] ${payload.routeCode} azureSpeed=${azureSpeedKmh} duration=${payload.estimatedDurationMin} segments:`,
-      stops.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
+    const lockedMin = exactDurationMinutes(
+      body.estimatedDurationMin ?? session?.estimatedDurationMin,
     );
+    payload.estimatedDurationMin = lockedMin
+      ?? exactDurationMinutes((pathKm / averageSpeedKmh) * 60);
+    console.log(
+      `[from-gps] ${payload.routeCode} speed=${averageSpeedKmh} azureSpeed=${azureSpeedKmh} duration=${payload.estimatedDurationMin} pathKm=${round(pathKm, 3)} segments:`,
+      stopsExact.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
+    );
+    // UI giữ bản thập phân đúng (vd 0.22), không bản int ép cho BE.
+    stops = stopsExact;
   } else {
-    // Không có stops — vẫn lấy thời gian từ quãng đường ÷ tốc độ lúc vẽ.
     const pathKm = routeLength(coordinates) / 1000;
-    const pathMinutes = Number(body.estimatedDurationMin) > 0
-      ? Number(body.estimatedDurationMin)
-      : ((pathKm / azureSpeedKmh) * 60);
-    payload.estimatedDurationMin = exactDurationMinutes(pathMinutes);
+    const lockedMin = exactDurationMinutes(
+      body.estimatedDurationMin ?? session?.estimatedDurationMin,
+    );
+    payload.estimatedDurationMin = lockedMin
+      ?? exactDurationMinutes((pathKm / averageSpeedKmh) * 60);
   }
 
   const targetResult = await postToTargetApi(
@@ -4181,11 +4220,12 @@ async function saveRouteFromGpsOnTarget(session, body) {
     payload,
     session.deviceId || deviceIdForBoat({ boatCode: session.boatCode }),
   );
-  // Giữ stops đã gửi để UI/BE fallback nếu Azure không trả stops[].
+  // Giữ stops/phút đã tính (thập phân) để UI — kể cả khi BE 400 fallback.
   if (targetResult && typeof targetResult === 'object') {
     targetResult.outboundStops = stops;
     targetResult.outboundEstimatedDurationMin = payload.estimatedDurationMin ?? null;
     targetResult.outboundCreateReverse = Boolean(payload.createReverseRoute);
+    targetResult.outboundAverageSpeedKmh = averageSpeedKmh;
   }
   return targetResult;
 }
@@ -4282,8 +4322,27 @@ async function persistRecordingSession(body, sessionInput = null) {
     } else {
       warning = targetSave.error || `BE from-gps trả ${targetSave.status}`;
       console.warn(`[save-route] Azure failed (${targetSave.status}): ${warning}. Falling back to local DB.`);
-      route = await saveRecordedRoute(body);
+      route = await saveRecordedRoute({
+        ...body,
+        estimatedDurationMin: body.estimatedDurationMin
+          ?? targetSave.outboundEstimatedDurationMin
+          ?? session?.estimatedDurationMin,
+        averageSpeedKmh: body.averageSpeedKmh
+          ?? targetSave.outboundAverageSpeedKmh
+          ?? session?.averageSpeedKmh
+          ?? session?.speedKmh,
+      });
       await refreshFromDatabase();
+      // Luôn hiện đúng phút panel — không để DB int / DEFAULT 16 đè.
+      const lockedMin = exactDurationMinutes(
+        body.estimatedDurationMin
+        ?? targetSave.outboundEstimatedDurationMin
+        ?? session?.estimatedDurationMin,
+      );
+      if (lockedMin != null) route.estimatedDurationMin = lockedMin;
+      if (Array.isArray(targetSave.outboundStops) && targetSave.outboundStops.length) {
+        route.stops = targetSave.outboundStops;
+      }
       savedTo = 'local';
       state.lastRecordingSession = null;
       if (session.targetSessionStarted) {
@@ -4368,6 +4427,8 @@ async function finalizeCollectorRecording() {
     reverseRouteCode: stopped.reverseRouteCode || null,
     reverseRouteName: stopped.reverseRouteName || null,
     averageSpeedKmh: stopped.speedKmh || null,
+    estimatedDurationMin: stopped.estimatedDurationMin ?? null,
+    speedKmh: stopped.speedKmh || null,
     stoppedAt: new Date().toISOString(),
     targetSessionStarted: Boolean(stopped.targetSessionStarted),
   };
@@ -4400,6 +4461,7 @@ async function finalizeCollectorRecording() {
       description: 'Auto-saved after GPS recording completed',
       status: 'Active',
       averageSpeedKmh: stopped.speedKmh,
+      estimatedDurationMin: stopped.estimatedDurationMin ?? null,
       startStationId: stopped.startStationId || null,
       endStationId: stopped.endStationId || null,
       routeType: stopped.routeType || null,
@@ -4472,14 +4534,18 @@ async function saveRecordedRoute(body) {
         routeCode: state.collector.routeCode,
         routeName: state.collector.routeName,
         recordedPoints: state.collector.recordedPoints,
+        plannedCoordinates: state.collector.coordinates,
         startStationId: state.collector.startStationId,
         endStationId: state.collector.endStationId,
+        averageSpeedKmh: state.collector.speedKmh,
+        estimatedDurationMin: state.collector.estimatedDurationMin,
+        speedKmh: state.collector.speedKmh,
       }
     : state.lastRecordingSession;
   if (!session?.recordedPoints?.length && !(session?.plannedCoordinates?.length >= 2)) {
     throw userError('Chua co diem GPS nao de luu. Hay bat dau ghi truoc.');
   }
-  const speed = Number(body.averageSpeedKmh || session.averageSpeedKmh || session.speedKmh || env.DEFAULT_SPEED_KMH || 16);
+  const speed = resolveSurveySpeedKmh(body, session, body.boatCode || session.boatCode);
   const coordinates = resolveSurveyPathCoordinates(session, body, speed).map((point) => ({
     lat: point.lat,
     lng: point.lng,
@@ -4491,7 +4557,8 @@ async function saveRecordedRoute(body) {
     boatCode: body.boatCode || session.boatCode || null,
     description: body.description || 'Captured from GPS recording session',
     status: body.status || 'Active',
-    averageSpeedKmh: body.averageSpeedKmh,
+    averageSpeedKmh: speed,
+    estimatedDurationMin: body.estimatedDurationMin ?? session.estimatedDurationMin ?? null,
     startStationId: body.startStationId || session.startStationId || null,
     endStationId: body.endStationId || session.endStationId || null,
     routeType: body.routeType || session.routeType || null,
@@ -4507,11 +4574,7 @@ async function createCapturedRoute(body) {
   let points = validateRoutePoints(body.coordinates);
   const routeId = randomUUID();
   const boatCode = cleanOptionalText(body.boatCode);
-  const maxSpeed = maxSpeedForBoatCode(boatCode);
-  const averageSpeedKmh = clampSpeedToBoatMax(
-    Number(body.averageSpeedKmh || env.DEFAULT_SPEED_KMH || 16),
-    maxSpeed,
-  );
+  const averageSpeedKmh = resolveSurveySpeedKmh(body, null, boatCode);
   const startStationId = cleanOptionalText(body.startStationId);
   const endStationId = cleanOptionalText(body.endStationId);
   const routeType = resolveRouteType(body, null, startStationId, endStationId);
@@ -4533,7 +4596,7 @@ async function createCapturedRoute(body) {
   const baseDistanceKm = round(lengthMeters / 1000, 3);
   const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh);
   const estimatedDurationExact = exactDurationMinutes(
-    Number(body.estimatedDurationMin) > 0
+    body.estimatedDurationMin != null && Number(body.estimatedDurationMin) > 0
       ? Number(body.estimatedDurationMin)
       : ((baseDistanceKm / averageSpeedKmh) * 60),
   ) || 0;
@@ -5022,6 +5085,11 @@ function startCollector(body) {
     endStationId,
     Number(env.STOP_DETECT_RADIUS_M || 200),
   );
+  const estimatedDurationMin = exactDurationMinutes(
+    body.estimatedDurationMin != null && Number(body.estimatedDurationMin) > 0
+      ? Number(body.estimatedDurationMin)
+      : ((lengthMeters / 1000 / speedKmh) * 60),
+  );
   return {
     boatId: `collector-${routeCode}`,
     deviceId,
@@ -5041,6 +5109,7 @@ function startCollector(body) {
     gpsFixQuality: 'good',
     speedKmh,
     maxSpeedKmh,
+    estimatedDurationMin,
     heading: start.heading,
     lat: start.lat,
     lng: start.lng,
