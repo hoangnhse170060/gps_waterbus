@@ -199,8 +199,8 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
           const heading = (Number.isFinite(station.lat) && Number.isFinite(station.lng))
             ? bearingDegreesLocal({ lat: rescueLat, lng: rescueLng }, station)
             : Number(mission.lastHeading || 0);
-          const gap = 35;
-          const behind = pointBehindLocal({ lat: rescueLat, lng: rescueLng }, heading, gap);
+        const gap = 15;
+        const behind = pointBehindLocal({ lat: rescueLat, lng: rescueLng }, heading, gap);
           lat = behind.lat;
           lng = behind.lng;
         }
@@ -1116,11 +1116,11 @@ function fallbackLatLngForBoat(code, index, data = latest) {
     const s = stations[index % stations.length];
     return { lat: Number(s.lat), lng: Number(s.lng) };
   }
-  return { lat: 10.776 + index * 0.0015, lng: 106.708 };
+  return { lat: 10.776, lng: 106.708 };
 }
 
 function resolveUniqueSeed(code, lat, lng, occupied) {
-  // Cho phép nhiều tàu sát/chồng cùng bến — không đẩy sang chỗ khác.
+  // Cho phép đè/chồng trong phạm vi bến chuẩn — không đẩy tàu khác ra ngoài.
   occupied.push({ lat, lng, code });
   return { lat, lng };
 }

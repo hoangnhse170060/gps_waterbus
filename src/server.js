@@ -2204,7 +2204,7 @@ function pickReplacementBoatCode(src = {}) {
 
 /**
  * Đảm bảo tàu cứu (vd SOS_001) có trong catalog + hub để Live hiện và POST tracking được.
- * Nếu chưa có GPS: seed gần hiện trường (lệch ~350m) hoặc bến đầu catalog.
+ * Nếu chưa có GPS: seed đúng tọa độ hiện trường/bến — được đè/chồng trong phạm vi chuẩn, không đẩy ~350m ra ngoài.
  */
 function ensureRescueBoatOnMap(boatCode, nearLat = null, nearLng = null) {
   const code = String(boatCode || '').trim();
@@ -2218,10 +2218,8 @@ function ensureRescueBoatOnMap(boatCode, nearLat = null, nearLng = null) {
     ));
     lat = Number(station?.lat) || 10.776;
     lng = Number(station?.lng) || 106.705;
-  } else {
-    // Lệch nhẹ khỏi hiện trường — tránh đè lên tàu sự cố lúc xuất phát.
-    lat += 0.0032;
   }
+  // Không lệch seed — nhiều tàu cùng bến được chồng trong phạm vi chuẩn.
   if (!boat) {
     const id = randomUUID();
     boat = {
@@ -2630,7 +2628,7 @@ function startRescueAutomation(incident) {
       { lat: startLat, lng: startLng },
       { lat: missionTargetLat, lng: missionTargetLng },
     ) || 0;
-    const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
+    const towRopeMeters = Math.max(12, Number(env.TOW_ROPE_METERS || 18));
     const behind = pointBehind({ lat: startLat, lng: startLng }, towHeading, towRopeMeters);
     mission.incidentCurrentLat = behind.lat;
     mission.incidentCurrentLng = behind.lng;
@@ -2768,8 +2766,8 @@ async function tickRescueMissions() {
       if (mission.incidentBoatCode) {
         if (mission.status === 'Towing') {
           // Khi kéo: tàu lỗi đi sau tàu cứu. Cập bến vẫn giữ nối đuôi, không đè cùng 1 điểm rồi cluster nhảy.
-          const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
-          const berthGapMeters = Math.max(12, Number(env.TOW_BERTH_GAP_METERS || 16));
+          const towRopeMeters = Math.max(12, Number(env.TOW_ROPE_METERS || 18));
+          const berthGapMeters = Math.max(8, Number(env.TOW_BERTH_GAP_METERS || 12));
           const towHeading = heading || Number(mission.lastHeading || 0);
           const towedPosition = arrived
             ? pointBehind({ lat, lng }, towHeading || bearingDegrees(current, target) || 0, berthGapMeters)
@@ -2910,7 +2908,7 @@ async function tickRescueMissions() {
             { lat: mission.currentLat, lng: mission.currentLng },
             { lat: nearest.lat, lng: nearest.lng },
           ) || heading;
-          const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
+          const towRopeMeters = Math.max(12, Number(env.TOW_ROPE_METERS || 18));
           const behind = pointBehind(
             { lat: mission.currentLat, lng: mission.currentLng },
             towHeading,
