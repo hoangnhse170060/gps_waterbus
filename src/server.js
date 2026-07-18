@@ -278,27 +278,7 @@ let boatsLatestPollBusy = false;
 let boatsLatestLastOkAt = null;
 let boatsLatestLastError = null;
 
-await refreshFromDatabase();
-setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 15000));
-// Status tàu từ Neon ~2s — cập nhật DB là Live GPS nhận gần như ngay.
-setInterval(() => {
-  refreshBoatStatusesFromDatabase().catch((error) => {
-    console.warn(`[boat-status] ${error.message}`);
-  });
-}, Math.max(1000, Number(env.BOAT_STATUS_POLL_MS || 2000)));
-setInterval(tickSimulator, 1000);
-setInterval(publishGpsPositions, Number(env.SEND_INTERVAL_MS || 2000));
-setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
-setInterval(pruneStaleHubBoats, 5000);
-setInterval(() => {
-  tickRescueMissions().catch((error) => {
-    console.warn(`[rescue-gps] ${error.message}`);
-  });
-}, Math.max(1000, Number(env.RESCUE_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
-// BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
-setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
-
-// Trip theo lịch BE (function decls bên dưới đã hoist — an toàn gọi create tại đây).
+// Trip autorun trước refresh/broadcast — snapshot dùng tripMissionsPublic().
 const tripAutorun = createTripAutorun({
   state,
   env,
@@ -319,6 +299,27 @@ const tripAutorun = createTripAutorun({
   effectiveBoatStatus,
   formatRecordedAt,
 });
+
+await refreshFromDatabase();
+setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 15000));
+// Status tàu từ Neon ~2s — cập nhật DB là Live GPS nhận gần như ngay.
+setInterval(() => {
+  refreshBoatStatusesFromDatabase().catch((error) => {
+    console.warn(`[boat-status] ${error.message}`);
+  });
+}, Math.max(1000, Number(env.BOAT_STATUS_POLL_MS || 2000)));
+setInterval(tickSimulator, 1000);
+setInterval(publishGpsPositions, Number(env.SEND_INTERVAL_MS || 2000));
+setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
+setInterval(pruneStaleHubBoats, 5000);
+setInterval(() => {
+  tickRescueMissions().catch((error) => {
+    console.warn(`[rescue-gps] ${error.message}`);
+  });
+}, Math.max(1000, Number(env.RESCUE_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
+// BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
+setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
+
 setInterval(() => {
   tripAutorun.pollDueTrips().catch((error) => {
     console.warn(`[trip-gps] poll: ${error.message}`);
