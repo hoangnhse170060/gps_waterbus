@@ -69,7 +69,7 @@ export function corridorFromStations(stations = []) {
  * Ưu tiên: OSM Saigon Waterbus (vạch sông) → Neon gần corridor → nối bến.
  */
 export function resolveRiverBasePath({ stations = [], routes = [], osmCorridor = [] } = {}) {
-  const osm = (osmCorridor || []).map(toPoint).filter(Boolean);
+  const osm = smoothCorridorSpikes((osmCorridor || []).map(toPoint).filter(Boolean));
   if (osm.length >= 2) return osm;
 
   const corridor = corridorFromStations(stations);
@@ -92,9 +92,38 @@ export function resolveRiverBasePath({ stations = [], routes = [], osmCorridor =
       best = coords;
     }
   }
-  if (best && bestScore >= 1e6) return best;
+  if (best && bestScore >= 1e6) return smoothCorridorSpikes(best);
   if (corridor.length >= 2) return corridor;
-  return best || [];
+  return best ? smoothCorridorSpikes(best) : [];
+}
+
+/** Bỏ đỉnh đâm vào cầu tàu (góc V / quay đầu) trên corridor. */
+export function smoothCorridorSpikes(path, { minTurnDeg = 70, minDetourM = 12 } = {}) {
+  let pts = (path || []).map(toPoint).filter(Boolean);
+  if (pts.length < 3) return pts;
+  for (let pass = 0; pass < 12; pass += 1) {
+    const keep = pts.map(() => true);
+    let removed = 0;
+    for (let i = 1; i < pts.length - 1; i += 1) {
+      const turn = turnDegrees(pts[i - 1], pts[i], pts[i + 1]);
+      const via = distanceMeters(pts[i - 1], pts[i]) + distanceMeters(pts[i], pts[i + 1]);
+      const chord = Math.max(1, distanceMeters(pts[i - 1], pts[i + 1]));
+      if (turn >= minTurnDeg && via > chord * 1.12 && via - chord >= minDetourM) {
+        keep[i] = false;
+        removed += 1;
+      }
+    }
+    if (!removed) break;
+    pts = pts.filter((_, i) => keep[i]);
+  }
+  return pts;
+}
+
+function turnDegrees(a, b, c) {
+  const b1 = bearingDegrees(a, b);
+  const b2 = bearingDegrees(b, c);
+  const d = Math.abs(b1 - b2) % 360;
+  return Math.min(d, 360 - d);
 }
 
 /** Chiếu điểm lên polyline → vị trí gần nhất + alongMeters. */
@@ -192,8 +221,9 @@ export function slicePathByAlong(path, alongA, alongB, stepMeters = 45) {
 /**
  * Đường đi bo sông từ `from` → `to`:
  * vào corridor (nếu lệch) → chạy dọc hành lang → ra tới đích.
+ * `corridorOnly`: không đâm nhánh V vào cầu tàu — chỉ chạy trên vạch sông.
  */
-export function buildRiverPath(from, to, basePath, { joinMeters = 80 } = {}) {
+export function buildRiverPath(from, to, basePath, { joinMeters = 80, corridorOnly = false } = {}) {
   const start = toPoint(from);
   const end = toPoint(to);
   if (!start || !end) return { coordinates: [], lengthMeters: 0 };
@@ -212,8 +242,8 @@ export function buildRiverPath(from, to, basePath, { joinMeters = 80 } = {}) {
   }
 
   const coordinates = [];
-  // Vào sông nếu đang lệch corridor.
-  if (projStart.distMeters > joinMeters) {
+  // Vào sông nếu đang lệch corridor (cứu hộ từ đất). Trip: corridorOnly → không stub.
+  if (!corridorOnly && projStart.distMeters > joinMeters) {
     coordinates.push(start);
     coordinates.push(...densifySegment(start, projStart, 40));
   }
@@ -225,12 +255,11 @@ export function buildRiverPath(from, to, basePath, { joinMeters = 80 } = {}) {
     if (!last || distanceMeters(last, p) > 8) coordinates.push(p);
   }
 
-  if (projEnd.distMeters > joinMeters) {
+  // Ra bến chỉ khi thật sự lệch và không bật corridorOnly.
+  // (Trước đây luôn push `end` → tạo góc V đâm vào cầu tàu.)
+  if (!corridorOnly && projEnd.distMeters > joinMeters) {
     coordinates.push(...densifySegment(projEnd, end, 40));
     coordinates.push(end);
-  } else {
-    const last = coordinates[coordinates.length - 1];
-    if (!last || distanceMeters(last, end) > 5) coordinates.push(end);
   }
 
   // Gỡ điểm trùng.
@@ -239,7 +268,9 @@ export function buildRiverPath(from, to, basePath, { joinMeters = 80 } = {}) {
     const last = cleaned[cleaned.length - 1];
     if (!last || distanceMeters(last, p) > 3) cleaned.push(p);
   }
-  if (cleaned.length < 2) cleaned.push(end);
+  if (cleaned.length < 2) {
+    cleaned.push({ lat: projEnd.lat, lng: projEnd.lng });
+  }
 
   return {
     coordinates: cleaned,

@@ -7,7 +7,9 @@ import { distanceMeters, routeLength } from './geo-distance.js';
 import {
   advanceAlongCoordinates,
   buildRiverPath,
+  projectOnPath,
   resolveRiverBasePath,
+  slicePathByAlong,
 } from './river-corridor.js';
 
 const ACTIVE_TRIP_STATUSES = new Set([
@@ -245,7 +247,7 @@ export function createTripAutorun(ctx) {
     return fromPayload;
   }
 
-  /** Ép tuyến trip lên hành lang sông (vạch Waterbus) — nối từng cặp bến. */
+  /** Ép tuyến trip lên vạch sông — không đâm nhánh V vào từng cầu tàu. */
   function snapTripPathToRiver(coordinates, stops = []) {
     const base = resolveRiverBasePath({
       stations: state.stations || [],
@@ -267,10 +269,18 @@ export function createTripAutorun(ctx) {
 
     if (anchors.length < 2) return coordinates;
 
+    const projs = anchors.map((a) => projectOnPath(base, a)).filter(Boolean);
+    if (projs.length < 2) return coordinates;
+
     const out = [];
-    for (let i = 0; i < anchors.length - 1; i += 1) {
-      const built = buildRiverPath(anchors[i], anchors[i + 1], base, { joinMeters: 90 });
-      for (const p of built.coordinates || []) {
+    for (let i = 0; i < projs.length - 1; i += 1) {
+      const slice = slicePathByAlong(
+        base,
+        projs[i].alongMeters,
+        projs[i + 1].alongMeters,
+        40,
+      );
+      for (const p of slice) {
         const last = out[out.length - 1];
         if (!last || distanceMetersFn(last, p) > 5) out.push({ lat: p.lat, lng: p.lng });
       }
@@ -279,6 +289,30 @@ export function createTripAutorun(ctx) {
     const snappedLen = routeLengthFn(out);
     if (!(snappedLen > 50) || snappedLen > 80_000) return coordinates;
     return out;
+  }
+
+  /** Trip đang chạy với path cũ (có V vào bến) → ép lại lên corridor một lần. */
+  function ensureMissionCorridorPath(mission) {
+    if (!mission || mission.corridorSnapped) return;
+    const snapped = snapTripPathToRiver(mission.coordinates || [], mission.stops || []);
+    if (snapped.length < 2) {
+      mission.corridorSnapped = true;
+      return;
+    }
+    const prevProgress = Number(mission.progressMeters) || 0;
+    const prevLen = Number(mission.lengthMeters) || routeLengthFn(mission.coordinates || []);
+    const ratio = prevLen > 10 ? Math.min(1, prevProgress / prevLen) : 0;
+    mission.coordinates = snapped;
+    mission.lengthMeters = routeLengthFn(snapped);
+    mission.progressMeters = Math.min(mission.lengthMeters, ratio * mission.lengthMeters);
+    const point = pointAtDistance(snapped, mission.progressMeters);
+    mission.currentLat = point.lat;
+    mission.currentLng = point.lng;
+    mission.lastHeading = point.heading || mission.lastHeading || 0;
+    mission.corridorSnapped = true;
+    console.log(
+      `[trip-gps] ${mission.boatCode} path bo sông (no pier-V): ${snapped.length} pts · ${Math.round(mission.lengthMeters)}m`,
+    );
   }
 
   function resolveLengthMeters(row, coordinates) {
@@ -784,11 +818,16 @@ export function createTripAutorun(ctx) {
 
   function nearStop(mission, stop, radius = STOP_ARRIVED_M) {
     if (!stop || !Number.isFinite(Number(stop.lat)) || !Number.isFinite(Number(stop.lng))) return false;
-    const d = distanceMetersFn(
-      { lat: mission.currentLat, lng: mission.currentLng },
-      { lat: Number(stop.lat), lng: Number(stop.lng) },
-    );
-    return d <= radius;
+    const boat = { lat: mission.currentLat, lng: mission.currentLng };
+    const stopPt = { lat: Number(stop.lat), lng: Number(stop.lng) };
+    if (distanceMetersFn(boat, stopPt) <= radius) return true;
+    // Path chỉ chạy giữa sông — coi tới điểm chiếu bến trên path là đã cập.
+    const coords = mission.coordinates || [];
+    if (coords.length >= 2) {
+      const proj = projectOnPath(coords, stopPt);
+      if (proj && distanceMetersFn(boat, { lat: proj.lat, lng: proj.lng }) <= radius) return true;
+    }
+    return false;
   }
 
   /** Khoảng cách dọc path từ progress hiện tại tới điểm gần stop nhất. */
@@ -966,6 +1005,9 @@ export function createTripAutorun(ctx) {
 
   async function tickOneMission(mission, nowMs) {
     if (!mission || mission.status === 'Completed') return;
+
+    // Path cũ đâm V vào cầu tàu → ép lại đúng vạch sông.
+    ensureMissionCorridorPath(mission);
 
     // Mission geometry/ETA lỗi từ BE (vd 11832 km / -95000p) → huỷ để poll lại.
     if (Number(mission.lengthMeters) > 80_000) {
