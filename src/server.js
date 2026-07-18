@@ -9,6 +9,11 @@ import { scheduleTravelMinutes, waterbusSchedulePublic } from './waterbus-schedu
 import { createSignalRRelay } from './signalr-relay.js';
 import { distanceMeters, routeLength } from './geo-distance.js';
 import { createTripAutorun } from './trip-autorun.js';
+import {
+  advanceAlongCoordinates,
+  buildRiverPath,
+  resolveRiverBasePath,
+} from './river-corridor.js';
 
 const { Pool } = pg;
 
@@ -28,6 +33,7 @@ let sequenceSaveTimer = null;
 const lastPositions = await loadLastPositions();
 let lastPositionsSaveTimer = null;
 const dbPool = createDbPool(env);
+const osmWaterbusCorridor = await loadOsmWaterbusCorridor();
 
 const clients = new Set();
 const state = {
@@ -35,6 +41,7 @@ const state = {
   routes: new Map(),
   stations: [],
   routeStops: [],
+  osmWaterbusCorridor,
   senderEnabled: parseBool(env.SEND_TO_TARGET),
   targetEndpoint: String(env.TARGET_GPS_ENDPOINT || '').trim(),
   targetApiKey: String(env.TARGET_GPS_API_KEY || '').trim(),
@@ -358,6 +365,21 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === '/events') return handleEvents(req, res);
     if (url.pathname === '/api/snapshot') return sendJson(res, snapshot());
+    if (url.pathname === '/api/river-path' && req.method === 'POST') {
+      const body = await readJson(req);
+      const from = sanitizeRequestPoint(body?.from || body?.start);
+      const to = sanitizeRequestPoint(body?.to || body?.end);
+      if (!from || !to) {
+        return sendJson(res, { error: 'Cần from/to với lat,lng hợp lệ' }, 400);
+      }
+      const basePath = getRescueRiverBasePath();
+      const built = buildRiverPath(from, to, basePath, { joinMeters: 90 });
+      return sendJson(res, {
+        coordinates: built.coordinates,
+        lengthMeters: built.lengthMeters,
+        corridorPoints: basePath.length,
+      });
+    }
     if (url.pathname === '/api/config') return sendJson(res, publicConfig());
     if (url.pathname === '/api/refresh' && req.method === 'POST') {
       await refreshFromDatabase();
@@ -2489,8 +2511,87 @@ function upsertIncidentRecord(incident, { removeIfResolved = true } = {}) {
 
 function rescueMissionPublic(mission) {
   if (!mission) return null;
-  const { publishing, ...publicMission } = mission;
-  return publicMission;
+  const { publishing, pathCoordinates, ...publicMission } = mission;
+  const path = Array.isArray(pathCoordinates) ? pathCoordinates : [];
+  return {
+    ...publicMission,
+    pathCoordinates: path.map((p) => ({
+      lat: round(Number(p.lat), 6),
+      lng: round(Number(p.lng), 6),
+    })),
+    pathLengthMeters: Number.isFinite(Number(mission.pathLengthMeters))
+      ? round(Number(mission.pathLengthMeters), 0)
+      : null,
+    pathProgressMeters: Number.isFinite(Number(mission.pathProgressMeters))
+      ? round(Number(mission.pathProgressMeters), 0)
+      : null,
+  };
+}
+
+function getRescueRiverBasePath() {
+  return resolveRiverBasePath({
+    stations: state.stations || [],
+    routes: [...state.routes.values()],
+    osmCorridor: state.osmWaterbusCorridor || osmWaterbusCorridor || [],
+  });
+}
+
+async function loadOsmWaterbusCorridor() {
+  try {
+    const filePath = path.join(rootDir, 'data', 'saigon-waterbus-corridor.json');
+    const raw = JSON.parse(await readFile(filePath, 'utf8'));
+    const coords = (raw.coordinates || [])
+      .map((p) => {
+        const lat = Number(p?.lat);
+        const lng = Number(p?.lng ?? p?.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+        return { lat, lng };
+      })
+      .filter(Boolean);
+    if (coords.length >= 2) {
+      console.log(`[river] OSM Saigon Waterbus corridor loaded: ${coords.length} pts`);
+    }
+    return coords;
+  } catch (error) {
+    console.warn(`[river] OSM corridor missing: ${error.message}`);
+    return [];
+  }
+}
+
+function sanitizeRequestPoint(value) {
+  const lat = Number(value?.lat ?? value?.latitude);
+  const lng = Number(value?.lng ?? value?.lon ?? value?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { lat, lng };
+}
+
+/** A→B (không vòng): ép path lên hành lang sông Waterbus. */
+function snapCoordinatesToRiver(coordinates, { force = false } = {}) {
+  const pts = Array.isArray(coordinates)
+    ? coordinates
+      .map((p) => sanitizeRequestPoint(p))
+      .filter(Boolean)
+    : [];
+  if (pts.length < 2) return pts;
+  const start = pts[0];
+  const end = pts[pts.length - 1];
+  // Vòng sightseeing (đầu ≈ cuối) giữ nguyên đường vẽ.
+  if (!force && distanceMeters(start, end) < 80) return pts;
+  const built = buildRiverPath(start, end, getRescueRiverBasePath(), { joinMeters: 90 });
+  if (built.coordinates.length >= 2) return built.coordinates;
+  return pts;
+}
+
+/** Gán đường bo sông từ from → to (cứu hộ InTransit / Towing). */
+function assignRescueRiverPath(mission, from, to) {
+  if (!mission) return null;
+  const built = buildRiverPath(from, to, getRescueRiverBasePath(), { joinMeters: 90 });
+  mission.pathCoordinates = built.coordinates;
+  mission.pathLengthMeters = built.lengthMeters;
+  mission.pathProgressMeters = 0;
+  mission.pathUpdatedAt = new Date().toISOString();
+  return built;
 }
 
 function completeRescueMission(incidentId, reason = 'IncidentResolved') {
@@ -2874,7 +2975,15 @@ function startRescueAutomation(incident) {
     lastSequence: null,
     lastPublishMode: null,
     lastError: null,
+    pathCoordinates: [],
+    pathLengthMeters: 0,
+    pathProgressMeters: 0,
   };
+  assignRescueRiverPath(
+    mission,
+    { lat: startLat, lng: startLng },
+    { lat: missionTargetLat, lng: missionTargetLng },
+  );
   if (destinationMeta) {
     mission.destinationStationId = destinationMeta.station?.stationId || null;
     mission.destinationStationCode = destinationMeta.station?.stationCode || null;
@@ -2996,18 +3105,36 @@ async function tickRescueMissions() {
     try {
       const current = { lat: Number(mission.currentLat), lng: Number(mission.currentLng) };
       const target = { lat: Number(mission.targetLat), lng: Number(mission.targetLng) };
-      const remaining = distanceMeters(current, target);
+      if (!Number.isFinite(current.lat) || !Number.isFinite(target.lat)) return;
+
+      // Đường bo sông: tạo mới hoặc làm lại khi đích lệch cuối path.
+      const path = Array.isArray(mission.pathCoordinates) ? mission.pathCoordinates : [];
+      const pathEnd = path.length ? path[path.length - 1] : null;
+      const endDrift = pathEnd
+        ? distanceMeters(pathEnd, target)
+        : Infinity;
+      if (path.length < 2 || endDrift > 45) {
+        assignRescueRiverPath(mission, current, target);
+      }
+
       const elapsedSeconds = Math.max(
         1,
         Math.min(10, (nowMs - Number(mission.lastTickAt || nowMs - 2000)) / 1000),
       );
       const stepMeters = Math.max(2, (Number(mission.speedKmh) * 1000 / 3600) * elapsedSeconds);
-      // Không teleport: mỗi tick chỉ đi tối đa stepMeters, kể cả nhịp cập bến.
-      const ratio = remaining <= 0 ? 1 : Math.min(1, stepMeters / remaining);
-      const lat = current.lat + ((target.lat - current.lat) * ratio);
-      const lng = current.lng + ((target.lng - current.lng) * ratio);
-      const heading = remaining > 0 ? bearingDegrees(current, target) : Number(mission.lastHeading || 0);
-      const arrived = distanceMeters({ lat, lng }, target) <= arrivalMeters;
+      const adv = advanceAlongCoordinates(
+        mission.pathCoordinates,
+        mission.pathProgressMeters || 0,
+        stepMeters,
+      );
+      mission.pathProgressMeters = adv.progressMeters;
+      const lat = adv.lat;
+      const lng = adv.lng;
+      const heading = adv.heading || Number(mission.lastHeading || 0);
+      const remaining = Number.isFinite(adv.remainingMeters)
+        ? adv.remainingMeters
+        : distanceMeters({ lat, lng }, target);
+      const arrived = remaining <= arrivalMeters || adv.arrived;
 
       const rescueResult = await publishLiveGpsPosition({
         boatCode: mission.rescueBoatCode,
@@ -3114,6 +3241,8 @@ async function tickRescueMissions() {
               mission.targetLng = live.lng;
               mission.incidentLat = live.lat;
               mission.incidentLng = live.lng;
+              // Đích đổi → làm lại path bo sông từ vị trí hiện tại.
+              assignRescueRiverPath(mission, { lat, lng }, { lat: live.lat, lng: live.lng });
             }
           }
         }
@@ -3196,6 +3325,11 @@ async function tickRescueMissions() {
           mission.destinationStationName = towDest.station.stationName || null;
           mission.destinationDistanceMeters = Math.round(towDest.meters);
           mission.towingStartedAt = mission.updatedAt;
+          assignRescueRiverPath(
+            mission,
+            { lat, lng },
+            { lat: towDest.lat, lng: towDest.lng },
+          );
           // Ngay khi bắt đầu kéo: đặt tàu lỗi nối đuôi tàu cứu (không chờ tick sau).
           const towHeading = bearingDegrees(
             { lat: mission.currentLat, lng: mission.currentLng },
@@ -4806,7 +4940,15 @@ function enrichStopsAlongPath(coordinates, rawStops, startStationId = '', endSta
 function startCollector(body) {
   const routeCode = cleanRouteText(body.routeCode, 'Route code');
   const routeName = cleanRouteText(body.routeName || body.routeCode, 'Route name');
-  const coordinates = validateRoutePoints(body.coordinates);
+  const keepDrawnPath = body.keepDrawnPath === true || body.followRiver === false;
+  let coordinates = validateRoutePoints(body.coordinates);
+  if (!keepDrawnPath) {
+    const snapped = snapCoordinatesToRiver(coordinates);
+    if (snapped.length >= 2) {
+      coordinates = snapped;
+      console.log(`[collector] path bo sông: ${coordinates.length} pts · ${Math.round(routeLength(coordinates))}m`);
+    }
+  }
   const lengthMeters = routeLength(coordinates);
   const start = pointAtDistance(coordinates, 0);
   const boatCode = cleanOptionalText(body.boatCode) || `SURVEY-${routeCode}`;
@@ -5285,6 +5427,10 @@ function snapshot() {
       coordinates: route.coordinates,
     })),
     stations: state.stations,
+    riverCorridor: getRescueRiverBasePath().map((p) => ({
+      lat: round(p.lat, 7),
+      lng: round(p.lng, 7),
+    })),
     collector: state.collector ? {
       ...state.collector,
       lat: round(state.collector.lat, 7),
