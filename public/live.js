@@ -1833,9 +1833,7 @@ function bindDragHandlers(marker, code) {
 
 async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
   if (!quiet && sending) return;
-  // Đang cứu hộ / trip tự động: server publish GPS — FE không đè / không spam 409.
-  if (quiet && isBoatInActiveAutomatedRescue(boatCode)) return false;
-  if (quiet && activeTripForBoat(boatCode)) return false;
+  // Kéo/gửi tay: không đè trip/rescue. Heartbeat (quiet) vẫn gửi liên tục.
   if (!quiet && (activeTripForBoat(boatCode) || isBoatInActiveAutomatedRescue(boatCode))) {
     toast(dragLockReason(boatCode) || 'GPS đang tự chạy — không gửi tay', 'warn');
     return false;
@@ -1851,12 +1849,16 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
   const cruise = getBoatSpeedKmh(boatCode);
   const userDriven = !quiet;
   const rescueMission = missionForRescue(boatCode);
-  const moving = userDriven
+  const trip = activeTripForBoat(boatCode);
+  const moving = (userDriven || Boolean(trip) || Boolean(rescueMission))
     && !st.incident
     && (phase === 'enroute' || phase === 'departing' || phase === 'approaching'
-      || rescueMission?.phase === 'to_incident' || rescueMission?.phase === 'returning');
+      || rescueMission?.phase === 'to_incident' || rescueMission?.phase === 'returning'
+      || (trip && ['Pending', 'ToDeparture', 'Boarding', 'Running', 'WaitingAtStop'].includes(String(trip.status || ''))));
   const status = st.incident ? 'idle' : (moving ? 'moving' : 'idle');
-  const speedKmh = moving ? cruise : 0;
+  const speedKmh = moving
+    ? (Number(trip?.speedKmh) > 0 ? Number(trip.speedKmh) : cruise)
+    : 0;
   const sendToTarget = sendAzureSelectEl.value === 'on';
   try {
     const response = await fetch('/api/live/gps', {
@@ -1878,6 +1880,8 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
         const msg = body.error || `HTTP ${response.status}`;
         sendStatusEl.textContent = `Lỗi ${response.status}`;
         toast(msg, 'err');
+      } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
+        sendStatusEl.textContent = `Heartbeat lỗi · ${body.status || response.status}`;
       }
       return false;
     }
@@ -1889,14 +1893,17 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
       if (body.warning) toast(body.warning, 'warn');
       else toast(`Đã gửi GPS ${boatDisplayName(boatCode)}`, 'ok');
       if (latest) renderHubBoats(latest.hubBoats);
-    } else {
-      sendStatusEl.textContent = `Heartbeat · ${boatDisplayName(boatCode)} · ${body.status || 200}`;
+    } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
+      const mode = body.mode === 'local' ? 'local' : `Azure ${body.status || 200}`;
+      sendStatusEl.textContent = `Heartbeat · seq ${body.sequence || '—'} · ${mode}`;
     }
     return true;
   } catch (error) {
     if (!quiet) {
       sendStatusEl.textContent = 'Lỗi mạng';
       toast(error.message, 'err');
+    } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
+      sendStatusEl.textContent = 'Heartbeat lỗi mạng';
     }
     return false;
   } finally {
@@ -1905,21 +1912,27 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
 }
 
 async function heartbeatAllBoats() {
-  // Không POST heartbeat khi Gửi Azure bật: trip/rescue/SSE đã đẩy GPS.
-  // Heartbeat đụng sequence Azure → browser spam 409.
+  // Gửi GPS liên tục mọi tàu (kể cả đang trip / sắp cập bến) — không để "Chưa gửi".
   if (heartbeatBusy || dragging || sending) return;
-  if (sendAzureSelectEl?.value === 'on') return;
   heartbeatBusy = true;
   try {
     const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
-      if (activeTripForBoat(code)) continue;
-      if (isBoatInActiveAutomatedRescue(code)) continue;
       const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
       ensureSeedPin(code, pin.lat, pin.lng);
       const fixed = pinnedFor(code) || pin;
-      await sendLiveGps(code, fixed.lat, fixed.lng, { quiet: true });
+      // Ưu tiên vị trí trip/hub nếu đang chạy lịch.
+      const hub = (latest?.hubBoats || []).find((b) => String(b.boatCode || '').trim() === code);
+      const lat = Number(hub?.lat);
+      const lng = Number(hub?.lng);
+      const useHub = Number.isFinite(lat) && Number.isFinite(lng);
+      await sendLiveGps(
+        code,
+        useHub ? lat : fixed.lat,
+        useHub ? lng : fixed.lng,
+        { quiet: true },
+      );
       await new Promise((r) => setTimeout(r, 120));
     }
     if (latest) renderHubBoats(latest.hubBoats);

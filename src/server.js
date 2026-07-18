@@ -540,12 +540,15 @@ const server = createServer(async (req, res) => {
           state.collector.targetSessionStarted = true;
           state.collector.targetSessionWarning = null;
         } else {
-          // Device chưa đăng ký / session fail → ghi local, vẫn tự lưu DB khi xong.
+          // Session fail → vẫn gửi GPS locations liên tục (không tắt sendToTarget).
           state.collector.targetSessionStarted = false;
-          state.collector.sendToTarget = false;
-          state.collector.targetSessionWarning = `${sessionResult.error || 'Khong bat dau session tren BE'}. Dang ghi local — se tu luu DB khi tau den dich.`;
+          state.collector.targetSessionWarning = `${sessionResult.error || 'Khong bat dau session tren BE'}. Van gui GPS lien tuc; from-gps co the luu local.`;
         }
       }
+      // Gửi ngay điểm GPS đầu — không để UI kẹt "chưa gửi / đang chờ tín hiệu".
+      publishCollectorPosition().catch((err) => {
+        console.warn(`[collector] first GPS publish: ${err.message}`);
+      });
       broadcast();
       return sendJson(res, state.collector, 201);
     }
@@ -577,10 +580,12 @@ const server = createServer(async (req, res) => {
           endStationId: stopped.endStationId || null,
           routeType: stopped.routeType || null,
           stops: Array.isArray(stopped.stops) ? stopped.stops : null,
-          createReverseRoute: Boolean(stopped.createReverseRoute),
-          reverseRouteCode: stopped.reverseRouteCode || null,
-          reverseRouteName: stopped.reverseRouteName || null,
-          averageSpeedKmh: stopped.speedKmh || null,
+          createReverseRoute: false,
+          reverseRouteCode: null,
+          reverseRouteName: null,
+          averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
+          cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
+          estimatedDurationMin: stopped.estimatedDurationMin ?? null,
           stoppedAt: new Date().toISOString(),
           targetSessionStarted: Boolean(stopped.targetSessionStarted),
         };
@@ -4117,36 +4122,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
 
   // Contract mới: GPS không gửi routeType/isBookable — BE tự phân loại
   // (start≠end → route nguồn; start=end → sightseeing loop).
-  const inferredLoop = Boolean(startStationId && endStationId && startStationId === endStationId);
-
-  const wantReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
-    && !inferredLoop;
-  if (wantReverse) {
-    let reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
-    let reverseName = cleanOptionalText(body.reverseRouteName || session?.reverseRouteName);
-    // BE bắt buộc reverseRouteCode khác routeCode — tự sửa nếu thiếu/trùng.
-    if (!reverseCode || reverseCode.toLowerCase() === String(payload.routeCode).toLowerCase()) {
-      const parts = String(payload.routeCode || '').split('-').map((s) => s.trim()).filter(Boolean);
-      reverseCode = parts.length >= 2
-        ? parts.reverse().join('-')
-        : `${payload.routeCode}-VE`;
-      if (reverseCode.toLowerCase() === String(payload.routeCode).toLowerCase()) {
-        reverseCode = `${payload.routeCode}-VE`;
-      }
-    }
-    if (!reverseName) {
-      const nameParts = String(payload.routeName || '').split(/\s+-\s+/).map((s) => s.trim()).filter(Boolean);
-      reverseName = nameParts.length >= 2
-        ? nameParts.reverse().join(' - ')
-        : `${payload.routeName || payload.routeCode} (chiều về)`;
-    }
-    payload.createReverseRoute = true;
-    payload.reverseRouteCode = reverseCode;
-    payload.reverseRouteName = reverseName;
-    console.log(
-      `[from-gps] reverse → ${reverseCode} (${reverseName}) for ${payload.routeCode}`,
-    );
-  }
+  // Không gửi createReverseRoute.
 
   const detectRadius = Number(env.STOP_DETECT_RADIUS_M || 200);
   let stops = enrichStopsAlongPath(
@@ -4181,8 +4157,9 @@ async function saveRouteFromGpsOnTarget(session, body) {
       segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
       travelSource: stop.travelSource || 'gps',
     }));
-    // Gửi BE: mặc định giữ thập phân đúng panel; đặt AZURE_EXACT_TRAVEL_MIN=false nếu BE bắt int ≥ 1.
-    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'true');
+    // Gửi BE: standardTravelMin / estimatedDurationMin là int ≥ 1 (tránh 400).
+    // UI vẫn giữ bản thập phân đúng panel (vd 0.28) qua outboundStops.
+    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'false');
     const stopsForAzure = stopsExact.map((stop) => ({
       stationId: stop.stationId,
       stationCode: stop.stationCode,
@@ -4195,7 +4172,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
       standardTravelMin: preferExactTravel
         ? stop.standardTravelMin
         : azureTravelMinutes(stop.standardTravelMin),
-      segmentDistanceKm: stop.segmentDistanceKm,
+      ...(stop.segmentDistanceKm != null ? { segmentDistanceKm: stop.segmentDistanceKm } : {}),
     }));
     payload.stops = stopsForAzure;
     payload.coordinates = snapped.map((point, index) => ({
@@ -4205,26 +4182,33 @@ async function saveRouteFromGpsOnTarget(session, body) {
       sequence: index + 1,
       recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
     }));
-    // Ưu tiên đúng số panel lúc vẽ (FE/session) — không tính lại với tốc độ mặc định.
+    // Ưu tiên đúng số panel lúc vẽ — UI giữ thập phân; BE nhận int ≥ 1.
     const pathKm = routeLength(snapped) / 1000;
     const lockedMin = exactDurationMinutes(
       body.estimatedDurationMin ?? session?.estimatedDurationMin,
     );
-    payload.estimatedDurationMin = lockedMin
+    const pathMinutesExact = lockedMin
       ?? exactDurationMinutes((pathKm / averageSpeedKmh) * 60);
+    payload.estimatedDurationMin = preferExactTravel
+      ? pathMinutesExact
+      : Math.max(1, Math.round(Number(pathMinutesExact) || 1));
     console.log(
-      `[from-gps] ${payload.routeCode} speed=${averageSpeedKmh} azureSpeed=${azureSpeedKmh} duration=${payload.estimatedDurationMin} pathKm=${round(pathKm, 3)} segments:`,
+      `[from-gps] ${payload.routeCode} speed=${averageSpeedKmh} azureSpeed=${azureSpeedKmh} durationExact=${pathMinutesExact} durationAzure=${payload.estimatedDurationMin} pathKm=${round(pathKm, 3)} segments:`,
       stopsExact.map((s) => `#${s.stopOrder} ${s.stationCode || s.stationName || s.stationId}=${s.standardTravelMin ?? '-'}p/${s.segmentDistanceKm ?? '-'}km`).join(' | '),
     );
-    // UI giữ bản thập phân đúng (vd 0.22), không bản int ép cho BE.
+    // UI giữ bản thập phân đúng (vd 0.28).
     stops = stopsExact;
   } else {
     const pathKm = routeLength(coordinates) / 1000;
     const lockedMin = exactDurationMinutes(
       body.estimatedDurationMin ?? session?.estimatedDurationMin,
     );
-    payload.estimatedDurationMin = lockedMin
+    const pathMinutesExact = lockedMin
       ?? exactDurationMinutes((pathKm / averageSpeedKmh) * 60);
+    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'false');
+    payload.estimatedDurationMin = preferExactTravel
+      ? pathMinutesExact
+      : Math.max(1, Math.round(Number(pathMinutesExact) || 1));
   }
 
   const targetResult = await postToTargetApi(
@@ -4232,11 +4216,13 @@ async function saveRouteFromGpsOnTarget(session, body) {
     payload,
     session.deviceId || deviceIdForBoat({ boatCode: session.boatCode }),
   );
-  // Giữ stops/phút đã tính (thập phân) để UI — kể cả khi BE 400 fallback.
+  // Giữ stops/phút thập phân đúng panel cho UI — kể cả khi BE nhận bản int.
   if (targetResult && typeof targetResult === 'object') {
     targetResult.outboundStops = stops;
-    targetResult.outboundEstimatedDurationMin = payload.estimatedDurationMin ?? null;
-    targetResult.outboundCreateReverse = Boolean(payload.createReverseRoute);
+    const uiDuration = exactDurationMinutes(
+      body.estimatedDurationMin ?? session?.estimatedDurationMin ?? payload.estimatedDurationMin,
+    );
+    targetResult.outboundEstimatedDurationMin = uiDuration ?? payload.estimatedDurationMin ?? null;
     targetResult.outboundAverageSpeedKmh = averageSpeedKmh;
   }
   return targetResult;
@@ -4255,26 +4241,7 @@ async function persistRecordingSession(body, sessionInput = null) {
   const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && session?.targetSessionStarted);
 
   if (canTryAzure) {
-    let targetSave = await saveRouteFromGpsOnTarget(session, body);
-    let reverseError = null;
-    // Lỗi khi đang gửi reverse (trùng mã chiều về, …) → thử lại chỉ chiều đi để tuyến chính vẫn lên BE.
-    const wantedReverse = Boolean(body.createReverseRoute || session?.createReverseRoute);
-    if (
-      !targetSave.ok
-      && targetSave.status !== 409
-      && wantedReverse
-    ) {
-      reverseError = targetSave.error || `BE from-gps trả ${targetSave.status}`;
-      console.warn(`[save-route] from-gps failed with reverse (${targetSave.status}): ${reverseError}. Retry without createReverseRoute.`);
-      const retrySave = await saveRouteFromGpsOnTarget(
-        { ...session, createReverseRoute: false, reverseRouteCode: null, reverseRouteName: null },
-        { ...body, createReverseRoute: false, reverseRouteCode: null, reverseRouteName: null },
-      );
-      if (retrySave.ok) {
-        targetSave = retrySave;
-        warning = `Chiều đi đã lên BE; chiều về lỗi: ${reverseError}`;
-      }
-    }
+    const targetSave = await saveRouteFromGpsOnTarget(session, body);
 
     if (targetSave.ok) {
       route = targetSave.data || {};
@@ -4313,16 +4280,6 @@ async function persistRecordingSession(body, sessionInput = null) {
       const outboundMin = exactDurationMinutes(targetSave.outboundEstimatedDurationMin);
       if (outboundMin != null) {
         route.estimatedDurationMin = outboundMin;
-      }
-      if (!route.reverseRoute && targetSave.data?.reverseRoute) {
-        route.reverseRoute = targetSave.data.reverseRoute;
-      }
-      if (route.createReverseRoute == null) {
-        route.createReverseRoute = Boolean(targetSave.outboundCreateReverse);
-      }
-      if (warning && !route.reverseRoute) {
-        route.createReverseRoute = false;
-        route.reverseWarning = warning;
       }
       savedTo = 'target';
       state.lastRecordingSession = null;
@@ -4435,9 +4392,9 @@ async function finalizeCollectorRecording() {
     endStationId: stopped.endStationId || null,
     routeType: stopped.routeType || null,
     stops: Array.isArray(stopped.stops) ? stopped.stops : null,
-    createReverseRoute: Boolean(stopped.createReverseRoute),
-    reverseRouteCode: stopped.reverseRouteCode || null,
-    reverseRouteName: stopped.reverseRouteName || null,
+    createReverseRoute: false,
+    reverseRouteCode: null,
+    reverseRouteName: null,
     averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
     estimatedDurationMin: stopped.estimatedDurationMin ?? null,
     cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
@@ -4480,9 +4437,9 @@ async function finalizeCollectorRecording() {
       endStationId: stopped.endStationId || null,
       routeType: stopped.routeType || null,
       stops: stopped.stops || null,
-      createReverseRoute: Boolean(stopped.createReverseRoute),
-      reverseRouteCode: stopped.reverseRouteCode || null,
-      reverseRouteName: stopped.reverseRouteName || null,
+      createReverseRoute: false,
+      reverseRouteCode: null,
+      reverseRouteName: null,
     }, state.lastRecordingSession);
     state.lastAutoSavedRoute = {
       ...result,
@@ -5140,9 +5097,9 @@ function startCollector(body) {
     endStationId,
     routeType,
     stops,
-    createReverseRoute: Boolean(body.createReverseRoute) && routeType !== 'SightseeingLoop',
-    reverseRouteCode: cleanOptionalText(body.reverseRouteCode) || null,
-    reverseRouteName: cleanOptionalText(body.reverseRouteName) || null,
+    createReverseRoute: false,
+    reverseRouteCode: null,
+    reverseRouteName: null,
     sendIntervalMs: clamp(Number(body.sendIntervalMs || 5000), 3000, 10000),
     recordedPoints: [],
     lastPublishAt: 0,
