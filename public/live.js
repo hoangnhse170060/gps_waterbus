@@ -86,8 +86,9 @@ let hasFitRoutes = false;
 let heartbeatTimer = null;
 let heartbeatBusy = false;
 let incidentBusy = false;
-let lastIncidentToastKey = '';
-let lastRescueToastKey = '';
+let incidentToastSeeded = false;
+const toastedIncidentIds = new Set();
+const toastedRescueKeys = new Set();
 let eventsReconnectTimer = null;
 let eventsBackoffMs = 1000;
 let lastEventsAt = 0;
@@ -2074,33 +2075,53 @@ async function resolveOpenIncident(incidentId) {
 
 function maybeToastNewIncidents(data) {
   const rows = openIncidentsList(data);
-  const key = rows.map((r) => (
-    `${r.incidentId}:${r.updatedAt || ''}:${r.rescueBoatCode || ''}:${r.replacementBoatCode || ''}`
-  )).sort().join('|');
-  if (!key) {
-    lastIncidentToastKey = '';
+  const openIds = new Set(rows.map((r) => String(r.incidentId || '').trim()).filter(Boolean));
+  for (const id of [...toastedIncidentIds]) {
+    if (!openIds.has(id)) toastedIncidentIds.delete(id);
+  }
+  for (const key of [...toastedRescueKeys]) {
+    const id = key.split(':')[0];
+    if (!openIds.has(id)) toastedRescueKeys.delete(key);
+  }
+
+  // Lần đầu vào trang: seed im lặng, không spam toast cho sự cố đã mở sẵn.
+  if (!incidentToastSeeded) {
+    for (const row of rows) {
+      const id = String(row.incidentId || '').trim();
+      if (!id) continue;
+      toastedIncidentIds.add(id);
+      const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
+      if (rescue) toastedRescueKeys.add(`${id}:${rescue}`);
+    }
+    incidentToastSeeded = true;
     return;
   }
-  if (lastIncidentToastKey && key !== lastIncidentToastKey) {
-    const newest = rows[0];
-    const rescueCode = newest?.rescueBoatCode || newest?.replacementBoatCode;
-    if (rescueCode && rescueCode !== lastRescueToastKey) {
-      lastRescueToastKey = rescueCode;
+
+  for (const row of rows) {
+    const id = String(row.incidentId || '').trim();
+    if (!id) continue;
+    const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
+    if (rescue) {
+      const rescueKey = `${id}:${rescue}`;
+      if (toastedRescueKeys.has(rescueKey)) continue;
+      toastedRescueKeys.add(rescueKey);
+      toastedIncidentIds.add(id);
       toast(
-        `BE điều cứu: ${rescueCode} → ${newest.boatName || newest.boatCode}`,
+        `BE điều cứu: ${rescue} → ${row.boatName || row.boatCode}`,
         'ok',
         5000,
       );
-    } else {
-      const status = boatDbStatusLabel(newest?.boatCode, data);
-      toast(
-        `BE sự cố: ${newest?.boatName || newest?.boatCode || 'tàu'} · ${status}`,
-        'warn',
-        4500,
-      );
+      continue;
     }
+    if (toastedIncidentIds.has(id)) continue;
+    toastedIncidentIds.add(id);
+    const status = boatDbStatusLabel(row.boatCode, data);
+    toast(
+      `BE sự cố: ${row.boatName || row.boatCode || 'tàu'} · ${status}`,
+      'warn',
+      4500,
+    );
   }
-  lastIncidentToastKey = key;
 }
 
 function render(data) {
