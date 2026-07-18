@@ -1273,10 +1273,10 @@ function tripNextStopLabel(trip) {
   const eta = Number(trip.nextStopEtaMin);
   const parts = [];
   if (name) parts.push(name);
-  if (Number.isFinite(km)) {
+  if (Number.isFinite(km) && km >= 0 && km < 100) {
     parts.push(km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km < 10 ? 1 : 0)} km`);
   }
-  if (Number.isFinite(eta)) {
+  if (Number.isFinite(eta) && eta >= 0 && eta < 24 * 60) {
     parts.push(eta < 1 ? '<1p' : `~${Math.round(eta)}p`);
   }
   return parts.join(' · ');

@@ -116,9 +116,40 @@ export function createTripAutorun(ctx) {
 
   function parseTimeMs(value) {
     if (value == null || value === '') return NaN;
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    const ms = Date.parse(String(value));
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      // epoch giây → ms
+      return value < 1e12 ? value * 1000 : value;
+    }
+    const raw = String(value).trim();
+    const ms = Date.parse(raw);
     return Number.isFinite(ms) ? ms : NaN;
+  }
+
+  /** Chuẩn hoá lat/lng — sửa swap (lat=106, lng=10) thường gặp từ BE. */
+  function sanitizeLatLng(lat, lng) {
+    let la = Number(lat);
+    let lo = Number(lng);
+    if (!Number.isFinite(la) || !Number.isFinite(lo)) return null;
+    if (Math.abs(la) > 90 && Math.abs(lo) <= 90) {
+      const tmp = la;
+      la = lo;
+      lo = tmp;
+    }
+    if (Math.abs(la) > 90 || Math.abs(lo) > 180) return null;
+    return { lat: la, lng: lo };
+  }
+
+  function latLngFromArrayPair(a, b) {
+    const x = Number(a);
+    const y = Number(b);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    // VN: lng ~102–110, lat ~8–24
+    if (x >= 100 && x <= 120 && y >= 5 && y <= 25) return sanitizeLatLng(y, x);
+    if (y >= 100 && y <= 120 && x >= 5 && x <= 25) return sanitizeLatLng(x, y);
+    if (Math.abs(x) > 90 && Math.abs(y) <= 90) return sanitizeLatLng(y, x);
+    if (Math.abs(y) > 90 && Math.abs(x) <= 90) return sanitizeLatLng(x, y);
+    // Mặc định GeoJSON [lng, lat]
+    return sanitizeLatLng(y, x);
   }
 
   function normalizeDueTrips(data) {
@@ -137,25 +168,22 @@ export function createTripAutorun(ctx) {
       const out = [];
       for (const point of raw) {
         if (Array.isArray(point) && point.length >= 2) {
-          const a = Number(point[0]);
-          const b = Number(point[1]);
-          if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
-          // Ưu tiên GeoJSON [lng, lat]; nhận diện [lat, lng] khi |lng| > 90 ở phần tử 2.
-          if (Math.abs(b) > 90 && Math.abs(a) <= 90) {
-            out.push({ lat: a, lng: b });
-          } else {
-            out.push({ lat: b, lng: a });
-          }
+          const pair = latLngFromArrayPair(point[0], point[1]);
+          if (pair) out.push(pair);
           continue;
         }
-        const lat = Number(point?.lat ?? point?.Latitude ?? point?.latitude);
-        const lng = Number(point?.lng ?? point?.lon ?? point?.Longitude ?? point?.longitude);
-        if (Number.isFinite(lat) && Number.isFinite(lng)) out.push({ lat, lng });
+        const pair = sanitizeLatLng(
+          point?.lat ?? point?.Latitude ?? point?.latitude,
+          point?.lng ?? point?.lon ?? point?.Longitude ?? point?.longitude,
+        );
+        if (pair) out.push(pair);
       }
       return out;
     }
     try {
-      return parseRouteCoordinates(raw);
+      return parseRouteCoordinates(raw)
+        .map((p) => sanitizeLatLng(p.lat, p.lng))
+        .filter(Boolean);
     } catch {
       return [];
     }
@@ -163,40 +191,99 @@ export function createTripAutorun(ctx) {
 
   function normalizeStops(rawStops) {
     if (!Array.isArray(rawStops)) return [];
-    return rawStops.map((stop, index) => ({
-      stationId: cleanOptionalText(stop.stationId || stop.StationId) || null,
-      stationCode: cleanOptionalText(stop.stationCode || stop.StationCode) || null,
-      stationName: cleanOptionalText(stop.stationName || stop.StationName) || null,
-      stopOrder: Number(stop.stopOrder ?? stop.StopOrder) || index + 1,
-      lat: Number.isFinite(Number(stop.lat ?? stop.Latitude)) ? Number(stop.lat ?? stop.Latitude) : null,
-      lng: Number.isFinite(Number(stop.lng ?? stop.Longitude)) ? Number(stop.lng ?? stop.Longitude) : null,
-      plannedArrivalTime: stop.plannedArrivalTime || stop.PlannedArrivalTime || stop.arrivalTime || null,
-      plannedDepartureTime: stop.plannedDepartureTime || stop.PlannedDepartureTime || stop.departureTime || null,
-    })).sort((a, b) => a.stopOrder - b.stopOrder);
+    return rawStops.map((stop, index) => {
+      const pair = sanitizeLatLng(
+        stop.lat ?? stop.Latitude ?? stop.latitude,
+        stop.lng ?? stop.lon ?? stop.Longitude ?? stop.longitude,
+      );
+      return {
+        stationId: cleanOptionalText(stop.stationId || stop.StationId) || null,
+        stationCode: cleanOptionalText(stop.stationCode || stop.StationCode) || null,
+        stationName: cleanOptionalText(stop.stationName || stop.StationName) || null,
+        stopOrder: Number(stop.stopOrder ?? stop.StopOrder) || index + 1,
+        lat: pair?.lat ?? null,
+        lng: pair?.lng ?? null,
+        plannedArrivalTime: stop.plannedArrivalTime || stop.PlannedArrivalTime || stop.arrivalTime || null,
+        plannedDepartureTime: stop.plannedDepartureTime || stop.PlannedDepartureTime || stop.departureTime || null,
+      };
+    }).sort((a, b) => a.stopOrder - b.stopOrder);
   }
 
   function resolveCoordinatesForTrip(row) {
-    const fromPayload = parseTripCoordinates(
+    let fromPayload = parseTripCoordinates(
       row.routeGeometry || row.RouteGeometry || row.geometry || row.coordinates,
     );
-    if (fromPayload.length >= 2) return fromPayload;
+    // Geometry lỗi (đoạn xuyên địa cầu) → bỏ, lấy Neon.
+    if (fromPayload.length >= 2) {
+      const len = routeLengthFn(fromPayload);
+      if (len > 0 && len <= 80_000) return fromPayload;
+      console.warn(`[trip-gps] routeGeometry bất thường ${Math.round(len)}m — fallback Neon`);
+      fromPayload = [];
+    }
 
     const routeCode = cleanOptionalText(row.routeCode || row.RouteCode);
-    if (!routeCode) return [];
+    if (!routeCode) return fromPayload;
     for (const route of state.routes.values()) {
       if (String(route.routeCode || '').trim() !== routeCode) continue;
       const coords = Array.isArray(route.coordinates) ? route.coordinates : [];
-      if (coords.length >= 2) return coords.map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+      const cleaned = coords
+        .map((p) => sanitizeLatLng(p.lat, p.lng))
+        .filter(Boolean);
+      if (cleaned.length >= 2) return cleaned;
     }
-    return [];
+    return fromPayload;
   }
 
   function resolveLengthMeters(row, coordinates) {
     const geoLen = coordinates.length >= 2 ? routeLengthFn(coordinates) : 0;
-    if (geoLen > 10) return geoLen;
+    if (geoLen > 10 && geoLen <= 80_000) return geoLen;
     const baseKm = Number(row.baseDistanceKm ?? row.BaseDistanceKm);
-    if (Number.isFinite(baseKm) && baseKm > 0) return baseKm * 1000;
-    return geoLen;
+    if (Number.isFinite(baseKm) && baseKm > 0 && baseKm <= 80) return baseKm * 1000;
+    // Fallback: tổng đoạn thẳng giữa các bến có toạ độ.
+    return Math.max(geoLen > 10 ? Math.min(geoLen, 80_000) : 0, estimateStopsLengthMeters(row));
+  }
+
+  function estimateStopsLengthMeters(row) {
+    const stops = normalizeStops(row.stops || row.Stops || []);
+    let sum = 0;
+    for (let i = 1; i < stops.length; i += 1) {
+      const a = stops[i - 1];
+      const b = stops[i];
+      if (!Number.isFinite(a.lat) || !Number.isFinite(b.lat)) continue;
+      sum += distanceMetersFn(
+        { lat: a.lat, lng: a.lng },
+        { lat: b.lat, lng: b.lng },
+      );
+    }
+    return sum;
+  }
+
+  /** Neo progress vào điểm path gần vị trí hub hiện tại — tránh teleport về đầu tuyến. */
+  function seedProgressFromHub(mission) {
+    const hub = state.hubBoats.get(mission.boatCode);
+    const lat = Number(hub?.lat);
+    const lng = Number(hub?.lng);
+    const coords = mission.coordinates || [];
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || coords.length < 2) return;
+    let bestAlong = 0;
+    let bestDist = Infinity;
+    let travelled = 0;
+    for (let i = 0; i < coords.length; i += 1) {
+      if (i > 0) travelled += distanceMetersFn(coords[i - 1], coords[i]);
+      const d = distanceMetersFn(coords[i], { lat, lng });
+      if (d < bestDist) {
+        bestDist = d;
+        bestAlong = travelled;
+      }
+    }
+    // Chỉ neo khi đang gần path (≤ 400m) — tránh nhảy nếu GPS lệch xa.
+    if (bestDist <= 400) {
+      mission.progressMeters = Math.min(Number(mission.lengthMeters) || bestAlong, bestAlong);
+      const point = pointAtDistance(coords, mission.progressMeters);
+      mission.currentLat = point.lat;
+      mission.currentLng = point.lng;
+      mission.lastHeading = point.heading || mission.lastHeading || 0;
+    }
   }
 
   async function fetchDueTrips({ boatCode, lookAheadMinutes: lookAhead } = {}) {
@@ -364,6 +451,10 @@ export function createTripAutorun(ctx) {
       console.warn(`[trip-gps] skip ${tripId}: lengthMeters quá ngắn`);
       return null;
     }
+    if (lengthMeters > 80_000) {
+      console.warn(`[trip-gps] skip ${tripId}: lengthMeters bất thường ${Math.round(lengthMeters)}m`);
+      return null;
+    }
 
     const boat = boatByIdOrCode(boatCode);
     const maxSpeedKmh = Number(boat?.maxSpeedKmh)
@@ -408,6 +499,9 @@ export function createTripAutorun(ctx) {
       updatedAt: new Date().toISOString(),
     };
 
+    // Neo vào vị trí GPS hiện tại trên path (đang ở Ba Son thì không kéo về đầu tuyến ảo).
+    seedProgressFromHub(mission);
+
     // Target speed ban đầu theo contract.
     const depMs = parseTimeMs(departureTime);
     const arrMs = parseTimeMs(arrivalTime);
@@ -423,13 +517,16 @@ export function createTripAutorun(ctx) {
     state.tripMissions.set(tripId, mission);
     console.log(
       `[trip-gps] START ${boatCode} trip=${tripId} `
-      + `${Math.round(lengthMeters)}m · max ${maxSpeedKmh} km/h · dep ${departureTime || '?'}`,
+      + `${Math.round(lengthMeters)}m · max ${maxSpeedKmh} km/h · dep ${departureTime || '?'} `
+      + `· progress ${Math.round(mission.progressMeters)}m`,
     );
     return mission;
   }
 
   function computeRequiredSpeedKmh(mission, nowMs) {
-    const remainingMeters = Math.max(0, Number(mission.lengthMeters) - Number(mission.progressMeters));
+    const rawRemaining = Math.max(0, Number(mission.lengthMeters) - Number(mission.progressMeters));
+    // Trần hợp lý tuyến sông — tránh geometry lỗi → tốc độ ~0 và đứng im.
+    const remainingMeters = Math.min(rawRemaining, 80_000);
     const remainingKm = remainingMeters / 1000;
     if (!(remainingKm > 0.001)) return 0;
 
@@ -442,7 +539,10 @@ export function createTripAutorun(ctx) {
       // Trễ: chạy max, chấp nhận đến muộn.
       return Number(mission.maxSpeedKmh) || 80;
     }
-    return remainingKm / remainingHours;
+    // Nếu lịch còn rất xa so với quãng đường (ETA ảo) → dùng tốc độ mặc định.
+    const required = remainingKm / remainingHours;
+    if (required < 0.5) return Number(env.DEFAULT_SPEED_KMH || 16);
+    return required;
   }
 
   function nearStop(mission, stop, radius = STOP_ARRIVED_M) {
@@ -543,9 +643,21 @@ export function createTripAutorun(ctx) {
         { lat: Number(next.lat), lng: Number(next.lng) },
       )
       : null;
-    const metersToNext = along != null && along > 0
-      ? along
-      : (straight != null ? straight : remainingMeters);
+
+    // Ưu tiên đường thẳng khi dọc path bất thường (toạ độ swap / geometry lỗi).
+    let metersToNext = null;
+    if (Number.isFinite(straight) && Number.isFinite(along) && along > 0) {
+      metersToNext = (along > straight * 3 + 300 || along > 50_000) ? straight : along;
+    } else if (Number.isFinite(along) && along > 0 && along <= 50_000) {
+      metersToNext = along;
+    } else if (Number.isFinite(straight)) {
+      metersToNext = straight;
+    } else {
+      metersToNext = Math.min(remainingMeters, 50_000);
+    }
+    if (!(metersToNext >= 0) || metersToNext > 80_000) {
+      metersToNext = Number.isFinite(straight) ? straight : Math.min(remainingMeters, 5_000);
+    }
 
     mission.nextStationId = next.stationId || next.stationCode || null;
     mission.nextStopCode = next.stationCode || next.stationId || null;
@@ -554,12 +666,13 @@ export function createTripAutorun(ctx) {
     mission.nextStopPlannedArrivalAt = next.plannedArrivalTime || null;
 
     const planArr = parseTimeMs(next.plannedArrivalTime);
-    if (Number.isFinite(planArr)) {
+    const speedForEta = Number(mission.speedKmh) > 0.5
+      ? Number(mission.speedKmh)
+      : (Number(mission.requiredSpeedKmh) || Number(mission.maxSpeedKmh) || 16);
+    if (Number.isFinite(planArr) && planArr > nowMs) {
       mission.nextStopEtaMin = Math.max(0, (planArr - nowMs) / 60000);
     } else {
-      const speedForEta = Number(mission.speedKmh) > 0.5
-        ? Number(mission.speedKmh)
-        : (Number(mission.requiredSpeedKmh) || Number(mission.maxSpeedKmh) || 16);
+      // Lịch quá khứ / thiếu → ETA theo quãng đường & tốc độ thực.
       mission.nextStopEtaMin = etaMinutesFromDistance(metersToNext, speedForEta);
     }
     mission.movementStatus = movementStatusFor(mission);
@@ -616,6 +729,20 @@ export function createTripAutorun(ctx) {
 
   async function tickOneMission(mission, nowMs) {
     if (!mission || mission.status === 'Completed') return;
+
+    // Mission geometry/ETA lỗi từ BE (vd 11832 km / -95000p) → huỷ để poll lại.
+    if (Number(mission.lengthMeters) > 80_000) {
+      console.warn(`[trip-gps] drop ${mission.tripId}: length ${Math.round(mission.lengthMeters)}m`);
+      state.tripMissions.delete(mission.tripId);
+      return;
+    }
+    // Sửa stop lat/lng bị swap nếu còn sót.
+    if (Array.isArray(mission.stops)) {
+      mission.stops = mission.stops.map((stop) => {
+        const pair = sanitizeLatLng(stop.lat, stop.lng);
+        return pair ? { ...stop, lat: pair.lat, lng: pair.lng } : stop;
+      });
+    }
 
     if (isBoatInActiveRescueMission(mission.boatCode) || hasOpenIncidentForBoat(mission.boatCode)) {
       mission.status = 'Paused';
