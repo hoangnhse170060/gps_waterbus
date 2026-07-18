@@ -152,9 +152,9 @@ function isBoatInActiveAutomatedRescue(code, data = latest) {
   if (!key) return false;
   return (data?.rescueMissions || []).some((mission) => {
     const status = String(mission?.status || '');
-    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) return false;
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status)) return false;
     if (String(mission.rescueBoatCode || '').trim() === key) return true;
-    if (status === 'Towing' && String(mission.incidentBoatCode || '').trim() === key) return true;
+    if (String(mission.incidentBoatCode || '').trim() === key) return true;
     return false;
   });
 }
@@ -186,24 +186,33 @@ function syncAutomatedRescuePins(hubBoats, data = latest) {
 
     // Đang kéo: tàu lỗi nối đuôi — không đè cùng điểm rồi bị cluster nhảy.
     const incidentDragging = dragging && draggingBoatCode === incidentCode;
-    if (status === 'Towing' && incidentCode && !incidentDragging) {
-      let lat = Number(mission.incidentCurrentLat);
-      let lng = Number(mission.incidentCurrentLng);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-        const station = {
-          lat: Number(mission.targetLat),
-          lng: Number(mission.targetLng),
-        };
-        const heading = (Number.isFinite(station.lat) && Number.isFinite(station.lng))
-          ? bearingDegreesLocal({ lat: rescueLat, lng: rescueLng }, station)
-          : Number(mission.lastHeading || 0);
-        const gap = 35;
-        const behind = pointBehindLocal({ lat: rescueLat, lng: rescueLng }, heading, gap);
-        lat = behind.lat;
-        lng = behind.lng;
+    if (incidentCode && !incidentDragging) {
+      if (status === 'Towing') {
+        let lat = Number(mission.incidentCurrentLat);
+        let lng = Number(mission.incidentCurrentLng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+          const station = {
+            lat: Number(mission.targetLat),
+            lng: Number(mission.targetLng),
+          };
+          const heading = (Number.isFinite(station.lat) && Number.isFinite(station.lng))
+            ? bearingDegreesLocal({ lat: rescueLat, lng: rescueLng }, station)
+            : Number(mission.lastHeading || 0);
+          const gap = 35;
+          const behind = pointBehindLocal({ lat: rescueLat, lng: rescueLng }, heading, gap);
+          lat = behind.lat;
+          lng = behind.lng;
+        }
+        pinnedPositions.set(incidentCode, { lat, lng, at: Date.now(), user: false });
+        changed = true;
+      } else if (status === 'Dispatched' || status === 'InTransit' || status === 'AtStation') {
+        const lat = Number(mission.incidentCurrentLat ?? mission.incidentLat);
+        const lng = Number(mission.incidentCurrentLng ?? mission.incidentLng);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+          pinnedPositions.set(incidentCode, { lat, lng, at: Date.now(), user: false });
+          changed = true;
+        }
       }
-      pinnedPositions.set(incidentCode, { lat, lng, at: Date.now(), user: false });
-      changed = true;
     }
 
     const local = rescueMissions.get(String(mission.incidentId || '').trim());

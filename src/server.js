@@ -2460,8 +2460,9 @@ function isBoatInActiveRescueMission(boatCode) {
   if (!code) return false;
   for (const mission of state.rescueMissions.values()) {
     const status = String(mission?.status || '');
-    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) continue;
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status)) continue;
     if (String(mission.rescueBoatCode || '').trim() === code) return true;
+    // Tàu sự cố cũng bị rescue sở hữu GPS (neo hiện trường / kéo / cập bến).
     if (String(mission.incidentBoatCode || '').trim() === code) return true;
   }
   return false;
@@ -2679,6 +2680,37 @@ function startRescueAutomation(incident) {
   }).catch((error) => {
     console.warn(`[rescue-gps] publish start failed: ${error.message}`);
   });
+  // Gửi luôn GPS tàu sự cố tại hiện trường (Azure/map thấy SC, không chỉ badge FE).
+  if (incidentBoatCode) {
+    const incHeading = Number(state.hubBoats.get(incidentBoatCode)?.heading) || 0;
+    if (destinationMeta && Number.isFinite(Number(mission.incidentCurrentLat))) {
+      publishLiveGpsPosition({
+        boatCode: incidentBoatCode,
+        lat: mission.incidentCurrentLat,
+        lng: mission.incidentCurrentLng,
+        heading: mission.lastHeading || incHeading,
+        speedKmh: mission.speedKmh,
+        status: 'moving',
+        sendToTarget: true,
+        fromRescue: true,
+      }).catch((error) => {
+        console.warn(`[rescue-gps] publish incident tow-start failed: ${error.message}`);
+      });
+    } else {
+      publishLiveGpsPosition({
+        boatCode: incidentBoatCode,
+        lat: resolvedTargetLat,
+        lng: resolvedTargetLng,
+        heading: incHeading,
+        speedKmh: 0,
+        status: 'idle',
+        sendToTarget: true,
+        fromRescue: true,
+      }).catch((error) => {
+        console.warn(`[rescue-gps] publish incident scene failed: ${error.message}`);
+      });
+    }
+  }
   broadcast();
 
   // Có tàu thay khách riêng → điều thêm (không kéo tàu sự cố).
@@ -2846,27 +2878,50 @@ async function tickRescueMissions() {
         fromRescue: true,
       });
       let incidentResult = null;
-      if (mission.status === 'Towing' && mission.incidentBoatCode) {
-        // Khi kéo: tàu lỗi đi sau tàu cứu. Cập bến vẫn giữ nối đuôi, không đè cùng 1 điểm rồi cluster nhảy.
-        const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
-        const berthGapMeters = Math.max(12, Number(env.TOW_BERTH_GAP_METERS || 16));
-        const towHeading = heading || Number(mission.lastHeading || 0);
-        const towedPosition = arrived
-          ? pointBehind({ lat, lng }, towHeading || bearingDegrees(current, target) || 0, berthGapMeters)
-          : pointBehind({ lat, lng }, towHeading, towRopeMeters);
-        mission.incidentCurrentLat = towedPosition.lat;
-        mission.incidentCurrentLng = towedPosition.lng;
-        mission.lastHeading = towHeading;
-        incidentResult = await publishLiveGpsPosition({
-          boatCode: mission.incidentBoatCode,
-          lat: towedPosition.lat,
-          lng: towedPosition.lng,
-          heading: towHeading,
-          speedKmh: arrived ? 0 : mission.speedKmh,
-          status: arrived ? 'idle' : 'moving',
-          sendToTarget: true,
-          fromRescue: true,
-        });
+      if (mission.incidentBoatCode) {
+        if (mission.status === 'Towing') {
+          // Khi kéo: tàu lỗi đi sau tàu cứu. Cập bến vẫn giữ nối đuôi, không đè cùng 1 điểm rồi cluster nhảy.
+          const towRopeMeters = Math.max(28, Number(env.TOW_ROPE_METERS || 35));
+          const berthGapMeters = Math.max(12, Number(env.TOW_BERTH_GAP_METERS || 16));
+          const towHeading = heading || Number(mission.lastHeading || 0);
+          const towedPosition = arrived
+            ? pointBehind({ lat, lng }, towHeading || bearingDegrees(current, target) || 0, berthGapMeters)
+            : pointBehind({ lat, lng }, towHeading, towRopeMeters);
+          mission.incidentCurrentLat = towedPosition.lat;
+          mission.incidentCurrentLng = towedPosition.lng;
+          mission.lastHeading = towHeading;
+          incidentResult = await publishLiveGpsPosition({
+            boatCode: mission.incidentBoatCode,
+            lat: towedPosition.lat,
+            lng: towedPosition.lng,
+            heading: towHeading,
+            speedKmh: arrived ? 0 : mission.speedKmh,
+            status: arrived ? 'idle' : 'moving',
+            sendToTarget: true,
+            fromRescue: true,
+          });
+        } else {
+          // Dispatched/InTransit: neo GPS tàu sự cố tại hiện trường (gửi Azure liên tục).
+          const sceneLat = Number(mission.incidentCurrentLat ?? mission.incidentLat);
+          const sceneLng = Number(mission.incidentCurrentLng ?? mission.incidentLng);
+          if (Number.isFinite(sceneLat) && Number.isFinite(sceneLng)) {
+            mission.incidentCurrentLat = sceneLat;
+            mission.incidentCurrentLng = sceneLng;
+            const incHeading = Number(state.hubBoats.get(mission.incidentBoatCode)?.heading)
+              || Number(mission.lastHeading || 0);
+            incidentResult = await publishLiveGpsPosition({
+              boatCode: mission.incidentBoatCode,
+              lat: sceneLat,
+              lng: sceneLng,
+              heading: incHeading,
+              speedKmh: 0,
+              status: 'idle',
+              sendToTarget: true,
+              fromRescue: true,
+            });
+          }
+          mission.lastHeading = heading;
+        }
       } else {
         mission.lastHeading = heading;
       }
@@ -2913,8 +2968,41 @@ async function tickRescueMissions() {
         }
         console.log(
           `[rescue-gps] đã về ${mission.destinationStationCode || 'bến'} — `
-          + `nhả ${mission.rescueBoatCode}, ${mission.incidentBoatCode} vẫn sự cố`,
+          + `nhả ${mission.rescueBoatCode}, ${mission.incidentBoatCode} → Bảo trì`,
         );
+        // Tàu sự cố cập bến → Bảo trì (vẫn hiện map; Active lại khi sửa xong, không cần hồ sơ mới).
+        if (mission.incidentBoatCode) {
+          const dockLat = Number(mission.incidentCurrentLat ?? lat);
+          const dockLng = Number(mission.incidentCurrentLng ?? lng);
+          if (Number.isFinite(dockLat) && Number.isFinite(dockLng)) {
+            await publishLiveGpsPosition({
+              boatCode: mission.incidentBoatCode,
+              lat: dockLat,
+              lng: dockLng,
+              heading: Number(mission.lastHeading || 0),
+              speedKmh: 0,
+              status: 'idle',
+              sendToTarget: true,
+              fromRescue: true,
+            });
+          }
+          applyBeBoatStatus({
+            boatCode: mission.incidentBoatCode,
+            status: 'UnderMaintenance',
+            source: 'rescue-at-station',
+          });
+          const incidentBoat = boatByIdOrCode(mission.incidentBoatCode);
+          if (incidentBoat) {
+            incidentBoat.dbStatus = 'UnderMaintenance';
+            incidentBoat.beStatus = 'UnderMaintenance';
+          }
+          const hubInc = state.hubBoats.get(mission.incidentBoatCode);
+          if (hubInc) {
+            hubInc.boatStatus = 'UnderMaintenance';
+            hubInc.beStatus = 'UnderMaintenance';
+            hubInc.updatedAt = new Date().toISOString();
+          }
+        }
       } else {
         mission.arrivedAt = mission.updatedAt;
         const nearest = nearestStationBeyond(
@@ -3199,6 +3287,19 @@ function ingestIncidentHook(body = {}, req = null) {
       boatStatus: 'Incident',
       beStatus: 'Incident',
       updatedAt: new Date().toISOString(),
+    });
+    // Gửi GPS tàu sự cố lên Azure ngay khi có tọa độ (không chỉ hiện SC trên FE).
+    publishLiveGpsPosition({
+      boatCode: incident.boatCode,
+      lat: incident.lat,
+      lng: incident.lng,
+      heading: prev?.heading ?? 0,
+      speedKmh: 0,
+      status: 'idle',
+      sendToTarget: true,
+      fromRescue: true,
+    }).catch((error) => {
+      console.warn(`[hook] publish incident GPS failed: ${error.message}`);
     });
   }
 
