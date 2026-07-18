@@ -2535,6 +2535,105 @@ function pointBehind(position, heading, meters) {
 }
 
 /**
+ * Contract BE: khi kéo về bến xong, GPS callback để BE quyết định status
+ * (Resolved + UnderMaintenance + SOS Active). GPS không tự sửa DB BE.
+ * POST {apiRoot}/api/incidents/rescue-mission-completed
+ * Header: X-Live-Hook-Secret
+ */
+async function notifyBeRescueMissionCompleted(mission) {
+  if (!mission || mission.beCallbackSent) return { ok: false, skipped: true, reason: 'already-sent' };
+  const incidentId = String(mission.incidentId || '').trim();
+  // Bỏ mission transfer (__xfer) — chỉ callback incident gốc.
+  if (!incidentId || incidentId.endsWith('__xfer')) {
+    return { ok: false, skipped: true, reason: 'no-incident' };
+  }
+  const secret = String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim();
+  const root = getTargetApiRoot();
+  if (!root) {
+    console.warn('[rescue-callback] thiếu TARGET_GPS_ENDPOINT — bỏ qua callback BE');
+    return { ok: false, skipped: true, reason: 'no-api-root' };
+  }
+  if (!secret) {
+    console.warn('[rescue-callback] thiếu LIVE_HOOK_SECRET — bỏ qua callback BE');
+    return { ok: false, skipped: true, reason: 'no-secret' };
+  }
+
+  const path = String(env.RESCUE_COMPLETED_PATH || '/api/incidents/rescue-mission-completed').trim()
+    || '/api/incidents/rescue-mission-completed';
+  const url = targetApiUrl(path);
+  const payload = {
+    incidentId,
+    boatCode: mission.incidentBoatCode || null,
+    rescueBoatCode: mission.rescueBoatCode || null,
+    replacementBoatCode: mission.replacementBoatCode || null,
+    completedAt: formatRecordedAt(new Date()),
+    destinationStationCode: mission.destinationStationCode || null,
+    destinationStationName: mission.destinationStationName || null,
+    note: mission.destinationStationName
+      ? `Tàu đã được kéo về ${mission.destinationStationName}`
+      : 'Tàu đã được kéo về bến',
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Live-Hook-Secret': secret,
+      },
+      body: JSON.stringify(payload),
+    });
+    let data = null;
+    const text = await response.text();
+    if (text) {
+      try { data = JSON.parse(text); } catch { data = { message: text }; }
+    }
+    const ok = response.status >= 200 && response.status < 300;
+    mission.beCallbackSent = true;
+    mission.beCallbackAt = new Date().toISOString();
+    mission.beCallbackOk = ok;
+    mission.beCallbackStatus = response.status;
+    mission.beCallbackError = ok ? null : formatTargetApiError(data, response.status);
+    pushApiCallLog({
+      method: 'POST',
+      url,
+      path,
+      ok,
+      status: response.status,
+      error: mission.beCallbackError,
+      at: mission.beCallbackAt,
+      request: summarizeApiPayload(payload),
+      response: summarizeApiPayload(data),
+      deviceId: null,
+    });
+    console.log(
+      `[rescue-callback] ${ok ? 'OK' : 'FAIL'} ${response.status} `
+      + `${mission.rescueBoatCode} · ${mission.incidentBoatCode} · ${incidentId}`,
+    );
+    return { ok, status: response.status, data, error: mission.beCallbackError };
+  } catch (error) {
+    mission.beCallbackSent = true;
+    mission.beCallbackAt = new Date().toISOString();
+    mission.beCallbackOk = false;
+    mission.beCallbackError = error.message;
+    pushApiCallLog({
+      method: 'POST',
+      url,
+      path,
+      ok: false,
+      status: 502,
+      error: error.message,
+      at: mission.beCallbackAt,
+      request: summarizeApiPayload(payload),
+      response: null,
+      deviceId: null,
+    });
+    console.warn(`[rescue-callback] error: ${error.message}`);
+    return { ok: false, status: 502, error: error.message };
+  }
+}
+
+/**
  * Nhận RescueDispatched → kéo tàu cứu tới hiện trường, rồi kéo tàu lỗi về bến gần nhất.
  * Đang chạy (InTransit/Towing): chỉ cập nhật target (idempotent).
  * Đã AtStation/Completed: cho phép Điều tàu lại → tạo mission mới.
@@ -2930,9 +3029,9 @@ async function tickRescueMissions() {
         }
         console.log(
           `[rescue-gps] đã về ${mission.destinationStationCode || 'bến'} — `
-          + `nhả ${mission.rescueBoatCode}, ${mission.incidentBoatCode} → Bảo trì`,
+          + `nhả ${mission.rescueBoatCode}, ${mission.incidentBoatCode} → Bảo trì (local); callback BE`,
         );
-        // Tàu sự cố cập bến → Bảo trì (vẫn hiện map; Active lại khi sửa xong, không cần hồ sơ mới).
+        // Tàu sự cố cập bến → Bảo trì local map; BE quyết định DB qua callback.
         if (mission.incidentBoatCode) {
           const dockLat = Number(mission.incidentCurrentLat ?? lat);
           const dockLng = Number(mission.incidentCurrentLng ?? lng);
@@ -2965,6 +3064,8 @@ async function tickRescueMissions() {
             hubInc.updatedAt = new Date().toISOString();
           }
         }
+        // Contract: GPS → BE rescue-mission-completed (BE set Resolved + UnderMaintenance + SOS Active).
+        await notifyBeRescueMissionCompleted(mission);
       } else {
         mission.arrivedAt = mission.updatedAt;
         const nearest = nearestStationTo({
