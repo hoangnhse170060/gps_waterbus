@@ -13,7 +13,10 @@ const ACTIVE_TRIP_STATUSES = new Set([
   'Paused',
 ]);
 
-const STOP_ARRIVE_METERS = 40;
+// Khớp Live FE: Arriving sớm hơn, Arrived sát bến (không báo cập bến khi còn ngoài sông).
+const STOP_ARRIVING_M = 120;
+const STOP_ARRIVED_M = 28;
+const STOP_DEPART_M = 45;
 const COMPLETED_TTL_MS = 30 * 60 * 1000;
 
 export function createTripAutorun(ctx) {
@@ -88,6 +91,19 @@ export function createTripAutorun(ctx) {
       currentLat: mission.currentLat == null ? null : Number(mission.currentLat),
       currentLng: mission.currentLng == null ? null : Number(mission.currentLng),
       stopIndex: mission.stopIndex ?? 0,
+      // FE / BE schedule fields
+      nextStationId: mission.nextStationId || null,
+      nextStopCode: mission.nextStopCode || null,
+      nextStopName: mission.nextStopName || null,
+      nextStationName: mission.nextStopName || null,
+      nextStopDistanceKm: round3(mission.nextStopDistanceKm),
+      nextStopEtaMin: round1(mission.nextStopEtaMin),
+      remainingDistanceKmToNextStation: round3(mission.nextStopDistanceKm),
+      remainingMinutesToNextStation: round1(mission.nextStopEtaMin),
+      nextStopPlannedArrivalAt: mission.nextStopPlannedArrivalAt || null,
+      remainingDistanceKm: round3(mission.remainingDistanceKm),
+      remainingEtaMin: round1(mission.remainingEtaMin),
+      movementStatus: mission.movementStatus || null,
       lastError: mission.lastError || null,
       completedAt: mission.completedAt || null,
       updatedAt: mission.updatedAt || null,
@@ -212,11 +228,100 @@ export function createTripAutorun(ctx) {
       method: 'POST',
       pathname: completePath(id),
       payload: body || {
+        boatCode: null,
         completedAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
-        note: 'GPS arrived at route end',
       },
       auth: 'hook',
     });
+  }
+
+  function stopEventPath(tripId, stationId) {
+    const template = String(env.TRIP_STOP_EVENT_PATH || '/api/gps/trips/{tripId}/stops/{stationId}/event').trim()
+      || '/api/gps/trips/{tripId}/stops/{stationId}/event';
+    return template
+      .replace('{tripId}', encodeURIComponent(tripId))
+      .replace('{stationId}', encodeURIComponent(stationId));
+  }
+
+  async function postStopEvent(mission, stop, event) {
+    const tripId = cleanOptionalText(mission?.tripId);
+    const stationId = cleanOptionalText(stop?.stationId || stop?.stationCode);
+    const boatCode = cleanOptionalText(mission?.boatCode);
+    if (!tripId || !stationId || !event) return { ok: false, skipped: true };
+    if (!mission.stopEventsSent) mission.stopEventsSent = new Set();
+    const key = `${stationId}:${event}`;
+    if (mission.stopEventsSent.has(key)) return { ok: true, skipped: true, reason: 'already-sent' };
+
+    const result = await requestTargetApi({
+      method: 'POST',
+      pathname: stopEventPath(tripId, stationId),
+      payload: {
+        boatCode,
+        event,
+        occurredAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
+      },
+      auth: 'hook',
+    });
+    if (result.ok) {
+      mission.stopEventsSent.add(key);
+      console.log(`[trip-gps] event ${event} ${boatCode} → ${stationId} trip=${tripId}`);
+    } else {
+      console.warn(`[trip-gps] event ${event} FAIL ${stationId}: ${result.error || result.status}`);
+    }
+    return result;
+  }
+
+  function distanceToStopMeters(mission, stop) {
+    if (!stop || !Number.isFinite(Number(stop.lat)) || !Number.isFinite(Number(stop.lng))) return Infinity;
+    return distanceMetersFn(
+      { lat: mission.currentLat, lng: mission.currentLng },
+      { lat: Number(stop.lat), lng: Number(stop.lng) },
+    );
+  }
+
+  /** Contract: Arriving → Arrived → Departed theo bán kính bến. */
+  async function maybeEmitStopEvents(mission) {
+    const stops = mission.stops || [];
+    if (!stops.length) return;
+    if (!mission.stopEventsSent) mission.stopEventsSent = new Set();
+
+    for (const stop of stops) {
+      const stationId = cleanOptionalText(stop.stationId || stop.stationCode);
+      if (!stationId) continue;
+      const dist = distanceToStopMeters(mission, stop);
+      if (dist <= STOP_ARRIVING_M) {
+        await postStopEvent(mission, stop, 'Arriving');
+      }
+      if (dist <= STOP_ARRIVED_M) {
+        await postStopEvent(mission, stop, 'Arrived');
+        mission.atStationId = stationId;
+      }
+      if (
+        mission.atStationId === stationId
+        && dist > STOP_DEPART_M
+        && mission.stopEventsSent.has(`${stationId}:Arrived`)
+      ) {
+        await postStopEvent(mission, stop, 'Departed');
+        if (mission.atStationId === stationId) mission.atStationId = null;
+      }
+    }
+  }
+
+  function movementStatusFor(mission) {
+    const st = String(mission.status || '');
+    if (st === 'Boarding') return 'Boarding';
+    if (st === 'WaitingAtStop') return 'AtStation';
+    if (st === 'Paused') return 'Delayed';
+    if (st === 'Completed') return 'Completed';
+    if (st === 'Running') {
+      const km = Number(mission.nextStopDistanceKm);
+      if (Number.isFinite(km) && km * 1000 <= STOP_ARRIVING_M && km * 1000 > STOP_ARRIVED_M) {
+        return 'Arriving';
+      }
+      if (Number.isFinite(km) && km * 1000 <= STOP_ARRIVED_M) return 'AtStation';
+      return 'Moving';
+    }
+    return 'Scheduled';
   }
 
   function eligibleBoatCodes() {
@@ -294,6 +399,12 @@ export function createTripAutorun(ctx) {
       lastError: null,
       completedAt: null,
       completeSent: false,
+      stopEventsSent: new Set(),
+      atStationId: null,
+      nextStationId: null,
+      nextStopDistanceKm: null,
+      nextStopEtaMin: null,
+      movementStatus: 'Scheduled',
       updatedAt: new Date().toISOString(),
     };
 
@@ -334,13 +445,124 @@ export function createTripAutorun(ctx) {
     return remainingKm / remainingHours;
   }
 
-  function nearStop(mission, stop, radius = STOP_ARRIVE_METERS) {
+  function nearStop(mission, stop, radius = STOP_ARRIVED_M) {
     if (!stop || !Number.isFinite(Number(stop.lat)) || !Number.isFinite(Number(stop.lng))) return false;
     const d = distanceMetersFn(
       { lat: mission.currentLat, lng: mission.currentLng },
       { lat: Number(stop.lat), lng: Number(stop.lng) },
     );
     return d <= radius;
+  }
+
+  /** Khoảng cách dọc path từ progress hiện tại tới điểm gần stop nhất. */
+  function alongMetersToStop(mission, stop) {
+    const coords = mission.coordinates || [];
+    if (!stop || coords.length < 2) return null;
+    if (!Number.isFinite(Number(stop.lat)) || !Number.isFinite(Number(stop.lng))) return null;
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < coords.length; i += 1) {
+      const d = distanceMetersFn(coords[i], { lat: Number(stop.lat), lng: Number(stop.lng) });
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    let along = 0;
+    for (let i = 1; i <= bestIdx; i += 1) along += distanceMetersFn(coords[i - 1], coords[i]);
+    return Math.max(0, along - Number(mission.progressMeters || 0));
+  }
+
+  function etaMinutesFromDistance(distanceMeters, speedKmh) {
+    const meters = Number(distanceMeters);
+    const speed = Number(speedKmh);
+    if (!(meters > 0)) return 0;
+    if (!(speed > 0.2)) return null;
+    return (meters / 1000) / speed * 60;
+  }
+
+  /** Cập nhật nextStop* + remaining* cho FE (snapshot/SSE). */
+  function refreshNextStopInfo(mission, nowMs = Date.now()) {
+    if (!mission) return;
+    const remainingMeters = Math.max(
+      0,
+      Number(mission.lengthMeters || 0) - Number(mission.progressMeters || 0),
+    );
+    mission.remainingDistanceKm = remainingMeters / 1000;
+
+    const arrMs = parseTimeMs(mission.arrivalTime);
+    if (Number.isFinite(arrMs)) {
+      mission.remainingEtaMin = Math.max(0, (arrMs - nowMs) / 60000);
+    } else {
+      const bySpeed = etaMinutesFromDistance(
+        remainingMeters,
+        Number(mission.speedKmh) || Number(mission.requiredSpeedKmh) || 0,
+      );
+      mission.remainingEtaMin = bySpeed;
+    }
+
+    const stops = mission.stops || [];
+    let idx = Number(mission.stopIndex) || 0;
+    // Đang chờ tại bến → next là bến hiện tại (0 km) hoặc bến kế.
+    let next = null;
+    if (mission.status === 'WaitingAtStop' && stops[idx]) {
+      next = stops[idx];
+    } else {
+      while (idx < stops.length && nearStop(mission, stops[idx], STOP_ARRIVED_M * 1.2)) {
+        idx += 1;
+      }
+      next = stops[idx] || null;
+    }
+
+    if (!next && remainingMeters > 8) {
+      // Không có stops — coi đích cuối tuyến là “bến tiếp theo”.
+      mission.nextStationId = null;
+      mission.nextStopCode = mission.routeCode || 'END';
+      mission.nextStopName = 'Đích tuyến';
+      mission.nextStopDistanceKm = mission.remainingDistanceKm;
+      mission.nextStopEtaMin = mission.remainingEtaMin;
+      mission.nextStopPlannedArrivalAt = mission.arrivalTime || null;
+      mission.movementStatus = movementStatusFor(mission);
+      return;
+    }
+    if (!next) {
+      mission.nextStationId = null;
+      mission.nextStopCode = null;
+      mission.nextStopName = null;
+      mission.nextStopDistanceKm = 0;
+      mission.nextStopEtaMin = 0;
+      mission.nextStopPlannedArrivalAt = null;
+      mission.movementStatus = movementStatusFor(mission);
+      return;
+    }
+
+    const along = alongMetersToStop(mission, next);
+    const straight = Number.isFinite(Number(next.lat)) && Number.isFinite(Number(next.lng))
+      ? distanceMetersFn(
+        { lat: mission.currentLat, lng: mission.currentLng },
+        { lat: Number(next.lat), lng: Number(next.lng) },
+      )
+      : null;
+    const metersToNext = along != null && along > 0
+      ? along
+      : (straight != null ? straight : remainingMeters);
+
+    mission.nextStationId = next.stationId || next.stationCode || null;
+    mission.nextStopCode = next.stationCode || next.stationId || null;
+    mission.nextStopName = next.stationName || next.stationCode || 'Bến kế';
+    mission.nextStopDistanceKm = Math.max(0, metersToNext) / 1000;
+    mission.nextStopPlannedArrivalAt = next.plannedArrivalTime || null;
+
+    const planArr = parseTimeMs(next.plannedArrivalTime);
+    if (Number.isFinite(planArr)) {
+      mission.nextStopEtaMin = Math.max(0, (planArr - nowMs) / 60000);
+    } else {
+      const speedForEta = Number(mission.speedKmh) > 0.5
+        ? Number(mission.speedKmh)
+        : (Number(mission.requiredSpeedKmh) || Number(mission.maxSpeedKmh) || 16);
+      mission.nextStopEtaMin = etaMinutesFromDistance(metersToNext, speedForEta);
+    }
+    mission.movementStatus = movementStatusFor(mission);
   }
 
   async function publishTripPoint(mission, { speedKmh, status }) {
@@ -353,6 +575,13 @@ export function createTripAutorun(ctx) {
       status,
       tripId: mission.tripId,
       routeCode: mission.routeCode,
+      nextStationId: mission.nextStationId || null,
+      remainingDistanceKmToNextStation: Number.isFinite(Number(mission.nextStopDistanceKm))
+        ? Number(mission.nextStopDistanceKm)
+        : null,
+      remainingMinutesToNextStation: Number.isFinite(Number(mission.nextStopEtaMin))
+        ? Number(mission.nextStopEtaMin)
+        : null,
       sendToTarget: true,
       fromTrip: true,
     });
@@ -368,10 +597,14 @@ export function createTripAutorun(ctx) {
     mission.completeSent = true;
     mission.status = 'Completed';
     mission.speedKmh = 0;
+    mission.movementStatus = 'Completed';
     mission.completedAt = new Date().toISOString();
     mission.updatedAt = mission.completedAt;
     await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
-    const complete = await completeTripOnBe(mission.tripId);
+    const complete = await completeTripOnBe(mission.tripId, {
+      boatCode: mission.boatCode,
+      completedAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
+    });
     if (!complete.ok) {
       mission.lastError = complete.error || `complete ${complete.status}`;
       mission.completeSent = false; // cho phép retry tick sau
@@ -387,6 +620,8 @@ export function createTripAutorun(ctx) {
     if (isBoatInActiveRescueMission(mission.boatCode) || hasOpenIncidentForBoat(mission.boatCode)) {
       mission.status = 'Paused';
       mission.speedKmh = 0;
+      refreshNextStopInfo(mission, nowMs);
+      await maybeEmitStopEvents(mission);
       mission.updatedAt = new Date().toISOString();
       return;
     }
@@ -411,6 +646,8 @@ export function createTripAutorun(ctx) {
         { ...mission, progressMeters: 0 },
         depMs,
       );
+      refreshNextStopInfo(mission, nowMs);
+      await maybeEmitStopEvents(mission);
       await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
       mission.lastTickAt = nowMs;
       return;
@@ -426,6 +663,8 @@ export function createTripAutorun(ctx) {
         mission.status = 'WaitingAtStop';
         mission.stopIndex = stopIndex;
         mission.speedKmh = 0;
+        refreshNextStopInfo(mission, nowMs);
+        await maybeEmitStopEvents(mission);
         await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
         mission.lastTickAt = nowMs;
         return;
@@ -463,6 +702,8 @@ export function createTripAutorun(ctx) {
     mission.lastHeading = point.heading || mission.lastHeading || 0;
 
     const arrived = mission.progressMeters >= (Number(mission.lengthMeters) - 8);
+    refreshNextStopInfo(mission, nowMs);
+    await maybeEmitStopEvents(mission);
     await publishTripPoint(mission, {
       speedKmh: arrived ? 0 : speed,
       status: arrived ? 'idle' : 'moving',
@@ -552,4 +793,10 @@ function round1(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 10) / 10;
+}
+
+function round3(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 1000) / 1000;
 }

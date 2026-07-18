@@ -1734,6 +1734,15 @@ async function publishLiveGpsPosition(body = {}) {
   const routeCode = fromTrip
     ? (cleanOptionalText(body.routeCode) || null)
     : null;
+  const nextStationId = fromTrip
+    ? (cleanOptionalText(body.nextStationId) || null)
+    : null;
+  const remainingDistanceKmToNextStation = fromTrip && Number.isFinite(Number(body.remainingDistanceKmToNextStation))
+    ? round(Number(body.remainingDistanceKmToNextStation), 3)
+    : null;
+  const remainingMinutesToNextStation = fromTrip && Number.isFinite(Number(body.remainingMinutesToNextStation))
+    ? round(Number(body.remainingMinutesToNextStation), 1)
+    : null;
 
   const sequence = bumpDeviceSequence(deviceId, matched || null);
   const payload = {
@@ -1745,6 +1754,9 @@ async function publishLiveGpsPosition(body = {}) {
     tripId,
     routeId: null,
     routeCode,
+    nextStationId,
+    remainingDistanceKmToNextStation,
+    remainingMinutesToNextStation,
     lat: round(lat, 7),
     lng: round(lng, 7),
     speedKmh: round(speedKmh, 1),
@@ -1953,12 +1965,16 @@ function sanitizeGpsPayloadForAzure(payload, { keepTrip = false } = {}) {
   const out = { ...payload };
   if (keepTrip) {
     out.routeId = null;
+    // Giữ tripId + nextStation + ETA/km theo contract BE.
     return out;
   }
   if (parseBool(env.AZURE_GPS_OMIT_ROUTE ?? 'true')) {
     out.routeId = null;
     out.routeCode = null;
     out.tripId = null;
+    out.nextStationId = null;
+    out.remainingDistanceKmToNextStation = null;
+    out.remainingMinutesToNextStation = null;
   }
   return out;
 }

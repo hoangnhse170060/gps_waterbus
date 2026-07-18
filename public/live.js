@@ -1,4 +1,5 @@
-const SNAP_STATION_M = 60;
+// Chỉ coi "đã cập bến" khi sát marker bến (trước 60m báo sớm khi còn ngoài sông).
+const SNAP_STATION_M = 28;
 const APPROACH_M = 180;
 const SIGNAL_TTL_MS = 120_000;
 const HEARTBEAT_MS = 5000;
@@ -1023,6 +1024,23 @@ function phaseStatusText(code, lat, lng) {
   const rescueLabel = rescuePhaseLabel(code);
   if (rescueLabel) return rescueLabel;
 
+  const trip = activeTripForBoat(code);
+  if (trip) {
+    const spd = Number.isFinite(Number(trip.speedKmh)) ? Math.round(Number(trip.speedKmh)) : 0;
+    const nextLabel = tripNextStopLabel(trip);
+    if (trip.status === 'Boarding') {
+      return nextLabel ? `Trip · chờ xuất bến · ${nextLabel}` : `Trip · chờ xuất bến · ${spd} km/h`;
+    }
+    if (trip.status === 'WaitingAtStop') {
+      return nextLabel ? `Trip · chờ bến · ${nextLabel}` : `Trip · chờ bến · ${spd} km/h`;
+    }
+    if (trip.status === 'Paused') return 'Trip · tạm dừng (cứu hộ)';
+    if (trip.status === 'Running') {
+      return nextLabel ? `Trip · ${nextLabel} · ${spd} km/h` : `Trip · đang chạy · ${spd} km/h`;
+    }
+    return nextLabel ? `Trip · ${trip.status} · ${nextLabel}` : `Trip · ${trip.status} · ${spd} km/h`;
+  }
+
   const phase = autoPhaseForBoat(code, lat, lng);
   const dbLabel = boatDbStatusLabel(code);
   if (phase === 'incident') {
@@ -1215,6 +1233,16 @@ function updateDeviceHint() {
     deviceHintEl.className = 'live-hint';
     return;
   }
+  const trip = activeTripForBoat(code);
+  if (trip) {
+    const spd = Number.isFinite(Number(trip.speedKmh)) ? Math.round(Number(trip.speedKmh)) : 0;
+    const nextLabel = tripNextStopLabel(trip);
+    deviceHintEl.textContent = nextLabel
+      ? `${code} · trip ${trip.status} · ${nextLabel} · ${spd} km/h`
+      : `${code} · trip ${trip.status} · tốc độ GPS ${spd} km/h (tự theo lịch)`;
+    deviceHintEl.className = 'live-hint is-ok';
+    return;
+  }
   const device = deviceForBoat(code);
   const unlocked = canDragBoat(code);
   const lockText = unlocked ? 'đã mở khóa — kéo được' : 'đang khóa — chuột phải → Mở khóa kéo';
@@ -1225,6 +1253,47 @@ function updateDeviceHint() {
     deviceHintEl.textContent = `${code} · chưa thấy gps_devices · ${lockText}.`;
     deviceHintEl.className = 'live-hint is-warn';
   }
+}
+
+function activeTripForBoat(code, data = latest) {
+  const key = String(code || '').trim();
+  if (!key) return null;
+  const list = Array.isArray(data?.tripMissions) ? data.tripMissions : [];
+  return list.find((row) => {
+    if (String(row.boatCode || '').trim() !== key) return false;
+    return ['Pending', 'Boarding', 'Running', 'WaitingAtStop', 'Paused'].includes(String(row.status || ''));
+  }) || null;
+}
+
+/** Ví dụ: "Ba Son · 1.2 km · ~8p" */
+function tripNextStopLabel(trip) {
+  if (!trip) return '';
+  const name = String(trip.nextStopName || trip.nextStopCode || '').trim();
+  const km = Number(trip.nextStopDistanceKm);
+  const eta = Number(trip.nextStopEtaMin);
+  const parts = [];
+  if (name) parts.push(name);
+  if (Number.isFinite(km)) {
+    parts.push(km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km < 10 ? 1 : 0)} km`);
+  }
+  if (Number.isFinite(eta)) {
+    parts.push(eta < 1 ? '<1p' : `~${Math.round(eta)}p`);
+  }
+  return parts.join(' · ');
+}
+
+/** Ưu tiên tốc độ trip GPS / hub; fallback tốc độ kéo tay local. */
+function displaySpeedKmh(code, data = latest) {
+  const trip = activeTripForBoat(code, data);
+  if (trip && Number.isFinite(Number(trip.speedKmh))) {
+    return Math.max(0, Math.round(Number(trip.speedKmh)));
+  }
+  const hub = (data?.hubBoats || []).find((b) => String(b.boatCode || '').trim() === String(code || '').trim());
+  const hubSpeed = Number(hub?.speedKmh);
+  if (Number.isFinite(hubSpeed) && hubSpeed > 0) {
+    return Math.max(0, Math.round(hubSpeed));
+  }
+  return getBoatSpeedKmh(code);
 }
 
 function canDragBoat(code) {
@@ -1364,11 +1433,20 @@ async function rotateBoatBy(code, deltaDeg) {
 function syncBoatControls() {
   const code = selectedBoatCode;
   const disabled = !code;
+  const trip = activeTripForBoat(code);
   if (incidentBtn) incidentBtn.disabled = disabled;
   if (speedInputEl) {
-    speedInputEl.disabled = disabled;
-    if (code) speedInputEl.value = String(getBoatSpeedKmh(code));
-    else speedInputEl.value = String(DEFAULT_SPEED_KMH);
+    if (trip) {
+      // GPS tự điều tốc theo lịch — chỉ hiển thị, không sửa tay.
+      speedInputEl.disabled = true;
+      speedInputEl.value = String(displaySpeedKmh(code));
+      speedInputEl.title = `GPS tự điều theo lịch (${trip.status})`;
+    } else {
+      speedInputEl.disabled = disabled;
+      speedInputEl.title = '';
+      if (code) speedInputEl.value = String(getBoatSpeedKmh(code));
+      else speedInputEl.value = String(DEFAULT_SPEED_KMH);
+    }
   }
   for (const btn of [
     rotateLeftBtn, rotateRightBtn, headNorthBtn, headSouthBtn, headEastBtn, headWestBtn,
@@ -1381,6 +1459,7 @@ function syncBoatControls() {
       : 'Phím ← → xoay · ↑ Bắc · ↓ Nam (khi đã chọn tàu).';
   }
   updateIncidentButton();
+  updateDeviceHint();
 }
 
 function updateIncidentButton() {
@@ -2450,6 +2529,11 @@ map.on('movestart zoomstart click', hideBoatContextMenu);
 
 speedInputEl?.addEventListener('change', () => {
   if (!selectedBoatCode) return;
+  if (activeTripForBoat(selectedBoatCode)) {
+    speedInputEl.value = String(displaySpeedKmh(selectedBoatCode));
+    toast('Đang chạy trip — GPS tự điều tốc, không chỉnh tay', 'warn');
+    return;
+  }
   const value = setBoatSpeedKmh(selectedBoatCode, speedInputEl.value);
   speedInputEl.value = String(value);
   toast(`${boatDisplayName(selectedBoatCode)} · ${value} km/h`, 'ok');
@@ -2457,6 +2541,10 @@ speedInputEl?.addEventListener('change', () => {
 
 speedInputEl?.addEventListener('input', () => {
   if (!selectedBoatCode) return;
+  if (activeTripForBoat(selectedBoatCode)) {
+    speedInputEl.value = String(displaySpeedKmh(selectedBoatCode));
+    return;
+  }
   setBoatSpeedKmh(selectedBoatCode, speedInputEl.value);
 });
 
