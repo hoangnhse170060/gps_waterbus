@@ -341,13 +341,13 @@ setInterval(() => {
   tripAutorun.tickTripMissions().catch((error) => {
     console.warn(`[trip-gps] tick: ${error.message}`);
   });
-}, Math.max(1000, Number(env.TRIP_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
+}, Math.max(1000, Number(env.TRIP_GPS_INTERVAL_MS || 1000)));
 // Seed poll due sau khi server lên.
 setTimeout(() => {
   tripAutorun.pollDueTrips().catch((error) => {
     console.warn(`[trip-gps] seed: ${error.message}`);
   });
-}, 4000);
+}, 2000);
 
 const server = createServer(async (req, res) => {
   try {
@@ -5795,7 +5795,7 @@ function publicConfig() {
     openIncidentCount: state.openIncidents.size,
     tripAutorun: parseBool(env.TRIP_AUTORUN ?? 'true'),
     tripDuePollMs: Number(env.TRIP_DUE_POLL_MS || 30000),
-    tripGpsIntervalMs: Number(env.TRIP_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000),
+    tripGpsIntervalMs: Number(env.TRIP_GPS_INTERVAL_MS || 1000),
     tripLookaheadMinutes: Number(env.TRIP_LOOKAHEAD_MINUTES || 120),
     activeTripCount: [...state.tripMissions.values()]
       .filter((m) => !['Completed'].includes(String(m.status || ''))).length,

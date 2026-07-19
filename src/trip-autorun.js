@@ -836,6 +836,12 @@ export function createTripAutorun(ctx) {
       `[trip-gps] START ${boatCode} trip=${tripId} · ${mission.status} `
       + `${Math.round(lengthMeters)}m · tới bến XP ${Math.round(distToDep)}m · dep ${departureTime || '?'}`,
     );
+    // Chạy ngay ≤1s — không chờ interval tick sau.
+    setTimeout(() => {
+      tickOneMission(mission, Date.now()).catch((error) => {
+        console.warn(`[trip-gps] first-tick ${tripId}: ${error.message}`);
+      });
+    }, 0);
     return mission;
   }
 
