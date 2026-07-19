@@ -1078,7 +1078,7 @@ function upsertHubBoat(payload) {
   });
   // Chỉ giữ quyền Live khi user kéo / trip / rescue — không phải heartbeat quiet.
   if (forceAccept && payload.holdAuthority === true) {
-    hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 8000));
+    hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 30_000));
   }
   rememberLastPosition(code, state.hubBoats.get(code));
   // Đồng bộ lat/lng vào state.boats — snapshot/FE không còn dùng vị trí stagger route giả.
@@ -1875,7 +1875,9 @@ async function publishLiveGpsPosition(body = {}) {
   };
 
   // Optimistic local hub marker (SSE) — BE sẽ đồng bộ lại qua SignalR / boats/latest.
-  hubBoatSuppressUntil.delete(boatCode);
+  // Chặn Azure echo cũ trong cửa sổ authority (tránh kéo xong bị kéo về chỗ cũ).
+  const authMs = Number(env.HUB_LIVE_AUTHORITY_MS || 30_000);
+  hubBoatSuppressUntil.set(boatCode, Date.now() + Math.max(authMs, 8_000));
   const allowAzureWrite = liveAzureWriteEnabled();
   // Local follow-only: CHỈ cập nhật hub khi user kéo tay / trip / rescue.
   // Heartbeat (kể cả FE cũ thiếu quiet) không được đè Azure → tránh lệch Railway.
@@ -6081,13 +6083,14 @@ function shouldForceAcceptAzurePosition(payload) {
   const code = String(payload?.boatCode || payload?.BoatCode || '').trim();
   if (!code) return false;
   if (activeSurveyBoatCode() === code) return false;
+  // Vừa kéo tay / trip / rescue — KHÔNG forceAccept Azure cũ (kể cả local follow-only).
+  const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
+  if (liveAuthUntil > Date.now()) return false;
   // Local follow-only: luôn nhận Azure (kể cả đang trip/rescue) để map/FE đồng bộ.
   if (!liveAzureWriteEnabled()) return true;
   // Railway đang tự chạy trip/rescue: bỏ echo Azure cũ, giữ authority tick.
   if (isBoatInActiveRescueMission(code)) return false;
   if (tripAutorun.isBoatInActiveTripMission(code)) return false;
-  const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
-  if (liveAuthUntil > Date.now()) return false;
   return true;
 }
 
