@@ -1801,28 +1801,10 @@ async function publishLiveGpsPosition(body = {}) {
     };
   }
 
-  // FE heartbeat / Gửi GPS tay không được đè SOS đang cứu hộ (kéo về bến).
+  // Chỉ tạm dừng Live GPS khi đang vẽ/survey. Trip + cứu hộ vẫn phải gửi liên tục
+  // để FE (LIVE TRACKING) luôn thấy tàu — heartbeat/rescue/trip cùng publish.
   const fromRescue = body.fromRescue === true || body._fromRescue === true;
   const fromTrip = body.fromTrip === true || body._fromTrip === true;
-  if (!fromRescue && isBoatInActiveRescueMission(boatCode)) {
-    return {
-      ok: true,
-      skipped: true,
-      status: 200,
-      mode: 'rescue-owned',
-      warning: `Đang cứu hộ tự động — bỏ qua GPS tay/heartbeat cho ${boatCode}`,
-    };
-  }
-  // Trip autorun sở hữu GPS khi đang chạy lịch (trừ chính tick trip).
-  if (!fromTrip && !fromRescue && tripAutorun.isBoatInActiveTripMission(boatCode)) {
-    return {
-      ok: true,
-      skipped: true,
-      status: 200,
-      mode: 'trip-owned',
-      warning: `Đang chạy trip theo lịch — bỏ qua GPS tay/heartbeat cho ${boatCode}`,
-    };
-  }
 
   const matched = [...state.boats.values()].find((boat) => (
     String(boat.boatCode) === boatCode
@@ -5959,10 +5941,11 @@ function shouldForceAcceptAzurePosition(payload) {
   const code = String(payload?.boatCode || payload?.BoatCode || '').trim();
   if (!code) return false;
   if (activeSurveyBoatCode() === code) return false;
+  // Local follow-only: luôn nhận Azure (kể cả đang trip/rescue) để map/FE đồng bộ.
+  if (!liveAzureWriteEnabled()) return true;
+  // Railway đang tự chạy trip/rescue: bỏ echo Azure cũ, giữ authority tick.
   if (isBoatInActiveRescueMission(code)) return false;
   if (tripAutorun.isBoatInActiveTripMission(code)) return false;
-  // Local follow-only: luôn nhận Azure (không bị liveAuth heartbeat chặn).
-  if (!liveAzureWriteEnabled()) return true;
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (liveAuthUntil > Date.now()) return false;
   return true;
