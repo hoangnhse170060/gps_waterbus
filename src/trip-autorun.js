@@ -242,6 +242,11 @@ export function createTripAutorun(ctx) {
     }).sort((a, b) => a.stopOrder - b.stopOrder);
   }
 
+  function tripSnapToRiverEnabled() {
+    // Mặc định OFF — tàu phải bám đúng đường đã vẽ (routeGeometry / Neon), không ép OSM corridor.
+    return String(env.TRIP_SNAP_TO_RIVER || '').trim().toLowerCase() === 'true';
+  }
+
   function resolveCoordinatesForTrip(row) {
     let fromPayload = parseTripCoordinates(
       row.routeGeometry || row.RouteGeometry || row.geometry || row.coordinates,
@@ -250,7 +255,7 @@ export function createTripAutorun(ctx) {
     if (fromPayload.length >= 2) {
       const len = routeLengthFn(fromPayload);
       if (len > 0 && len <= 80_000) {
-        return snapTripPathToRiver(fromPayload, normalizeStops(row.stops || row.Stops || []));
+        return maybeSnapTripPath(fromPayload, normalizeStops(row.stops || row.Stops || []));
       }
       console.warn(`[trip-gps] routeGeometry bất thường ${Math.round(len)}m — fallback Neon`);
       fromPayload = [];
@@ -265,13 +270,18 @@ export function createTripAutorun(ctx) {
         .map((p) => sanitizeLatLng(p.lat, p.lng))
         .filter(Boolean);
       if (cleaned.length >= 2) {
-        return snapTripPathToRiver(cleaned, normalizeStops(row.stops || row.Stops || []));
+        return maybeSnapTripPath(cleaned, normalizeStops(row.stops || row.Stops || []));
       }
     }
     return fromPayload;
   }
 
-  /** Ép tuyến trip lên vạch sông — không đâm nhánh V vào từng cầu tàu. */
+  function maybeSnapTripPath(coordinates, stops = []) {
+    if (!tripSnapToRiverEnabled()) return coordinates;
+    return snapTripPathToRiver(coordinates, stops);
+  }
+
+  /** Optional: ép tuyến trip lên vạch sông (TRIP_SNAP_TO_RIVER=true). Mặc định giữ path vẽ. */
   function snapTripPathToRiver(coordinates, stops = []) {
     const base = resolveRiverBasePath({
       stations: state.stations || [],
@@ -315,9 +325,13 @@ export function createTripAutorun(ctx) {
     return out;
   }
 
-  /** Trip đang chạy với path cũ (có V vào bến) → ép lại lên corridor một lần. */
+  /** Mission cũ: chỉ snap corridor khi bật TRIP_SNAP_TO_RIVER. */
   function ensureMissionCorridorPath(mission) {
     if (!mission || mission.corridorSnapped) return;
+    if (!tripSnapToRiverEnabled()) {
+      mission.corridorSnapped = true;
+      return;
+    }
     const snapped = snapTripPathToRiver(mission.coordinates || [], mission.stops || []);
     if (snapped.length < 2) {
       mission.corridorSnapped = true;
@@ -335,7 +349,7 @@ export function createTripAutorun(ctx) {
     mission.lastHeading = point.heading || mission.lastHeading || 0;
     mission.corridorSnapped = true;
     console.log(
-      `[trip-gps] ${mission.boatCode} path bo sông (no pier-V): ${snapped.length} pts · ${Math.round(mission.lengthMeters)}m`,
+      `[trip-gps] ${mission.boatCode} path bo sông (TRIP_SNAP_TO_RIVER): ${snapped.length} pts · ${Math.round(mission.lengthMeters)}m`,
     );
   }
 

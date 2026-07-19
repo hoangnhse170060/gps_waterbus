@@ -8,6 +8,12 @@
   font-family: "Be Vietnam Pro", ui-sans-serif, system-ui, sans-serif;
 }
 
+/* styles.css sets button { display: inline-grid } which overrides [hidden] →
+   legacy hook buttons (Báo sự cố, xoay…) leaked as a teal strip under the map. */
+.live-page [hidden] {
+  display: none !important;
+}
+
 .live-shell {
   position: relative;
   width: 100%;
