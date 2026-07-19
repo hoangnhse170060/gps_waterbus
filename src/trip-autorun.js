@@ -1046,16 +1046,12 @@ export function createTripAutorun(ctx) {
     mission.nextStopDistanceKm = Math.max(0, metersToNext) / 1000;
     mission.nextStopPlannedArrivalAt = next.plannedArrivalTime || null;
 
-    const planArr = parseTimeMs(next.plannedArrivalTime);
+    // remainingMinutes = ETA di chuyển (quãng đường / tốc độ), không phải countdown lịch.
+    // Lịch kế hoạch FE lấy từ /operations/schedule.
     const speedForEta = Number(mission.speedKmh) > 0.5
       ? Number(mission.speedKmh)
       : (Number(mission.requiredSpeedKmh) || Number(mission.maxSpeedKmh) || 16);
-    if (Number.isFinite(planArr) && planArr > nowMs) {
-      mission.nextStopEtaMin = Math.max(0, (planArr - nowMs) / 60000);
-    } else {
-      // Lịch quá khứ / thiếu → ETA theo quãng đường & tốc độ thực.
-      mission.nextStopEtaMin = etaMinutesFromDistance(metersToNext, speedForEta);
-    }
+    mission.nextStopEtaMin = etaMinutesFromDistance(metersToNext, speedForEta);
     mission.movementStatus = movementStatusFor(mission);
   }
 
