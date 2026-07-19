@@ -462,6 +462,7 @@ export function createTripAutorun(ctx) {
     const key = `${stationId}:${event}`;
     if (mission.stopEventsSent.has(key)) return { ok: true, skipped: true, reason: 'already-sent' };
 
+    const dist = distanceForStopEvent(mission, stop);
     const result = await requestTargetApi({
       method: 'POST',
       pathname: stopEventPath(tripId, stationId),
@@ -469,6 +470,20 @@ export function createTripAutorun(ctx) {
         boatCode,
         event,
         occurredAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
+        stationId,
+        stationCode: cleanOptionalText(stop.stationCode) || null,
+        stationName: cleanOptionalText(stop.stationName) || null,
+        distanceMeters: Number.isFinite(dist) ? Math.round(dist) : null,
+        lat: Number.isFinite(Number(mission.currentLat)) ? Number(mission.currentLat) : null,
+        lng: Number.isFinite(Number(mission.currentLng)) ? Number(mission.currentLng) : null,
+        plannedArrivalTime: stop.plannedArrivalTime || null,
+        plannedDepartureTime: stop.plannedDepartureTime || null,
+        remainingDistanceKmToNextStation: Number.isFinite(Number(mission.nextStopDistanceKm))
+          ? Number(mission.nextStopDistanceKm)
+          : null,
+        remainingMinutesToNextStation: Number.isFinite(Number(mission.nextStopEtaMin))
+          ? Number(mission.nextStopEtaMin)
+          : null,
       },
       auth: 'hook',
     });
@@ -489,7 +504,30 @@ export function createTripAutorun(ctx) {
     );
   }
 
-  /** Contract: Arriving → Arrived → Departed theo bán kính bến. */
+  /** Khoảng cách tới bến: min(đường thẳng, điểm chiếu trên path) — tàu giữa sông vẫn kịp Arriving/Arrived. */
+  function distanceForStopEvent(mission, stop) {
+    const straight = distanceToStopMeters(mission, stop);
+    const coords = mission.coordinates || [];
+    if (
+      coords.length >= 2
+      && Number.isFinite(Number(stop?.lat))
+      && Number.isFinite(Number(stop?.lng))
+    ) {
+      const stopPt = { lat: Number(stop.lat), lng: Number(stop.lng) };
+      const proj = projectOnPath(coords, stopPt);
+      if (proj && Number.isFinite(Number(proj.alongMeters))) {
+        const alongDist = Math.abs((Number(mission.progressMeters) || 0) - Number(proj.alongMeters));
+        const toProj = distanceMetersFn(
+          { lat: mission.currentLat, lng: mission.currentLng },
+          { lat: proj.lat, lng: proj.lng },
+        );
+        return Math.min(straight, alongDist, toProj);
+      }
+    }
+    return straight;
+  }
+
+  /** Contract: Arriving → Arrived → Departed theo bán kính bến (+ thời gian occurredAt). */
   async function maybeEmitStopEvents(mission) {
     const stops = mission.stops || [];
     if (!stops.length) return;
@@ -498,17 +536,18 @@ export function createTripAutorun(ctx) {
     for (const stop of stops) {
       const stationId = cleanOptionalText(stop.stationId || stop.stationCode);
       if (!stationId) continue;
-      const dist = distanceToStopMeters(mission, stop);
+      const dist = distanceForStopEvent(mission, stop);
       if (dist <= STOP_ARRIVING_M) {
         await postStopEvent(mission, stop, 'Arriving');
       }
-      if (dist <= STOP_ARRIVED_M) {
+      if (dist <= STOP_ARRIVED_M || nearStop(mission, stop, STOP_ARRIVED_M)) {
         await postStopEvent(mission, stop, 'Arrived');
         mission.atStationId = stationId;
       }
       if (
         mission.atStationId === stationId
         && dist > STOP_DEPART_M
+        && !nearStop(mission, stop, STOP_ARRIVED_M)
         && mission.stopEventsSent.has(`${stationId}:Arrived`)
       ) {
         await postStopEvent(mission, stop, 'Departed');
