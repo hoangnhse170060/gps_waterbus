@@ -2,11 +2,13 @@
 const SNAP_STATION_M = 28;
 const APPROACH_M = 180;
 const SIGNAL_TTL_MS = 120_000;
-const HEARTBEAT_MS = 5000;
+const HEARTBEAT_MS = 2000;
 const CLUSTER_M = 25;
 /** Giữ pin kéo tay khi hub/Azure chưa kịp (tránh nhảy về chỗ cũ). */
 const USER_PIN_HOLD_MS = 120_000;
 const USER_PIN_HUB_CATCHUP_M = 40;
+/** Khi kéo tay: gửi GPS lên Azure tối thiểu mỗi khoảng này để FE bám kịp. */
+const DRAG_SEND_MS = 800;
 const ROUTE_STYLE = {
   color: '#0f766e',
   weight: 2.5,
@@ -89,6 +91,8 @@ let contextMenuBoatCode = '';
 let sending = false;
 let dragging = false;
 let draggingBoatCode = '';
+let lastDragSendAt = 0;
+let lastDragSentKey = '';
 let hasFitRoutes = false;
 let heartbeatTimer = null;
 let heartbeatBusy = false;
@@ -1894,6 +1898,9 @@ function bindDragHandlers(marker, code) {
     const { lat, lng } = marker.getLatLng();
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
     if (boatPhaseStatusEl) boatPhaseStatusEl.textContent = phaseStatusText(code, lat, lng) || '—';
+    // Gửi GPS khi đang kéo (throttle) — FE Live Tracking bám realtime như trước.
+    pinBoatPosition(code, lat, lng, { user: true });
+    void sendDragGpsThrottled(code, lat, lng);
   });
   marker.on('dragend', async () => {
     if (!canDragBoat(code) && !dragging) return;
@@ -1926,8 +1933,31 @@ function bindDragHandlers(marker, code) {
     if (boatRouteStatusEl) {
       boatRouteStatusEl.textContent = routeLabelForBoat(code) || 'Chưa gán lộ trình';
     }
-    await sendLiveGps(code, lat, lng);
+    // Burst gửi ngay — FE nhận nhanh hơn chờ heartbeat.
+    await sendLiveGps(code, lat, lng, { holdAuthority: true });
+    setTimeout(() => {
+      sendLiveGps(code, lat, lng, { quiet: true, holdAuthority: true }).catch(() => {});
+    }, 350);
+    setTimeout(() => {
+      sendLiveGps(code, lat, lng, { quiet: true, holdAuthority: true }).catch(() => {});
+    }, 900);
   });
+}
+
+async function sendDragGpsThrottled(code, lat, lng) {
+  const key = String(code || '').trim();
+  if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const now = Date.now();
+  const same = lastDragSentKey === `${key}:${lat.toFixed(5)},${lng.toFixed(5)}`;
+  if (same && now - lastDragSendAt < DRAG_SEND_MS) return;
+  if (!same && now - lastDragSendAt < Math.min(400, DRAG_SEND_MS)) return;
+  lastDragSendAt = now;
+  lastDragSentKey = `${key}:${lat.toFixed(5)},${lng.toFixed(5)}`;
+  try {
+    await sendLiveGps(key, lat, lng, { quiet: true, holdAuthority: true });
+  } catch {
+    // ignore throttle errors
+  }
 }
 
 async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = null } = {}) {
@@ -2120,18 +2150,35 @@ function renderGpsScan(scan) {
 }
 
 async function heartbeatAllBoats() {
-  // Gửi GPS liên tục mọi tàu (kể cả đang trip / sắp cập bến) — không để "Chưa gửi".
-  if (heartbeatBusy || dragging || sending) return;
+  // Gửi GPS liên tục mọi tàu — vẫn chạy khi đang kéo tàu khác.
+  if (heartbeatBusy || sending) return;
   heartbeatBusy = true;
   const results = [];
   try {
     const surveyCode = activeSurveyBoatCode();
-    const codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
+    let codes = catalogBoats().map((b) => String(b.boatCode).trim()).filter(Boolean);
+    // Ưu tiên tàu đang chọn / vừa kéo — FE nhận nhanh hơn.
+    const priority = String(draggingBoatCode || selectedBoatCode || '').trim();
+    if (priority && codes.includes(priority)) {
+      codes = [priority, ...codes.filter((c) => c !== priority)];
+    }
     if (gpsScanSummaryEl) {
       gpsScanSummaryEl.textContent = `Đang quét ${codes.length} tàu…`;
     }
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
+      // Đang kéo đúng tàu này: drag throttle lo gửi — skip heartbeat trùng.
+      if (dragging && draggingBoatCode === code) {
+        results.push({
+          boatCode: code,
+          ok: true,
+          skipped: true,
+          reason: 'dragging',
+          status: 200,
+          error: null,
+        });
+        continue;
+      }
       if (surveyCode && code === surveyCode) {
         results.push({
           boatCode: code,
@@ -2176,7 +2223,7 @@ async function heartbeatAllBoats() {
         sequence: result?.sequence || null,
         error: result?.error || null,
       });
-      await new Promise((r) => setTimeout(r, 120));
+      await new Promise((r) => setTimeout(r, 80));
     }
     renderGpsScan({ at: Date.now(), results });
     if (latest) renderHubBoats(latest.hubBoats);
