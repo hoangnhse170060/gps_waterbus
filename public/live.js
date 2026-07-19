@@ -17,7 +17,7 @@ const STORAGE_PINS = 'liveGpsBoatPins.v3'; // v3: luôn bám hub/Azure — bỏ 
 const STORAGE_STATUS = 'liveGpsBoatStatus.v1';
 const STORAGE_SPEEDS = 'liveGpsBoatSpeeds.v1';
 const STORAGE_RESCUE = 'liveGpsRescueMissions.v1';
-const STORAGE_HEADINGS = 'liveGpsBoatHeadings.v1';
+const STORAGE_HEADINGS = 'liveGpsBoatHeadings.v2'; // v2: bám hub/Azure — bỏ heading lệch domain
 const RESCUE_ARRIVE_M = 120;
 const DEFAULT_SPEED_KMH = 16;
 const HEADING_STEP_DEG = 15;
@@ -100,10 +100,11 @@ let snapshotPollTimer = null;
 let snapshotPollBusy = false;
 let sseAlive = false;
 const pinnedPositions = loadJsonMap(STORAGE_PINS);
-// Pin v1/v2 từng làm local ≠ Railway (mỗi domain nhớ vị trí riêng).
+// Pin/heading v1 từng làm local ≠ Railway (mỗi domain nhớ riêng).
 try {
   localStorage.removeItem('liveGpsBoatPins.v1');
   localStorage.removeItem('liveGpsBoatPins.v2');
+  localStorage.removeItem('liveGpsBoatHeadings.v1');
 } catch {
   /* ignore */
 }
@@ -1406,14 +1407,30 @@ function normalizeHeading(deg) {
 
 function getBoatHeading(code, hub = null) {
   const key = String(code || '').trim();
+  // Hub/Azure là SoT — localStorage chỉ dùng khi chưa có hub (hoặc đang xoay tay).
+  const hubRow = hub || (latest?.hubBoats || []).find((b) => String(b.boatCode) === key);
+  if (hubRow && Number.isFinite(Number(hubRow.heading))) {
+    return normalizeHeading(hubRow.heading);
+  }
   const stored = boatHeadings.get(key);
   if (stored != null && Number.isFinite(Number(stored))) return normalizeHeading(stored);
-  if (hub && Number.isFinite(Number(hub.heading))) return normalizeHeading(hub.heading);
-  const fromLatest = (latest?.hubBoats || []).find((b) => String(b.boatCode) === key);
-  if (fromLatest && Number.isFinite(Number(fromLatest.heading))) {
-    return normalizeHeading(fromLatest.heading);
-  }
   return 0;
+}
+
+/** Đồng bộ heading hiển thị từ hub — local/Railway cùng mũi tàu. */
+function syncHeadingsFromHub(hubBoats) {
+  let changed = false;
+  for (const boat of hubBoats || []) {
+    const code = String(boat?.boatCode || '').trim();
+    if (!code || !Number.isFinite(Number(boat.heading))) continue;
+    const next = normalizeHeading(boat.heading);
+    const prev = boatHeadings.get(code);
+    if (prev == null || Math.abs(normalizeHeading(prev) - next) > 0.5) {
+      boatHeadings.set(code, next);
+      changed = true;
+    }
+  }
+  if (changed) persistMap(STORAGE_HEADINGS, boatHeadings);
 }
 
 function setBoatHeading(code, deg) {
@@ -1584,6 +1601,7 @@ function renderHubBoats(hubBoats) {
   syncAutomatedRescuePins(hubBoats);
   // Đang survey: tạm ẩn tàu đó khỏi Live (Survey vẫn gửi GPS riêng).
   clearSurveyBoatFromLive();
+  syncHeadingsFromHub(hubBoats);
   const hubByCode = new Map();
   for (const boat of hubBoats || []) {
     const code = String(boat.boatCode || '').trim();

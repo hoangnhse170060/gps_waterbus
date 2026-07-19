@@ -1040,14 +1040,19 @@ function upsertHubBoat(payload) {
     return;
   }
 
-  // Đứng yên: giữ heading cũ (tránh xoay 0↔360).
+  // Đứng yên: giữ heading cũ (tránh xoay 0↔360) — TRỪ khi nhận từ Azure (SoT chung).
   let heading = incoming.heading;
+  const fromAzure = Boolean(payload.fromAzure)
+    || String(payload.source || '').startsWith('azure');
   if (
-    prev
+    !fromAzure
+    && prev
     && Number.isFinite(Number(prev.heading))
     && (incoming.speedKmh == null || incoming.speedKmh < 2)
     && (gate.moved == null || gate.moved < 8)
   ) {
+    heading = Number(prev.heading);
+  } else if (!Number.isFinite(Number(heading)) && prev && Number.isFinite(Number(prev.heading))) {
     heading = Number(prev.heading);
   }
 
