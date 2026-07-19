@@ -1043,6 +1043,7 @@ export function createTripAutorun(ctx) {
       tripId: mission.tripId,
       routeCode: mission.routeCode,
       nextStationId: mission.nextStationId || null,
+      nextStationName: mission.nextStopName || null,
       remainingDistanceKmToNextStation: Number.isFinite(Number(mission.nextStopDistanceKm))
         ? Number(mission.nextStopDistanceKm)
         : null,

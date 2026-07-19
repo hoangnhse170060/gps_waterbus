@@ -1833,6 +1833,9 @@ async function publishLiveGpsPosition(body = {}) {
   const nextStationId = fromTrip
     ? (cleanOptionalText(body.nextStationId) || null)
     : null;
+  const nextStationName = fromTrip
+    ? (cleanOptionalText(body.nextStationName) || null)
+    : null;
   const remainingDistanceKmToNextStation = fromTrip && Number.isFinite(Number(body.remainingDistanceKmToNextStation))
     ? round(Number(body.remainingDistanceKmToNextStation), 3)
     : null;
@@ -1851,6 +1854,7 @@ async function publishLiveGpsPosition(body = {}) {
     routeId: null,
     routeCode,
     nextStationId,
+    nextStationName,
     remainingDistanceKmToNextStation,
     remainingMinutesToNextStation,
     lat: round(lat, 7),
@@ -1972,6 +1976,64 @@ async function publishLiveGpsPosition(body = {}) {
         };
       }
     }
+    // 400 khi kèm ETA/nextStation: fallback chỉ vị trí để FE vẫn thấy tàu.
+    if (!ok && statusCode === 400 && fromTrip && (
+      azurePayload.nextStationId
+      || azurePayload.remainingDistanceKmToNextStation != null
+      || azurePayload.remainingMinutesToNextStation != null
+    )) {
+      const stripped = {
+        ...azurePayload,
+        nextStationId: null,
+        nextStationName: null,
+        remainingDistanceKmToNextStation: null,
+        remainingMinutesToNextStation: null,
+        tripId: null,
+        routeCode: null,
+        routeId: null,
+      };
+      try {
+        const retryRes = await fetch(getTargetEndpoint(), {
+          method: 'POST',
+          headers: buildGpsHeaders(stripped),
+          body: JSON.stringify(stripped),
+        });
+        const retryText = await retryRes.text();
+        let retryData = null;
+        if (retryText) {
+          try { retryData = JSON.parse(retryText); } catch { retryData = { message: retryText }; }
+        }
+        if (retryRes.status >= 200 && retryRes.status < 300) {
+          pushApiCallLog({
+            method: 'POST',
+            url: getTargetEndpoint(),
+            path: '/api/tracking/locations',
+            ok: true,
+            status: retryRes.status,
+            error: null,
+            at: new Date().toISOString(),
+            request: summarizeApiPayload(stripped),
+            response: summarizeApiPayload(retryData),
+            deviceId,
+          });
+          console.warn(
+            `[live-gps] ${boatCode}: BE 400 với ETA/nextStation → đã gửi lại chỉ vị trí. `
+            + 'BE cần nhận remainingMinutes/Distance/nextStation trên /locations.',
+          );
+          return {
+            ok: true,
+            soft: true,
+            status: 200,
+            azureStatus: 400,
+            sequence: payload.sequence,
+            payload: stripped,
+            warning: 'BE từ chối ETA trên locations — đã gửi vị trí; ETA chưa vào boats/latest.',
+          };
+        }
+      } catch {
+        // fall through to normal error log
+      }
+    }
     if (!ok) {
       errorText = formatTargetApiError(responseData, statusCode);
     }
@@ -2087,30 +2149,38 @@ function buildGpsHeaders(payload) {
 }
 
 /**
- * BE routes đang trống: gửi routeId/routeCode sẽ 404 → vị trí không cập nhật.
- * Mặc định luôn null trên POST /tracking/locations (tắt bằng AZURE_GPS_OMIT_ROUTE=false).
- * Trip autorun: keepTrip=true giữ tripId (+ routeCode) để BE chuyển InProgress.
+ * POST /tracking/locations:
+ * - Luôn trần speed (AZURE_MAX_SPEED_KMH).
+ * - Trip: mặc định GỬI nextStation + ETA cho FE (boats/latest), BỎ tripId/routeCode
+ *   (BE đang 400 empty body khi có tripId).
+ * - Full trip fields: AZURE_GPS_TRIP_ON_LOCATION=true
  */
 function sanitizeGpsPayloadForAzure(payload, { keepTrip = false } = {}) {
   const out = { ...payload };
-  // BE từ chối speed quá cao (400 empty body) — luôn trần AZURE_MAX_SPEED_KMH.
   const azureMaxSpeed = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
   if (Number.isFinite(Number(out.speedKmh))) {
     out.speedKmh = round(Math.min(Math.max(0, Number(out.speedKmh)), azureMaxSpeed), 1);
   }
-  if (keepTrip) {
+
+  const fullTrip = keepTrip && parseBool(env.AZURE_GPS_TRIP_ON_LOCATION ?? 'false');
+  if (fullTrip) {
     out.routeId = null;
-    // Giữ tripId + nextStation + ETA/km theo contract BE.
     return out;
   }
-  if (parseBool(env.AZURE_GPS_OMIT_ROUTE ?? 'true')) {
-    out.routeId = null;
-    out.routeCode = null;
-    out.tripId = null;
-    out.nextStationId = null;
-    out.remainingDistanceKmToNextStation = null;
-    out.remainingMinutesToNextStation = null;
+
+  out.routeId = null;
+  out.routeCode = null;
+  out.tripId = null;
+
+  if (keepTrip) {
+    // Giữ ETA / nextStation — FE đọc từ boats/latest.
+    return out;
   }
+
+  out.nextStationId = null;
+  out.nextStationName = null;
+  out.remainingDistanceKmToNextStation = null;
+  out.remainingMinutesToNextStation = null;
   return out;
 }
 
