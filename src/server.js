@@ -2093,6 +2093,11 @@ function buildGpsHeaders(payload) {
  */
 function sanitizeGpsPayloadForAzure(payload, { keepTrip = false } = {}) {
   const out = { ...payload };
+  // BE từ chối speed quá cao (400 empty body) — luôn trần AZURE_MAX_SPEED_KMH.
+  const azureMaxSpeed = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
+  if (Number.isFinite(Number(out.speedKmh))) {
+    out.speedKmh = round(Math.min(Math.max(0, Number(out.speedKmh)), azureMaxSpeed), 1);
+  }
   if (keepTrip) {
     out.routeId = null;
     // Giữ tripId + nextStation + ETA/km theo contract BE.
@@ -5005,9 +5010,13 @@ function maxSpeedForBoatCode(boatCode) {
 }
 
 function clampSpeedToBoatMax(speedKmh, maxSpeedKmh) {
-  const max = Number.isFinite(Number(maxSpeedKmh)) && Number(maxSpeedKmh) > 0
+  const boatMax = Number.isFinite(Number(maxSpeedKmh)) && Number(maxSpeedKmh) > 0
     ? Number(maxSpeedKmh)
     : 80;
+  // Trip/live thực tế không vượt trần Azure — tránh 400 + tàu bay 140km/h.
+  const azureMax = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
+  const tripMax = Math.max(1, Number(env.TRIP_MAX_SPEED_KMH || azureMax));
+  const max = Math.min(boatMax, tripMax, azureMax);
   return clamp(Number(speedKmh), 1, max);
 }
 
