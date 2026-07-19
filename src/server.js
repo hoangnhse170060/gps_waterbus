@@ -1884,16 +1884,15 @@ async function publishLiveGpsPosition(body = {}) {
   // Optimistic local hub marker (SSE) — BE sẽ đồng bộ lại qua SignalR / boats/latest.
   hubBoatSuppressUntil.delete(boatCode);
   const allowAzureWrite = liveAzureWriteEnabled();
-  const holdAuthority = body.holdAuthority === true
-    || body.fromTrip === true
-    || body.fromRescue === true
-    || body._fromTrip === true
-    || body._fromRescue === true
-    || (body.quiet !== true && body.holdAuthority !== false);
+  // Local follow-only: CHỈ cập nhật hub khi user kéo tay / trip / rescue.
+  // Heartbeat (kể cả FE cũ thiếu quiet) không được đè Azure → tránh lệch Railway.
+  const userOrMissionWrite = fromTrip || fromRescue
+    || (body.holdAuthority === true && body.quiet !== true);
+  const followOnly = !allowAzureWrite;
+  const updateLocalHub = !followOnly || userOrMissionWrite;
+  const holdAuthority = userOrMissionWrite;
 
-  // Local follow-only: heartbeat quiet không đè vị trí Azure (tránh lệch map với Railway).
-  const followOnlyQuiet = !allowAzureWrite && body.quiet === true && !fromTrip && !fromRescue;
-  if (!followOnlyQuiet) {
+  if (updateLocalHub) {
     upsertHubBoat({
       ...payload,
       isOnline: true,
@@ -1918,7 +1917,7 @@ async function publishLiveGpsPosition(body = {}) {
     return {
       ok: true,
       status: 200,
-      mode: followOnlyQuiet ? 'follow-azure' : 'local',
+      mode: followOnly ? 'follow-azure' : 'local',
       sequence: payload.sequence,
       payload,
       warning: !allowAzureWrite
@@ -5936,6 +5935,8 @@ function shouldForceAcceptAzurePosition(payload) {
   if (activeSurveyBoatCode() === code) return false;
   if (isBoatInActiveRescueMission(code)) return false;
   if (tripAutorun.isBoatInActiveTripMission(code)) return false;
+  // Local follow-only: luôn nhận Azure (không bị liveAuth heartbeat chặn).
+  if (!liveAzureWriteEnabled()) return true;
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (liveAuthUntil > Date.now()) return false;
   return true;
