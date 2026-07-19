@@ -1842,6 +1842,9 @@ async function publishLiveGpsPosition(body = {}) {
   const remainingMinutesToNextStation = fromTrip && Number.isFinite(Number(body.remainingMinutesToNextStation))
     ? round(Number(body.remainingMinutesToNextStation), 1)
     : null;
+  const plannedArrivalTime = fromTrip
+    ? (cleanOptionalText(body.plannedArrivalTime || body.nextStopPlannedArrivalAt) || null)
+    : null;
 
   const sequence = bumpDeviceSequence(deviceId, matched || null);
   const payload = {
@@ -1857,6 +1860,7 @@ async function publishLiveGpsPosition(body = {}) {
     nextStationName,
     remainingDistanceKmToNextStation,
     remainingMinutesToNextStation,
+    plannedArrivalTime,
     lat: round(lat, 7),
     lng: round(lng, 7),
     speedKmh: round(speedKmh, 1),
@@ -1981,6 +1985,7 @@ async function publishLiveGpsPosition(body = {}) {
       azurePayload.nextStationId
       || azurePayload.remainingDistanceKmToNextStation != null
       || azurePayload.remainingMinutesToNextStation != null
+      || azurePayload.plannedArrivalTime
     )) {
       const stripped = {
         ...azurePayload,
@@ -1988,6 +1993,7 @@ async function publishLiveGpsPosition(body = {}) {
         nextStationName: null,
         remainingDistanceKmToNextStation: null,
         remainingMinutesToNextStation: null,
+        plannedArrivalTime: null,
         tripId: null,
         routeCode: null,
         routeId: null,
@@ -2173,7 +2179,7 @@ function sanitizeGpsPayloadForAzure(payload, { keepTrip = false } = {}) {
   out.tripId = null;
 
   if (keepTrip) {
-    // Giữ ETA / nextStation — FE đọc từ boats/latest.
+    // Giữ ETA / nextStation / plannedArrivalTime — FE đọc từ boats/latest.
     return out;
   }
 
@@ -2181,6 +2187,7 @@ function sanitizeGpsPayloadForAzure(payload, { keepTrip = false } = {}) {
   out.nextStationName = null;
   out.remainingDistanceKmToNextStation = null;
   out.remainingMinutesToNextStation = null;
+  out.plannedArrivalTime = null;
   return out;
 }
 

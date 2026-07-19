@@ -1089,6 +1089,7 @@ export function createTripAutorun(ctx) {
       remainingMinutesToNextStation: Number.isFinite(Number(mission.nextStopEtaMin))
         ? Number(mission.nextStopEtaMin)
         : null,
+      plannedArrivalTime: mission.nextStopPlannedArrivalAt || null,
       sendToTarget: true,
       fromTrip: true,
     });
