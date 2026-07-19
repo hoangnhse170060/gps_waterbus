@@ -998,15 +998,17 @@ function upsertHubBoat(payload) {
     return;
   }
   const suppressUntil = hubBoatSuppressUntil.get(code) || 0;
-  if (suppressUntil > Date.now()) return;
-  if (suppressUntil) hubBoatSuppressUntil.delete(code);
+  const forceAccept = payload.forceAccept === true || payload._forceAccept === true;
+  // Suppress chỉ chặn Azure/echo — KHÔNG chặn live/trip/rescue forceAccept
+  // (trước đây set suppress rồi upsert → lần kéo bị return, hub giữ chỗ cũ → FE nhảy về).
+  if (!forceAccept && suppressUntil > Date.now()) return;
+  if (!forceAccept && suppressUntil) hubBoatSuppressUntil.delete(code);
   // Đang survey cùng mã → không hiện / không nhận GPS Live (Azure echo / heartbeat).
   if (activeSurveyBoatCode() === code) {
     state.hubBoats.delete(code);
     return;
   }
 
-  const forceAccept = payload.forceAccept === true || payload._forceAccept === true;
   // Đang cứu hộ / trip lịch: chỉ nhận GPS từ publishLiveGpsPosition (forceAccept), bỏ echo Azure cũ.
   if (!forceAccept && isBoatInActiveRescueMission(code)) return;
   if (!forceAccept && tripAutorun.isBoatInActiveTripMission(code)) return;
@@ -1874,10 +1876,7 @@ async function publishLiveGpsPosition(body = {}) {
     capturedRoute: null,
   };
 
-  // Optimistic local hub marker (SSE) — BE sẽ đồng bộ lại qua SignalR / boats/latest.
-  // Chặn Azure echo cũ trong cửa sổ authority (tránh kéo xong bị kéo về chỗ cũ).
-  const authMs = Number(env.HUB_LIVE_AUTHORITY_MS || 30_000);
-  hubBoatSuppressUntil.set(boatCode, Date.now() + Math.max(authMs, 8_000));
+  // Optimistic local hub marker (SSE) — cập nhật hub TRƯỚC, rồi mới suppress Azure echo.
   const allowAzureWrite = liveAzureWriteEnabled();
   // Local follow-only: CHỈ cập nhật hub khi user kéo tay / trip / rescue.
   // Heartbeat (kể cả FE cũ thiếu quiet) không được đè Azure → tránh lệch Railway.
@@ -1898,6 +1897,12 @@ async function publishLiveGpsPosition(body = {}) {
       source: holdAuthority ? 'live' : 'live-heartbeat',
     });
     broadcast();
+  }
+
+  // Chặn Azure echo cũ sau khi hub đã nhận vị trí kéo/trip.
+  const authMs = Number(env.HUB_LIVE_AUTHORITY_MS || 30_000);
+  if (holdAuthority) {
+    hubBoatSuppressUntil.set(boatCode, Date.now() + Math.max(authMs, 8_000));
   }
 
   const sendToTarget = allowAzureWrite

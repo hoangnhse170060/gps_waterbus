@@ -4,6 +4,9 @@ const APPROACH_M = 180;
 const SIGNAL_TTL_MS = 120_000;
 const HEARTBEAT_MS = 5000;
 const CLUSTER_M = 25;
+/** Giữ pin kéo tay khi hub/Azure chưa kịp (tránh nhảy về chỗ cũ). */
+const USER_PIN_HOLD_MS = 45_000;
+const USER_PIN_HUB_CATCHUP_M = 40;
 const ROUTE_STYLE = {
   color: '#0f766e',
   weight: 2.5,
@@ -1157,8 +1160,8 @@ function escapeHtml(value) {
 
 function fallbackLatLngForBoat(code, index, data = latest) {
   const pin = pinnedFor(code);
-  // Chỉ dùng pin user khi đang kéo tay — còn lại ưu tiên hub/Azure.
-  if (pin?.user && dragging && draggingBoatCode === code) {
+  // Pin user đang kéo, hoặc hub chưa bắt kịp chỗ vừa kéo.
+  if (pin?.user && recentUserPinHolds(code, null)) {
     return { lat: pin.lat, lng: pin.lng };
   }
   const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === code);
@@ -1183,13 +1186,26 @@ function fallbackLatLngForBoat(code, index, data = latest) {
   return { lat: 10.776, lng: 106.708 };
 }
 
-/** Vị trí hiện map: hub/Azure là SoT. Pin user chỉ khi đang kéo. */
+/** Pin kéo tay còn hiệu lực khi hub lệch / chưa cập nhật. */
+function recentUserPinHolds(code, hub) {
+  const pin = pinnedFor(code);
+  if (!pin?.user) return false;
+  if (dragging && draggingBoatCode === code) return true;
+  const age = Date.now() - (Number(pin.at) || 0);
+  if (!(age >= 0 && age <= USER_PIN_HOLD_MS)) return false;
+  if (!hub || !Number.isFinite(Number(hub.lat)) || !Number.isFinite(Number(hub.lng))) return true;
+  const dist = distMeters(
+    { lat: pin.lat, lng: pin.lng },
+    { lat: Number(hub.lat), lng: Number(hub.lng) },
+  );
+  return !(Number.isFinite(dist) && dist <= USER_PIN_HUB_CATCHUP_M);
+}
+
+/** Vị trí hiện map: ưu tiên pin kéo khi hub chưa kịp; còn lại hub/Azure. */
 function boatMapLatLng(code, hub, index, data = latest) {
-  if (dragging && draggingBoatCode === code) {
-    const pin = pinnedFor(code);
-    if (pin && Number.isFinite(Number(pin.lat)) && Number.isFinite(Number(pin.lng))) {
-      return { lat: Number(pin.lat), lng: Number(pin.lng), source: 'drag' };
-    }
+  const pin = pinnedFor(code);
+  if (pin?.user && recentUserPinHolds(code, hub)) {
+    return { lat: Number(pin.lat), lng: Number(pin.lng), source: 'user-pin' };
   }
   if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
     return { lat: Number(hub.lat), lng: Number(hub.lng), source: hub.source || 'hub' };
@@ -1642,9 +1658,11 @@ function renderHubBoats(hubBoats) {
     } else {
       seed = fallbackLatLngForBoat(code, index, latest);
     }
-    // Luôn neo pin theo hub/Azure (trừ đang kéo user).
+    // Neo pin theo hub — nhưng không đè pin kéo tay còn hiệu lực.
     if (!(dragging && draggingBoatCode === code && pinnedFor(code)?.user)) {
-      pinBoatPosition(code, seed.lat, seed.lng, { user: false });
+      if (!recentUserPinHolds(code, hub)) {
+        pinBoatPosition(code, seed.lat, seed.lng, { user: false });
+      }
     }
     occupied.push({ ...seed, code });
     index += 1;
@@ -2002,6 +2020,27 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
     markSignal(boatCode);
     if (!quiet) {
       pinBoatPosition(boatCode, lat, lng, { user: true });
+      // Cập nhật latest.hubBoats ngay — tránh renderHubBoats(stale) nhảy về chỗ cũ.
+      if (latest) {
+        const hubs = Array.isArray(latest.hubBoats) ? [...latest.hubBoats] : [];
+        const idx = hubs.findIndex((b) => String(b.boatCode) === String(boatCode));
+        const merged = {
+          ...(idx >= 0 ? hubs[idx] : {}),
+          boatCode,
+          lat: Number(lat),
+          lng: Number(lng),
+          speedKmh,
+          heading: getBoatHeading(boatCode),
+          status,
+          source: 'live',
+          recordedAt: new Date().toISOString(),
+          receivedAt: new Date().toISOString(),
+          isOnline: true,
+        };
+        if (idx >= 0) hubs[idx] = merged;
+        else hubs.push(merged);
+        latest = { ...latest, hubBoats: hubs };
+      }
     }
     const mode = body.mode === 'follow-azure'
       ? 'follow Azure'
