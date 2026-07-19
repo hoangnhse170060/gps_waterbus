@@ -2141,15 +2141,24 @@ async function heartbeatAllBoats() {
       const pin = pinnedFor(code) || fallbackLatLngForBoat(code, i, latest);
       ensureSeedPin(code, pin.lat, pin.lng);
       const fixed = pinnedFor(code) || pin;
-      // Ưu tiên vị trí trip/hub nếu đang chạy lịch.
+      // Ưu tiên pin kéo tay còn hiệu lực — tránh heartbeat gửi lại hub/Azure cũ.
       const hub = (latest?.hubBoats || []).find((b) => String(b.boatCode || '').trim() === code);
-      const lat = Number(hub?.lat);
-      const lng = Number(hub?.lng);
-      const useHub = Number.isFinite(lat) && Number.isFinite(lng);
+      let lat;
+      let lng;
+      if (fixed?.user && recentUserPinHolds(code, hub)) {
+        lat = Number(fixed.lat);
+        lng = Number(fixed.lng);
+      } else if (Number.isFinite(Number(hub?.lat)) && Number.isFinite(Number(hub?.lng))) {
+        lat = Number(hub.lat);
+        lng = Number(hub.lng);
+      } else {
+        lat = Number(fixed.lat);
+        lng = Number(fixed.lng);
+      }
       const result = await sendLiveGps(
         code,
-        useHub ? lat : fixed.lat,
-        useHub ? lng : fixed.lng,
+        lat,
+        lng,
         { quiet: true },
       );
       results.push({
@@ -2885,10 +2894,14 @@ async function resyncAzurePositions() {
       console.warn('[resync]', body.error || response.status);
       return false;
     }
-    // Xóa pin user cũ — map bám hub Azure vừa seed.
+    // Xóa pin thường; giữ pin kéo tay còn trong cửa sổ (tránh F5 về chỗ cũ).
     for (const [code, pin] of [...pinnedPositions.entries()]) {
-      if (!pin?.user) pinnedPositions.delete(code);
-      else if (!(dragging && draggingBoatCode === code)) pinnedPositions.delete(code);
+      if (!pin?.user) {
+        pinnedPositions.delete(code);
+        continue;
+      }
+      const age = Date.now() - (Number(pin.at) || 0);
+      if (!(age >= 0 && age <= USER_PIN_HOLD_MS)) pinnedPositions.delete(code);
     }
     persistPins();
     await pullSnapshot({ force: true });

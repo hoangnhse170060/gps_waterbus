@@ -459,8 +459,7 @@ const server = createServer(async (req, res) => {
       }
     }
     if (url.pathname === '/api/live/resync-positions' && req.method === 'POST') {
-      // Ép đọc lại vị trí Azure — local/Railway cùng map ngay.
-      hubLiveAuthorityUntil.clear();
+      // Đọc lại Azure nhưng KHÔNG xóa authority / đè chỗ vừa kéo tay.
       azurePositionsSeeded = false;
       try {
         await pollLatestBoatLocations({ force: true });
@@ -1172,6 +1171,10 @@ async function pollLatestBoatLocations({ force = false } = {}) {
     for (const row of rows) {
       const code = String(row.boatCode || '').trim();
       const before = state.hubBoats.get(code);
+      // Giữ chỗ kéo tay / trip / last-pos mới hơn Azure stale — tránh F5 về vị trí cũ.
+      if (shouldKeepHubOverAzure(code, row)) {
+        continue;
+      }
       if (firstSeed && code) hubLiveAuthorityUntil.delete(code);
       upsertHubBoat({
         ...row,
@@ -1906,7 +1909,7 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   const sendToTarget = allowAzureWrite
-    && (azurePositionsSeeded || fromTrip || fromRescue)
+    && (azurePositionsSeeded || fromTrip || fromRescue || holdAuthority)
     && (
       body.sendToTarget !== undefined
         ? Boolean(body.sendToTarget)
@@ -6097,6 +6100,41 @@ function shouldForceAcceptAzurePosition(payload) {
   if (isBoatInActiveRescueMission(code)) return false;
   if (tripAutorun.isBoatInActiveTripMission(code)) return false;
   return true;
+}
+
+/**
+ * Hub live/last-pos mới hơn Azure stale → giữ hub (F5 không nhảy về chỗ cũ).
+ * Azure row thiếu/trễ lat sau POST locations là case đã gặp.
+ */
+function shouldKeepHubOverAzure(boatCode, azureRow = {}) {
+  const code = String(boatCode || '').trim();
+  const hub = state.hubBoats.get(code);
+  if (!hub || !Number.isFinite(Number(hub.lat)) || !Number.isFinite(Number(hub.lng))) return false;
+
+  const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
+  if (liveAuthUntil > Date.now()) return true;
+
+  const src = String(hub.source || '');
+  const trusted = src === 'live'
+    || src === 'last-position'
+    || src.startsWith('trip')
+    || src.startsWith('rescue')
+    || src === 'live-heartbeat';
+  if (!trusted) return false;
+
+  const keepMs = Number(env.HUB_LIVE_KEEP_MS || 600_000); // 10 phút
+  const hubAt = Date.parse(hub.updatedAt || hub.receivedAt || hub.recordedAt || '') || 0;
+  if (!(hubAt > 0) || Date.now() - hubAt > keepMs) return false;
+
+  const aLat = Number(azureRow.lat ?? azureRow.latitude ?? azureRow.Latitude);
+  const aLng = Number(azureRow.lng ?? azureRow.lon ?? azureRow.longitude ?? azureRow.Longitude);
+  if (!Number.isFinite(aLat) || !Number.isFinite(aLng)) return true;
+
+  const dist = distanceMeters(
+    { lat: Number(hub.lat), lng: Number(hub.lng) },
+    { lat: aLat, lng: aLng },
+  );
+  return Number.isFinite(dist) && dist > 40;
 }
 
 /** Commit đang chạy — Railway set RAILWAY_GIT_COMMIT_SHA; local lấy từ git. */
