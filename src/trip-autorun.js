@@ -659,10 +659,9 @@ export function createTripAutorun(ctx) {
       mission.approachProgress = 0;
     }
 
-    const elapsedSeconds = Math.max(
-      0.2,
-      Math.min(5, (nowMs - (mission.lastTickAt || nowMs)) / 1000),
-    );
+    const elapsedSeconds = mission.lastTickAt
+      ? Math.max(0.2, Math.min(5, (nowMs - mission.lastTickAt) / 1000))
+      : 1; // tick đầu: 1s để tàu chạy ngay
     const stepMeters = Math.max(0.5, (mission.speedKmh * 1000 / 3600) * elapsedSeconds);
     const adv = advanceAlongCoordinates(
       mission.approachPath,
@@ -1163,10 +1162,9 @@ export function createTripAutorun(ctx) {
     mission.speedKmh = speed;
     mission.status = 'Running';
 
-    const elapsedSeconds = Math.max(
-      0.2,
-      Math.min(5, (nowMs - (mission.lastTickAt || nowMs)) / 1000),
-    );
+    const elapsedSeconds = mission.lastTickAt
+      ? Math.max(0.2, Math.min(5, (nowMs - mission.lastTickAt) / 1000))
+      : 1; // tick đầu: 1s để tàu chạy ngay
     const stepMeters = Math.max(0.5, (speed * 1000 / 3600) * elapsedSeconds);
     mission.progressMeters = Math.min(
       Number(mission.lengthMeters),
