@@ -780,41 +780,40 @@ export function createTripAutorun(ctx) {
       mission.departureStop = depPoint.stop;
     }
 
-    // Giữ vị trí hub hiện tại (vd Bình An) — không teleport về đầu tuyến.
+    // CHỈ nhảy khi trip bắt đầu → đúng bến xuất phát (không ToDeparture, không nhảy giữa chuyến).
+    const jumpLat = Number.isFinite(Number(mission.departureLat))
+      ? Number(mission.departureLat)
+      : start.lat;
+    const jumpLng = Number.isFinite(Number(mission.departureLng))
+      ? Number(mission.departureLng)
+      : start.lng;
     const hub = state.hubBoats.get(boatCode);
-    const hubLat = Number(hub?.lat);
-    const hubLng = Number(hub?.lng);
-    if (Number.isFinite(hubLat) && Number.isFinite(hubLng)) {
-      mission.currentLat = hubLat;
-      mission.currentLng = hubLng;
-      if (Number.isFinite(Number(hub.heading))) mission.lastHeading = Number(hub.heading);
+    const fromLat = Number(hub?.lat);
+    const fromLng = Number(hub?.lng);
+    const jumpFromMeters = (Number.isFinite(fromLat) && Number.isFinite(fromLng))
+      ? distanceMetersFn({ lat: fromLat, lng: fromLng }, { lat: jumpLat, lng: jumpLng })
+      : null;
+
+    mission.currentLat = jumpLat;
+    mission.currentLng = jumpLng;
+    mission.progressMeters = 0;
+    mission.stopIndex = 0;
+    if (Number.isFinite(Number(hub?.heading))) {
+      mission.lastHeading = Number(hub.heading);
+    } else if (start.heading) {
+      mission.lastHeading = start.heading;
     }
 
-    const distToDep = (Number.isFinite(mission.departureLat) && Number.isFinite(mission.departureLng))
-      ? distanceMetersFn(
-        { lat: mission.currentLat, lng: mission.currentLng },
-        { lat: mission.departureLat, lng: mission.departureLng },
-      )
-      : 0;
-
-    if (distToDep > TO_DEPARTURE_ARRIVE_M) {
-      // Đang ở bến khác → chạy về bến xuất phát lịch trước.
-      mission.status = 'ToDeparture';
-      mission.movementStatus = 'Moving';
-      mission.nextStationId = mission.departureStop?.stationId || mission.departureStop?.stationCode || null;
-      mission.nextStopCode = mission.departureStop?.stationCode || mission.nextStationId;
-      mission.nextStopName = mission.departureStop?.stationName
-        || mission.departureStop?.stationCode
-        || 'Bến xuất phát';
-      mission.nextStopDistanceKm = distToDep / 1000;
-    } else {
-      mission.currentLat = mission.departureLat ?? mission.currentLat;
-      mission.currentLng = mission.departureLng ?? mission.currentLng;
-      mission.progressMeters = 0;
-      const depMs0 = parseTimeMs(departureTime);
-      mission.status = (Number.isFinite(depMs0) && Date.now() < depMs0) ? 'Boarding' : 'Running';
-      mission.movementStatus = mission.status === 'Boarding' ? 'Boarding' : 'Moving';
-    }
+    const depMs0 = parseTimeMs(departureTime);
+    mission.status = (Number.isFinite(depMs0) && Date.now() < depMs0) ? 'Boarding' : 'Running';
+    mission.movementStatus = mission.status === 'Boarding' ? 'Boarding' : 'Moving';
+    mission.nextStationId = mission.departureStop?.stationId || mission.departureStop?.stationCode || null;
+    mission.nextStopCode = mission.departureStop?.stationCode || mission.nextStationId;
+    mission.nextStopName = mission.departureStop?.stationName
+      || mission.departureStop?.stationCode
+      || 'Bến xuất phát';
+    mission.nextStopDistanceKm = 0;
+    mission.speedKmh = 0;
 
     // Target speed ban đầu theo contract (khi đã chạy tuyến).
     const depMs = parseTimeMs(departureTime);
@@ -824,7 +823,7 @@ export function createTripAutorun(ctx) {
       const km = lengthMeters / 1000;
       if (hours > 0 && km > 0) {
         mission.requiredSpeedKmh = km / hours;
-        if (mission.status !== 'ToDeparture') {
+        if (mission.status === 'Running') {
           mission.speedKmh = clampSpeedToBoatMax(mission.requiredSpeedKmh, maxSpeedKmh);
         }
       }
@@ -833,8 +832,30 @@ export function createTripAutorun(ctx) {
     state.tripMissions.set(tripId, mission);
     console.log(
       `[trip-gps] START ${boatCode} trip=${tripId} · ${mission.status} `
-      + `${Math.round(lengthMeters)}m · tới bến XP ${Math.round(distToDep)}m · dep ${departureTime || '?'}`,
+      + `${Math.round(lengthMeters)}m · JUMP bến XP `
+      + `${mission.nextStopCode || mission.nextStopName || ''} `
+      + `(${jumpFromMeters != null ? `${Math.round(jumpFromMeters)}m` : 'n/a'}) · dep ${departureTime || '?'}`,
     );
+
+    // Publish ngay tại bến xuất phát — chỉ lần nhảy khi bắt đầu trip.
+    publishLiveGpsPosition({
+      boatCode,
+      lat: jumpLat,
+      lng: jumpLng,
+      heading: mission.lastHeading,
+      speedKmh: 0,
+      status: 'idle',
+      tripId,
+      routeCode: mission.routeCode,
+      nextStationId: mission.nextStationId,
+      remainingDistanceKmToNextStation: 0,
+      remainingMinutesToNextStation: 0,
+      sendToTarget: true,
+      fromTrip: true,
+    }).catch((error) => {
+      console.warn(`[trip-gps] start-jump publish ${boatCode}: ${error.message}`);
+    });
+
     // Chạy ngay ≤1s — không chờ interval tick sau.
     setTimeout(() => {
       tickOneMission(mission, Date.now()).catch((error) => {
@@ -851,56 +872,6 @@ export function createTripAutorun(ctx) {
     return Math.min(boatMax, tripMax, azureMax);
   }
 
-  function tripJumpWhenLateEnabled() {
-    // Mặc định bật: trễ lịch / cần tốc độ > trần → nhảy tới bến kế (không bay 140km/h).
-    const raw = env.TRIP_JUMP_WHEN_LATE;
-    if (raw == null || String(raw).trim() === '') return true;
-    return String(raw).trim().toLowerCase() === 'true' || String(raw).trim() === '1';
-  }
-
-  /**
-   * Nhảy dọc path tới bến tiếp theo (hoặc đích cuối nếu đã quá giờ về).
-   * Dùng khi trễ lịch — không mô phỏng tốc độ phi thực tế.
-   */
-  function jumpTripTowardBerth(mission, nowMs) {
-    const coords = mission.coordinates || [];
-    if (coords.length < 2) return false;
-    const lengthMeters = Number(mission.lengthMeters) || routeLengthFn(coords);
-    const arrMs = parseTimeMs(mission.arrivalTime);
-    const pastFinalArrival = Number.isFinite(arrMs) && nowMs >= arrMs;
-
-    let targetAlong = lengthMeters;
-    if (!pastFinalArrival) {
-      const stops = mission.stops || [];
-      let idx = Number(mission.stopIndex) || 0;
-      let found = null;
-      for (let i = idx; i < stops.length; i += 1) {
-        const along = alongMetersToStop(mission, stops[i]);
-        if (!Number.isFinite(along)) continue;
-        if (along > (Number(mission.progressMeters) || 0) + 15) {
-          found = along;
-          mission.stopIndex = i;
-          break;
-        }
-      }
-      if (Number.isFinite(found)) targetAlong = found;
-    }
-
-    const prev = Number(mission.progressMeters) || 0;
-    mission.progressMeters = Math.min(lengthMeters, Math.max(prev, targetAlong));
-    const point = pointAtDistance(coords, mission.progressMeters);
-    mission.currentLat = point.lat;
-    mission.currentLng = point.lng;
-    mission.lastHeading = point.heading || mission.lastHeading || 0;
-    mission.speedKmh = 0;
-    mission.requiredSpeedKmh = 0;
-    console.log(
-      `[trip-gps] JUMP ${mission.boatCode} ${Math.round(prev)}m → ${Math.round(mission.progressMeters)}m `
-      + `(${pastFinalArrival ? 'quá giờ về' : 'trễ → bến kế'})`,
-    );
-    return true;
-  }
-
   function computeRequiredSpeedKmh(mission, nowMs) {
     const rawRemaining = Math.max(0, Number(mission.lengthMeters) - Number(mission.progressMeters));
     // Trần hợp lý tuyến sông — tránh geometry lỗi → tốc độ ~0 và đứng im.
@@ -914,8 +885,8 @@ export function createTripAutorun(ctx) {
     }
     const remainingHours = (arrMs - nowMs) / 3600000;
     if (!(remainingHours > 0)) {
-      // Trễ giờ về — caller sẽ JUMP tới đích, không cần max boat.
-      return tripCruiseMaxKmh(mission) * 2;
+      // Trễ giờ về — chạy trần cruise (không JUMP giữa chuyến).
+      return tripCruiseMaxKmh(mission);
     }
     // Nếu lịch còn rất xa so với quãng đường (ETA ảo) → dùng tốc độ mặc định.
     const required = remainingKm / remainingHours;
@@ -1212,28 +1183,7 @@ export function createTripAutorun(ctx) {
 
     const required = computeRequiredSpeedKmh(mission, nowMs);
     mission.requiredSpeedKmh = required;
-    const cruiseMax = tripCruiseMaxKmh(mission);
-    // Trễ lịch / cần tốc độ > trần cho phép → nhảy tới bến kế (hoặc đích).
-    if (
-      tripJumpWhenLateEnabled()
-      && Number.isFinite(required)
-      && required > cruiseMax * 1.05
-    ) {
-      jumpTripTowardBerth(mission, nowMs);
-      mission.status = 'Running';
-      const arrivedJump = mission.progressMeters >= (Number(mission.lengthMeters) - 8);
-      refreshNextStopInfo(mission, nowMs);
-      await maybeEmitStopEvents(mission);
-      await publishTripPoint(mission, {
-        speedKmh: 0,
-        status: arrivedJump ? 'idle' : 'idle',
-      });
-      mission.lastTickAt = nowMs;
-      if (arrivedJump) await finishTripMission(mission);
-      return;
-    }
-
-    // Early (required thấp): giảm tốc; đúng giờ: chạy theo required (≤ trần).
+    // Early (required thấp): giảm tốc; đúng giờ / trễ: chạy ≤ trần (không JUMP giữa chuyến).
     const speed = required <= 0
       ? 0
       : clampSpeedToBoatMax(Math.max(1, required), mission.maxSpeedKmh);
