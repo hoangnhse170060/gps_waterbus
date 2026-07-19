@@ -462,28 +462,16 @@ export function createTripAutorun(ctx) {
     const key = `${stationId}:${event}`;
     if (mission.stopEventsSent.has(key)) return { ok: true, skipped: true, reason: 'already-sent' };
 
-    const dist = distanceForStopEvent(mission, stop);
     const result = await requestTargetApi({
       method: 'POST',
       pathname: stopEventPath(tripId, stationId),
+      // Contract: boatCode, event, occurredAt, lat, lng (+ hook secret header).
       payload: {
         boatCode,
         event,
         occurredAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
-        stationId,
-        stationCode: cleanOptionalText(stop.stationCode) || null,
-        stationName: cleanOptionalText(stop.stationName) || null,
-        distanceMeters: Number.isFinite(dist) ? Math.round(dist) : null,
         lat: Number.isFinite(Number(mission.currentLat)) ? Number(mission.currentLat) : null,
         lng: Number.isFinite(Number(mission.currentLng)) ? Number(mission.currentLng) : null,
-        plannedArrivalTime: stop.plannedArrivalTime || null,
-        plannedDepartureTime: stop.plannedDepartureTime || null,
-        remainingDistanceKmToNextStation: Number.isFinite(Number(mission.nextStopDistanceKm))
-          ? Number(mission.nextStopDistanceKm)
-          : null,
-        remainingMinutesToNextStation: Number.isFinite(Number(mission.nextStopEtaMin))
-          ? Number(mission.nextStopEtaMin)
-          : null,
       },
       auth: 'hook',
     });
@@ -1072,6 +1060,30 @@ export function createTripAutorun(ctx) {
   }
 
   async function publishTripPoint(mission, { speedKmh, status }) {
+    let remKm = Number.isFinite(Number(mission.nextStopDistanceKm))
+      ? Number(mission.nextStopDistanceKm)
+      : null;
+    let remMin = Number.isFinite(Number(mission.nextStopEtaMin))
+      ? Number(mission.nextStopEtaMin)
+      : null;
+    // Contract: remaining*=0 chỉ khi đã tới / rất gần bến — không gửi 0 khi còn xa.
+    const nearBerth = Number.isFinite(remKm) && remKm * 1000 <= STOP_ARRIVED_M * 1.5;
+    if (!nearBerth) {
+      if (remKm != null && remKm <= 0 && Number.isFinite(Number(mission.nextStopDistanceKm))) {
+        remKm = Math.max(Number(mission.nextStopDistanceKm), 0.001);
+      }
+      if (remMin != null && remMin <= 0) {
+        const spd = Number(speedKmh) > 0.5
+          ? Number(speedKmh)
+          : (Number(mission.requiredSpeedKmh) || Number(mission.maxSpeedKmh) || 16);
+        remMin = etaMinutesFromDistance((remKm || 0) * 1000, spd);
+        if (!(remMin > 0)) remMin = 1;
+      }
+    } else {
+      remKm = 0;
+      remMin = 0;
+    }
+
     const result = await publishLiveGpsPosition({
       boatCode: mission.boatCode,
       lat: mission.currentLat,
@@ -1083,13 +1095,8 @@ export function createTripAutorun(ctx) {
       routeCode: mission.routeCode,
       nextStationId: mission.nextStationId || null,
       nextStationName: mission.nextStopName || null,
-      remainingDistanceKmToNextStation: Number.isFinite(Number(mission.nextStopDistanceKm))
-        ? Number(mission.nextStopDistanceKm)
-        : null,
-      remainingMinutesToNextStation: Number.isFinite(Number(mission.nextStopEtaMin))
-        ? Number(mission.nextStopEtaMin)
-        : null,
-      plannedArrivalTime: mission.nextStopPlannedArrivalAt || null,
+      remainingDistanceKmToNextStation: remKm,
+      remainingMinutesToNextStation: remMin,
       sendToTarget: true,
       fromTrip: true,
     });
