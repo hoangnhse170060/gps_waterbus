@@ -2868,9 +2868,10 @@ function isBoatInActiveRescueMission(boatCode) {
   if (!code) return false;
   for (const mission of state.rescueMissions.values()) {
     const status = String(mission?.status || '');
-    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status)) continue;
+    // AtStation/Completed: đã nhả — không còn khóa GPS/kéo.
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) continue;
     if (String(mission.rescueBoatCode || '').trim() === code) return true;
-    // Tàu sự cố cũng bị rescue sở hữu GPS (neo hiện trường / kéo / cập bến).
+    // Tàu sự cố cũng bị rescue sở hữu GPS (neo hiện trường / kéo).
     if (String(mission.incidentBoatCode || '').trim() === code) return true;
   }
   return false;
@@ -3254,6 +3255,13 @@ function startRescueAutomation(incident) {
 async function tickRescueMissions() {
   const nowMs = Date.now();
   const arrivalMeters = Math.max(3, Number(env.RESCUE_ARRIVE_METERS || 15));
+  // Bản cũ giữ AtStation → SOS bị khóa; nhả ngay.
+  for (const [id, mission] of state.rescueMissions) {
+    if (String(mission?.status || '') === 'AtStation') {
+      clearBeBoatStatus(mission.rescueBoatCode);
+      completeRescueMission(id, 'ArrivedAtStation');
+    }
+  }
   const active = [...state.rescueMissions.values()].filter((mission) => (
     (mission.status === 'Dispatched' || mission.status === 'InTransit' || mission.status === 'Towing')
     && !mission.publishing
@@ -3408,14 +3416,11 @@ async function tickRescueMissions() {
       } else if (mission.status === 'Towing') {
         mission.status = 'AtStation';
         mission.stationArrivedAt = mission.updatedAt;
-        // Nhả BE status nhưng GIỮ mission AtStation (badge CỨU) đến khi đóng sự cố — tránh "xóa" khi FE chưa kịp thấy chạy.
+        // Nhả SOS ngay khi cập bến — không giữ AtStation khóa tàu đến khi đóng sự cố.
         clearBeBoatStatus(mission.rescueBoatCode);
         const rescueBoat = boatByIdOrCode(mission.rescueBoatCode);
         if (rescueBoat && normalizeBoatStatus(rescueBoat.dbStatus) !== 'incident') {
           rescueBoat.beStatus = null;
-          if (normalizeBoatStatus(rescueBoat.dbStatus) === 'undermaintenance') {
-            // giữ db Neon; chỉ bỏ override cứu hộ
-          }
         }
         const hubRescue = state.hubBoats.get(mission.rescueBoatCode);
         if (hubRescue) {
@@ -3462,6 +3467,9 @@ async function tickRescueMissions() {
         }
         // Contract: GPS → BE rescue-mission-completed (BE set Resolved + UnderMaintenance + SOS Active).
         await notifyBeRescueMissionCompleted(mission);
+        // Luôn Completed local để nhả SOS khỏi khóa cứu hộ (kể cả callback BE lỗi).
+        completeRescueMission(mission.incidentId, 'ArrivedAtStation');
+        broadcast();
       } else {
         mission.arrivedAt = mission.updatedAt;
         const nearest = nearestStationTo({

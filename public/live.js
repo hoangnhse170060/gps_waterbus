@@ -165,7 +165,8 @@ function isBoatInActiveAutomatedRescue(code, data = latest) {
   if (!key) return false;
   return (data?.rescueMissions || []).some((mission) => {
     const status = String(mission?.status || '');
-    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status)) return false;
+    // AtStation = đã cập bến / đã nhả — không khóa kéo nữa.
+    if (!['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status)) return false;
     if (String(mission.rescueBoatCode || '').trim() === key) return true;
     if (String(mission.incidentBoatCode || '').trim() === key) return true;
     return false;
@@ -718,9 +719,9 @@ function isRescueBoat(code) {
     (mission) => String(mission.rescueBoatCode || '').trim() === key,
   );
   if (automated) {
-    // Giữ badge CỨU đến AtStation (sự cố còn mở) — không tắt sớm nhìn như bị xóa.
+    // Badge CỨU chỉ khi đang chạy — cập bến / Completed thì nhả.
     const status = String(automated.status || '');
-    return ['Dispatched', 'InTransit', 'Arrived', 'Towing', 'AtStation'].includes(status);
+    return ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status);
   }
   return openIncidentsList().some((row) => {
     const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
@@ -1016,8 +1017,17 @@ function phaseStatusText(code, lat, lng) {
 
   const phase = autoPhaseForBoat(code, lat, lng);
   const dbLabel = boatDbStatusLabel(code);
+  const nearBerth = nearestStationAny({ lat, lng }, latest?.stations || []);
+  const atBerth = Boolean(nearBerth && nearBerth.dist <= SNAP_STATION_M);
+  const berthName = nearBerth?.station?.stationName || nearBerth?.station?.stationCode || 'bến';
   if (phase === 'incident') {
     const open = openIncidentForBoat(code);
+    if (atBerth) {
+      if (dbLabel === 'Bảo trì') return `Đã cập bến · ${berthName} · Bảo trì`;
+      return open
+        ? `Đã cập bến · ${berthName} · Sự cố`
+        : `Đã cập bến · ${berthName}`;
+    }
     const base = (open?.rescueBoatCode || open?.replacementBoatCode)
       ? `Sự cố · cứu: ${open.rescueBoatCode || open.replacementBoatCode}`
       : 'Sự cố';
@@ -1025,21 +1035,17 @@ function phaseStatusText(code, lat, lng) {
   }
   // Không còn sự cố mở nhưng DB vẫn UnderMaintenance.
   if (boatDbStatus(code) === 'undermaintenance') {
-    return 'Bảo trì';
+    return atBerth ? `Đã cập bến · ${berthName} · Bảo trì` : 'Bảo trì';
   }
   if (phase === 'enroute' || phase === 'departing') {
     return phase === 'departing' ? PHASES.departing : PHASES.enroute;
   }
   if (phase === 'stopped') return PHASES.stopped;
   if (phase === 'approaching') {
-    const near = nearestStationAny({ lat, lng }, latest?.stations || []);
-    const name = near?.station?.stationName || near?.station?.stationCode || 'bến';
-    return `${PHASES.approaching} · ${name}`;
+    return `${PHASES.approaching} · ${berthName}`;
   }
   if (phase === 'arrived') {
-    const near = nearestStationAny({ lat, lng }, latest?.stations || []);
-    const name = near?.station?.stationName || near?.station?.stationCode || 'bến';
-    return `${PHASES.arrived} · ${name}`;
+    return `${PHASES.arrived} · ${berthName}`;
   }
   return PHASES[phase] || PHASES.prepare;
 }
