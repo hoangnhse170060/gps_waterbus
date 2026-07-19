@@ -3089,18 +3089,16 @@ function startRescueAutomation(incident) {
   let missionTargetLng = resolvedTargetLng;
   let destinationMeta = null;
   if (alreadyAtScene) {
-    const towDest = nearestStationBeyond(
-      { lat: startLat, lng: startLng },
-      Math.max(80, Number(env.RESCUE_MIN_TOW_METERS || 80)),
-    );
-    if (towDest && towDest.meters > arrivalMeters) {
+    // Sát hiện trường + sát bến → kéo vào đúng bến gần nhất (không đẩy sang bến ≥80m).
+    const towDest = nearestStationTo({ lat: startLat, lng: startLng });
+    if (towDest) {
       initialStatus = 'Towing';
       missionTargetLat = towDest.lat;
       missionTargetLng = towDest.lng;
       destinationMeta = towDest;
       console.log(
         `[rescue-gps] SOS đã sát hiện trường (${Math.round(distToScene)}m) `
-        + `→ Towing thẳng về ${towDest.station?.stationCode || 'bến'} (${Math.round(towDest.meters)}m)`,
+        + `→ Towing vào ${towDest.station?.stationCode || 'bến'} (${Math.round(towDest.meters)}m)`,
       );
     }
   }
@@ -3472,17 +3470,11 @@ async function tickRescueMissions() {
         broadcast();
       } else {
         mission.arrivedAt = mission.updatedAt;
-        const nearest = nearestStationTo({
+        // Luôn kéo về bến gần nhất — sát bến thì kéo vào đúng bến đó (không đẩy sang bến khác).
+        const towDest = nearestStationTo({
           lat: Number(mission.incidentCurrentLat ?? mission.incidentLat ?? lat),
           lng: Number(mission.incidentCurrentLng ?? mission.incidentLng ?? lng),
         });
-        // Nếu đang đứng đúng bến gần nhất → chọn bến kế tiếp đủ xa để còn lộ trình kéo.
-        const towDest = (nearest && nearest.meters <= arrivalMeters)
-          ? nearestStationBeyond(
-            { lat: Number(mission.incidentLat ?? lat), lng: Number(mission.incidentLng ?? lng) },
-            Math.max(80, Number(env.RESCUE_MIN_TOW_METERS || 80)),
-          )
-          : nearest;
         if (towDest) {
           mission.status = 'Towing';
           mission.targetLat = towDest.lat;
@@ -3492,42 +3484,63 @@ async function tickRescueMissions() {
           mission.destinationStationName = towDest.station.stationName || null;
           mission.destinationDistanceMeters = Math.round(towDest.meters);
           mission.towingStartedAt = mission.updatedAt;
-          assignRescueRiverPath(
-            mission,
-            { lat, lng },
-            { lat: towDest.lat, lng: towDest.lng },
-          );
-          // Ngay khi bắt đầu kéo: đặt tàu lỗi nối đuôi tàu cứu (không chờ tick sau).
-          const towHeading = bearingDegrees(
-            { lat: mission.currentLat, lng: mission.currentLng },
-            { lat: towDest.lat, lng: towDest.lng },
-          ) || heading;
-          const towRopeMeters = Math.max(12, Number(env.TOW_ROPE_METERS || 18));
-          const behind = pointBehind(
-            { lat: mission.currentLat, lng: mission.currentLng },
-            towHeading,
-            towRopeMeters,
-          );
-          mission.incidentCurrentLat = behind.lat;
-          mission.incidentCurrentLng = behind.lng;
-          if (mission.incidentBoatCode) {
-            const towStart = await publishLiveGpsPosition({
-              boatCode: mission.incidentBoatCode,
-              lat: behind.lat,
-              lng: behind.lng,
-              heading: towHeading,
-              speedKmh: mission.speedKmh,
-              status: 'moving',
-              sendToTarget: true,
-              fromRescue: true,
-            });
-            if (towStart.ok) mission.incidentBoatSequence = towStart.sequence || null;
+
+          if (towDest.meters <= arrivalMeters) {
+            // Đã sát bến → kéo vào đúng bến, tick sau cập bến / nhả SOS.
+            mission.currentLat = towDest.lat;
+            mission.currentLng = towDest.lng;
+            if (mission.incidentBoatCode) {
+              mission.incidentCurrentLat = towDest.lat;
+              mission.incidentCurrentLng = towDest.lng;
+            }
+            assignRescueRiverPath(
+              mission,
+              { lat: towDest.lat, lng: towDest.lng },
+              { lat: towDest.lat, lng: towDest.lng },
+            );
+            mission.pathProgressMeters = mission.pathLengthMeters || 0;
+            console.log(
+              `[rescue-gps] sát ${towDest.station?.stationCode || 'bến'} `
+              + `(${Math.round(towDest.meters)}m) → kéo vào bến luôn`,
+            );
+          } else {
+            assignRescueRiverPath(
+              mission,
+              { lat, lng },
+              { lat: towDest.lat, lng: towDest.lng },
+            );
+            // Ngay khi bắt đầu kéo: đặt tàu lỗi nối đuôi tàu cứu (không chờ tick sau).
+            const towHeading = bearingDegrees(
+              { lat: mission.currentLat, lng: mission.currentLng },
+              { lat: towDest.lat, lng: towDest.lng },
+            ) || heading;
+            const towRopeMeters = Math.max(12, Number(env.TOW_ROPE_METERS || 18));
+            const behind = pointBehind(
+              { lat: mission.currentLat, lng: mission.currentLng },
+              towHeading,
+              towRopeMeters,
+            );
+            mission.incidentCurrentLat = behind.lat;
+            mission.incidentCurrentLng = behind.lng;
+            if (mission.incidentBoatCode) {
+              const towStart = await publishLiveGpsPosition({
+                boatCode: mission.incidentBoatCode,
+                lat: behind.lat,
+                lng: behind.lng,
+                heading: towHeading,
+                speedKmh: mission.speedKmh,
+                status: 'moving',
+                sendToTarget: true,
+                fromRescue: true,
+              });
+              if (towStart.ok) mission.incidentBoatSequence = towStart.sequence || null;
+            }
+            console.log(
+              `[rescue-gps] ${mission.rescueBoatCode} kéo ${mission.incidentBoatCode} → `
+              + `${mission.destinationStationCode || mission.destinationStationName || 'bến gần nhất'} `
+              + `(${Math.round(towDest.meters)}m)`,
+            );
           }
-          console.log(
-            `[rescue-gps] ${mission.rescueBoatCode} kéo ${mission.incidentBoatCode} → `
-            + `${mission.destinationStationCode || mission.destinationStationName || 'bến gần nhất'} `
-            + `(${Math.round(towDest.meters)}m)`,
-          );
         } else {
           mission.status = 'Arrived';
           mission.lastError = 'Không tìm thấy bến để kéo tàu về';
