@@ -5,7 +5,7 @@ const SIGNAL_TTL_MS = 120_000;
 const HEARTBEAT_MS = 5000;
 const CLUSTER_M = 25;
 /** Giữ pin kéo tay khi hub/Azure chưa kịp (tránh nhảy về chỗ cũ). */
-const USER_PIN_HOLD_MS = 45_000;
+const USER_PIN_HOLD_MS = 120_000;
 const USER_PIN_HUB_CATCHUP_M = 40;
 const ROUTE_STYLE = {
   color: '#0f766e',
@@ -1930,7 +1930,7 @@ function bindDragHandlers(marker, code) {
   });
 }
 
-async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
+async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = null } = {}) {
   if (!quiet && sending) return { ok: false, skipped: true, reason: 'busy' };
   // Kéo/gửi tay: không đè trip/rescue. Heartbeat (quiet) vẫn gửi liên tục.
   if (!quiet && (activeTripForBoat(boatCode) || isBoatInActiveAutomatedRescue(boatCode))) {
@@ -1962,6 +1962,7 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
     ? (Number(trip?.speedKmh) > 0 ? Number(trip.speedKmh) : cruise)
     : 0;
   const sendToTarget = sendAzureSelectEl.value === 'on';
+  const authority = holdAuthority == null ? !quiet : Boolean(holdAuthority);
   try {
     const response = await fetch('/api/live/gps', {
       method: 'POST',
@@ -1975,7 +1976,7 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
         status,
         sendToTarget,
         quiet,
-        holdAuthority: !quiet,
+        holdAuthority: authority,
       }),
     });
     const body = await response.json();
@@ -2048,7 +2049,11 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false } = {}) {
     if (!quiet) {
       sendStatusEl.textContent = `OK · seq ${body.sequence || '—'} · ${mode}`;
       if (body.warning) toast(body.warning, 'warn');
-      else toast(`Đã gửi GPS ${boatDisplayName(boatCode)}`, 'ok');
+      else if (body.mode === 'follow-azure' || body.mode === 'local') {
+        toast('Chưa ghi Azure — FE Live Tracking không nhận vị trí kéo', 'warn');
+      } else {
+        toast(`Đã gửi GPS ${boatDisplayName(boatCode)}`, 'ok');
+      }
       if (latest) renderHubBoats(latest.hubBoats);
     } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
       sendStatusEl.textContent = `Heartbeat · seq ${body.sequence || '—'} · ${mode}`;
@@ -2145,7 +2150,8 @@ async function heartbeatAllBoats() {
       const hub = (latest?.hubBoats || []).find((b) => String(b.boatCode || '').trim() === code);
       let lat;
       let lng;
-      if (fixed?.user && recentUserPinHolds(code, hub)) {
+      const pinHolds = Boolean(fixed?.user && recentUserPinHolds(code, hub));
+      if (pinHolds) {
         lat = Number(fixed.lat);
         lng = Number(fixed.lng);
       } else if (Number.isFinite(Number(hub?.lat)) && Number.isFinite(Number(hub?.lng))) {
@@ -2159,7 +2165,7 @@ async function heartbeatAllBoats() {
         code,
         lat,
         lng,
-        { quiet: true },
+        { quiet: true, holdAuthority: pinHolds },
       );
       results.push({
         boatCode: code,

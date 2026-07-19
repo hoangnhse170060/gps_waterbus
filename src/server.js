@@ -98,7 +98,9 @@ const signalrRelay = createSignalRRelay({
     {
       names: ['boatLocation', 'BoatLocationUpdated'],
       onEvent: (payload) => {
-        // Azure SignalR = SoT vị trí chung cho local + Railway (idle).
+        const code = String(payload?.boatCode || payload?.BoatCode || '').trim();
+        // Đang giữ chỗ kéo tay / last-pos mới — bỏ qua echo Azure cũ.
+        if (code && shouldKeepHubOverAzure(code, payload)) return;
         upsertHubBoat({
           ...payload,
           fromAzure: true,
@@ -459,8 +461,7 @@ const server = createServer(async (req, res) => {
       }
     }
     if (url.pathname === '/api/live/resync-positions' && req.method === 'POST') {
-      // Đọc lại Azure nhưng KHÔNG xóa authority / đè chỗ vừa kéo tay.
-      azurePositionsSeeded = false;
+      // Đọc lại Azure nhưng không tắt cửa sổ ghi GPS (tránh mất POST /locations).
       try {
         await pollLatestBoatLocations({ force: true });
         const hubs = [...state.hubBoats.values()].map((b) => ({
@@ -1077,9 +1078,9 @@ function upsertHubBoat(payload) {
     source: payload.source || (payload.fromAzure ? 'azure' : (prev?.source || null)),
     updatedAt: new Date().toISOString(),
   });
-  // Chỉ giữ quyền Live khi user kéo / trip / rescue — không phải heartbeat quiet.
+  // Chỉ giữ quyền Live khi user kéo / trip / rescue / heartbeat giữ pin kéo.
   if (forceAccept && payload.holdAuthority === true) {
-    hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 30_000));
+    hubLiveAuthorityUntil.set(code, Date.now() + Number(env.HUB_LIVE_AUTHORITY_MS || 120_000));
   }
   rememberLastPosition(code, state.hubBoats.get(code));
   // Đồng bộ lat/lng vào state.boats — snapshot/FE không còn dùng vị trí stagger route giả.
@@ -1881,10 +1882,8 @@ async function publishLiveGpsPosition(body = {}) {
 
   // Optimistic local hub marker (SSE) — cập nhật hub TRƯỚC, rồi mới suppress Azure echo.
   const allowAzureWrite = liveAzureWriteEnabled();
-  // Local follow-only: CHỈ cập nhật hub khi user kéo tay / trip / rescue.
-  // Heartbeat (kể cả FE cũ thiếu quiet) không được đè Azure → tránh lệch Railway.
-  const userOrMissionWrite = fromTrip || fromRescue
-    || (body.holdAuthority === true && body.quiet !== true);
+  // holdAuthority=true kể cả heartbeat quiet khi đang giữ chỗ kéo tay.
+  const userOrMissionWrite = fromTrip || fromRescue || body.holdAuthority === true;
   const followOnly = !allowAzureWrite;
   const updateLocalHub = !followOnly || userOrMissionWrite;
   const holdAuthority = userOrMissionWrite;
@@ -1903,20 +1902,18 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   // Chặn Azure echo cũ sau khi hub đã nhận vị trí kéo/trip.
-  const authMs = Number(env.HUB_LIVE_AUTHORITY_MS || 30_000);
+  const authMs = Number(env.HUB_LIVE_AUTHORITY_MS || 120_000);
   if (holdAuthority) {
     hubBoatSuppressUntil.set(boatCode, Date.now() + Math.max(authMs, 8_000));
   }
 
-  const sendToTarget = allowAzureWrite
-    && (azurePositionsSeeded || fromTrip || fromRescue || holdAuthority)
-    && (
-      body.sendToTarget !== undefined
-        ? Boolean(body.sendToTarget)
-        : Boolean(state.senderEnabled && getTargetEndpoint())
-    );
+  // Gửi Azure khi bật write + FE/server cho phép — không chặn vì chưa seed.
+  const wantSend = body.sendToTarget !== undefined
+    ? Boolean(body.sendToTarget)
+    : Boolean(state.senderEnabled && getTargetEndpoint());
+  const sendToTarget = allowAzureWrite && wantSend && Boolean(getTargetEndpoint());
 
-  if (!sendToTarget || !getTargetEndpoint()) {
+  if (!sendToTarget) {
     return {
       ok: true,
       status: 200,
@@ -1925,9 +1922,9 @@ async function publishLiveGpsPosition(body = {}) {
       payload,
       warning: !allowAzureWrite
         ? 'Local chỉ đọc vị trí Azure (LIVE_AZURE_WRITE=false) — Railway ghi GPS.'
-        : (!azurePositionsSeeded && !fromTrip && !fromRescue
-          ? 'Chưa seed boats/latest từ Azure — tạm chưa ghi GPS.'
-          : 'Chưa gửi Azure (SEND_TO_TARGET tắt hoặc chưa cấu hình endpoint).'),
+        : (!wantSend
+          ? 'Chưa gửi Azure (Gửi Azure tắt hoặc SEND_TO_TARGET=false).'
+          : 'Chưa cấu hình TARGET_GPS_ENDPOINT.'),
     };
   }
 
