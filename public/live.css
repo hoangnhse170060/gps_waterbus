@@ -29,7 +29,7 @@
 
 .live-panel {
   position: absolute;
-  z-index: 500;
+  z-index: 800;
   top: 18px;
   left: 18px;
   width: min(340px, calc(100vw - 36px));
@@ -261,6 +261,13 @@ body.survey-open {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+.live-field select {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+  cursor: pointer;
 }
 
 .live-hint {

@@ -106,6 +106,8 @@ let lastEventsAt = 0;
 let snapshotPollTimer = null;
 let snapshotPollBusy = false;
 let sseAlive = false;
+let boatOptionsSignature = '';
+let pendingBoatOptionsRefresh = false;
 const pinnedPositions = loadJsonMap(STORAGE_PINS);
 // Pin/heading v1 từng làm local ≠ Railway (mỗi domain nhớ riêng).
 try {
@@ -1228,9 +1230,42 @@ function resolveUniqueSeed(code, lat, lng, occupied) {
   return { lat, lng };
 }
 
+function buildBoatOptionsSignature(data) {
+  return catalogBoats(data).map((boat) => {
+    const max = Number(boat.maxSpeedKmh) || '';
+    const name = boat.boatName ? ` · ${boat.boatName}` : '';
+    const maxText = max ? ` · max ${max}` : '';
+    const dbTag = boatDbStatusLabel(boat.boatCode, data);
+    const statusTag = dbTag && dbTag !== 'Hoạt động' ? ` · ${dbTag}` : '';
+    return `${boat.boatCode}${name}${maxText}${statusTag}`;
+  }).join('\n');
+}
+
+function isBoatSelectInteracting() {
+  return document.activeElement === boatSelectEl;
+}
+
 function renderBoatOptions(data) {
-  const boats = catalogBoats(data);
+  if (!boatSelectEl) return;
+  const signature = buildBoatOptionsSignature(data);
+  if (isBoatSelectInteracting()) {
+    if (signature !== boatOptionsSignature) pendingBoatOptionsRefresh = true;
+    return;
+  }
+  pendingBoatOptionsRefresh = false;
   const previous = selectedBoatCode || boatSelectEl.value;
+  if (signature === boatOptionsSignature) {
+    if (previous && boatSelectEl.value !== previous
+      && [...boatSelectEl.options].some((o) => o.value === previous)) {
+      boatSelectEl.value = previous;
+      selectedBoatCode = previous;
+    }
+    updateDeviceHint();
+    syncBoatControls();
+    return;
+  }
+  boatOptionsSignature = signature;
+  const boats = catalogBoats(data);
   boatSelectEl.innerHTML = [
     '<option value="">Chọn tàu...</option>',
     ...boats.map((boat) => {
@@ -2679,6 +2714,13 @@ window.addEventListener('online', () => {
   eventsBackoffMs = 1000;
   pullSnapshot({ force: true }).catch(() => {});
   connectEvents();
+});
+
+boatSelectEl?.addEventListener('blur', () => {
+  if (!pendingBoatOptionsRefresh || !latest) return;
+  pendingBoatOptionsRefresh = false;
+  boatOptionsSignature = '';
+  renderBoatOptions(latest);
 });
 
 boatSelectEl.addEventListener('change', () => {
