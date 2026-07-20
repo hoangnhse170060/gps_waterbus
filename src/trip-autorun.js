@@ -15,11 +15,14 @@ import {
 const ACTIVE_TRIP_STATUSES = new Set([
   'Pending',
   'ToDeparture', // chạy về bến xuất phát của lịch trước khi boarding/chạy tuyến
+  'ToHandoff', // tàu thay → điểm bàn giao (hiện trường / bến target) rồi resume trip
   'Boarding',
   'Running',
   'WaitingAtStop',
   'Paused',
 ]);
+
+const HANDOFF_ARRIVE_M = 35;
 
 // Khớp Live FE: Arriving sớm hơn, Arrived sát bến (không báo cập bến khi còn ngoài sông).
 const STOP_ARRIVING_M = 120;
@@ -57,6 +60,8 @@ export function createTripAutorun(ctx) {
   /** Sau 401/403: tạm dừng poll due (ms epoch) — tránh spam log mỗi 30s. */
   let dueAuthBlockedUntil = 0;
   let dueAuthLastWarnAt = 0;
+  /** RescueDispatched tới trước khi GPS đã có trip local → áp khi startTripMission. */
+  const pendingTripTakeovers = new Map();
 
   function tripAutorunEnabled() {
     return parseBool(env.TRIP_AUTORUN ?? 'true');
@@ -111,9 +116,12 @@ export function createTripAutorun(ctx) {
     if (!mission) return null;
     return {
       tripId: mission.tripId,
+      tripCode: mission.tripCode || null,
       boatCode: mission.boatCode,
+      takenOverFrom: mission.takenOverFrom || null,
       routeCode: mission.routeCode,
       status: mission.status,
+      handoffMissionType: mission.handoffMissionType || null,
       departureTime: mission.departureTime,
       arrivalTime: mission.arrivalTime,
       progressMeters: round1(mission.progressMeters),
@@ -726,6 +734,406 @@ export function createTripAutorun(ctx) {
     return [...codes];
   }
 
+  function findActiveTripMission({ tripId = null, boatCode = null } = {}) {
+    const id = cleanOptionalText(tripId);
+    if (id && state.tripMissions.has(id)) {
+      const mission = state.tripMissions.get(id);
+      if (ACTIVE_TRIP_STATUSES.has(String(mission?.status || ''))) return mission;
+    }
+    const code = cleanOptionalText(boatCode);
+    if (!code) return null;
+    for (const mission of state.tripMissions.values()) {
+      if (!ACTIVE_TRIP_STATUSES.has(String(mission?.status || ''))) continue;
+      if (String(mission.boatCode || '').trim() === code) return mission;
+    }
+    return null;
+  }
+
+  function pendingTakeoverKey({ tripId = null, fromBoatCode = null } = {}) {
+    const id = cleanOptionalText(tripId);
+    if (id) return `trip:${id}`;
+    const boat = cleanOptionalText(fromBoatCode);
+    if (boat) return `boat:${boat}`;
+    return null;
+  }
+
+  function resolveHandoffStopIndex(mission, takeover) {
+    const stops = Array.isArray(mission?.stops) ? mission.stops : [];
+    if (!stops.length) return 0;
+    const order = Number(takeover?.targetStopOrder);
+    if (Number.isFinite(order)) {
+      const byOrder = stops.findIndex((s) => (
+        Number(s.stopOrder ?? s.order ?? s.stopSequence) === order
+      ));
+      if (byOrder >= 0) return byOrder;
+    }
+    const stationId = cleanOptionalText(takeover?.targetStationId);
+    const stationCode = cleanOptionalText(takeover?.targetStationCode)?.toLowerCase();
+    const stationName = cleanOptionalText(takeover?.targetStationName)?.toLowerCase();
+    if (stationId || stationCode || stationName) {
+      const byId = stops.findIndex((s) => {
+        const sid = String(s.stationId || s.id || '').trim();
+        const scode = String(s.stationCode || s.code || '').trim().toLowerCase();
+        const sname = String(s.stationName || s.name || '').trim().toLowerCase();
+        if (stationId && (sid === stationId || scode === stationId)) return true;
+        if (stationCode && scode === stationCode) return true;
+        if (stationName && (sname === stationName || sname.includes(stationName))) return true;
+        return false;
+      });
+      if (byId >= 0) return byId;
+    }
+    const lat = Number(takeover?.handoffLat);
+    const lng = Number(takeover?.handoffLng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < stops.length; i += 1) {
+        const s = stops[i];
+        if (!Number.isFinite(Number(s.lat)) || !Number.isFinite(Number(s.lng))) continue;
+        const d = distanceMetersFn(
+          { lat, lng },
+          { lat: Number(s.lat), lng: Number(s.lng) },
+        );
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    }
+    return Math.max(0, Number(mission.stopIndex) || 0);
+  }
+
+  function snapMissionToHandoff(mission, takeover) {
+    const coords = mission.coordinates || [];
+    const type = String(takeover?.replacementMissionType || mission.handoffMissionType || '');
+    const handoffLat = Number(takeover?.handoffLat ?? mission.handoffLat);
+    const handoffLng = Number(takeover?.handoffLng ?? mission.handoffLng);
+
+    if (/continuefromstation/i.test(type)) {
+      const stopIndex = resolveHandoffStopIndex(mission, {
+        ...takeover,
+        handoffLat,
+        handoffLng,
+        targetStationId: takeover?.targetStationId || mission.handoffStationId,
+        targetStationCode: takeover?.targetStationCode || mission.handoffStationCode,
+        targetStationName: takeover?.targetStationName || mission.handoffStationName,
+        targetStopOrder: takeover?.targetStopOrder ?? mission.handoffStopOrder,
+      });
+      const stop = mission.stops?.[stopIndex];
+      mission.stopIndex = stopIndex;
+      if (stop && Number.isFinite(Number(stop.lat))) {
+        mission.currentLat = Number(stop.lat);
+        mission.currentLng = Number(stop.lng);
+        const along = alongMetersToStop(
+          { ...mission, progressMeters: 0 },
+          stop,
+        );
+        if (Number.isFinite(along)) {
+          mission.progressMeters = Math.min(Number(mission.lengthMeters) || along, along);
+        }
+      }
+      return;
+    }
+
+    // TransferAtIncidentLocation (mặc định): chiếu hiện trường lên path, giữ tiến độ.
+    if (coords.length >= 2 && Number.isFinite(handoffLat) && Number.isFinite(handoffLng)) {
+      const proj = projectOnPath(coords, { lat: handoffLat, lng: handoffLng });
+      if (proj && Number.isFinite(Number(proj.alongMeters))) {
+        const along = Math.max(
+          Number(mission.progressMeters) || 0,
+          Number(proj.alongMeters) || 0,
+        );
+        mission.progressMeters = Math.min(Number(mission.lengthMeters) || along, along);
+        const point = pointAtDistance(coords, mission.progressMeters);
+        mission.currentLat = point.lat;
+        mission.currentLng = point.lng;
+        if (point.heading) mission.lastHeading = point.heading;
+      } else {
+        mission.currentLat = handoffLat;
+        mission.currentLng = handoffLng;
+      }
+    } else if (Number.isFinite(handoffLat) && Number.isFinite(handoffLng)) {
+      mission.currentLat = handoffLat;
+      mission.currentLng = handoffLng;
+    }
+
+    // stopIndex = bến tiếp theo phía trước progress.
+    const stops = mission.stops || [];
+    let nextIdx = Number(mission.stopIndex) || 0;
+    for (let i = 0; i < stops.length; i += 1) {
+      const along = alongMetersToStop({ ...mission, progressMeters: 0 }, stops[i]);
+      if (Number.isFinite(along) && along > (Number(mission.progressMeters) || 0) + 20) {
+        nextIdx = i;
+        break;
+      }
+      nextIdx = i;
+    }
+    mission.stopIndex = nextIdx;
+  }
+
+  function applyTakeoverToMission(mission, takeover) {
+    const toBoat = cleanOptionalText(takeover?.toBoatCode);
+    if (!mission || !toBoat) return { ok: false, error: 'missing mission/toBoat' };
+
+    const fromBoat = cleanOptionalText(mission.boatCode) || cleanOptionalText(takeover.fromBoatCode);
+    const boat = boatByIdOrCode(toBoat);
+    const maxSpeedKmh = Number(boat?.maxSpeedKmh)
+      || maxSpeedForBoatCode(toBoat)
+      || Number(mission.maxSpeedKmh)
+      || Number(env.DEFAULT_SPEED_KMH || 16)
+      || 16;
+
+    mission.takenOverFrom = fromBoat || mission.takenOverFrom || null;
+    mission.takenOverAt = new Date().toISOString();
+    mission.boatCode = toBoat;
+    mission.tripCode = cleanOptionalText(takeover.tripCode) || mission.tripCode || null;
+    mission.maxSpeedKmh = maxSpeedKmh;
+    mission.handoffMissionType = cleanOptionalText(takeover.replacementMissionType)
+      || mission.handoffMissionType
+      || 'TransferAtIncidentLocation';
+    mission.handoffLat = Number(takeover.handoffLat);
+    mission.handoffLng = Number(takeover.handoffLng);
+    mission.handoffStationId = cleanOptionalText(takeover.targetStationId) || null;
+    mission.handoffStationCode = cleanOptionalText(takeover.targetStationCode) || null;
+    mission.handoffStationName = cleanOptionalText(takeover.targetStationName) || null;
+    mission.handoffStopOrder = Number.isFinite(Number(takeover.targetStopOrder))
+      ? Number(takeover.targetStopOrder)
+      : null;
+    mission.replacementDelayMinutes = Number.isFinite(Number(takeover.replacementDelayMinutes))
+      ? Number(takeover.replacementDelayMinutes)
+      : mission.replacementDelayMinutes ?? null;
+    mission.incidentId = cleanOptionalText(takeover.incidentId) || mission.incidentId || null;
+
+    const hub = state.hubBoats.get(toBoat);
+    if (Number.isFinite(Number(hub?.lat)) && Number.isFinite(Number(hub?.lng))) {
+      mission.currentLat = Number(hub.lat);
+      mission.currentLng = Number(hub.lng);
+      if (Number.isFinite(Number(hub.heading))) mission.lastHeading = Number(hub.heading);
+    }
+
+    mission.approachPath = null;
+    mission.approachProgress = 0;
+    mission.status = 'ToHandoff';
+    mission.movementStatus = 'Moving';
+    mission.speedKmh = 0;
+    mission.lastError = null;
+    mission.updatedAt = new Date().toISOString();
+
+    console.log(
+      `[trip-gps] TAKEOVER ${fromBoat || '?'} → ${toBoat} trip=${mission.tripId}`
+      + (mission.tripCode ? ` (${mission.tripCode})` : '')
+      + ` · ${mission.handoffMissionType}`
+      + (Number.isFinite(mission.handoffLat)
+        ? ` → ${mission.handoffLat.toFixed(5)},${mission.handoffLng.toFixed(5)}`
+        : ''),
+    );
+
+    publishLiveGpsPosition({
+      boatCode: toBoat,
+      lat: mission.currentLat,
+      lng: mission.currentLng,
+      heading: mission.lastHeading || 0,
+      speedKmh: 0,
+      status: 'idle',
+      tripId: mission.tripId,
+      routeCode: mission.routeCode,
+      sendToTarget: true,
+      fromTrip: true,
+    }).catch((error) => {
+      console.warn(`[trip-gps] takeover publish ${toBoat}: ${error.message}`);
+    });
+
+    return { ok: true, mission, fromBoat, toBoat };
+  }
+
+  /**
+   * RescueDispatched: replacementBoatCode nhận tripId ngay.
+   * Tàu sự cố ngừng publish trip; SOS chỉ kéo, không chạy trip.
+   */
+  function takeoverTripForReplacement(raw = {}) {
+    const toBoatCode = cleanOptionalText(raw.toBoatCode || raw.replacementBoatCode);
+    const fromBoatCode = cleanOptionalText(raw.fromBoatCode || raw.boatCode || raw.incidentBoatCode);
+    const tripId = cleanOptionalText(raw.tripId);
+    const tripCode = cleanOptionalText(raw.tripCode);
+    if (!toBoatCode) {
+      return { ok: false, skipped: true, reason: 'no-replacement' };
+    }
+    if (!tripId && !fromBoatCode) {
+      return { ok: false, skipped: true, reason: 'no-tripId' };
+    }
+
+    let missionType = cleanOptionalText(raw.replacementMissionType) || 'TransferAtIncidentLocation';
+    if (/^none$/i.test(missionType) || /passengerrecovery/i.test(missionType)) {
+      return { ok: false, skipped: true, reason: missionType };
+    }
+
+    let handoffLat = Number(raw.handoffLat ?? raw.replacementTargetLat);
+    let handoffLng = Number(raw.handoffLng ?? raw.replacementTargetLng);
+    if (/continuefromstation/i.test(missionType)) {
+      if (!Number.isFinite(handoffLat) || !Number.isFinite(handoffLng)) {
+        handoffLat = Number(raw.incidentLat);
+        handoffLng = Number(raw.incidentLng);
+      }
+    } else {
+      handoffLat = Number(raw.incidentLat ?? raw.handoffLat);
+      handoffLng = Number(raw.incidentLng ?? raw.handoffLng);
+    }
+
+    const takeover = {
+      tripId,
+      tripCode,
+      fromBoatCode,
+      toBoatCode,
+      replacementMissionType: /continuefromstation/i.test(missionType)
+        ? 'ContinueFromStation'
+        : 'TransferAtIncidentLocation',
+      handoffLat: Number.isFinite(handoffLat) ? handoffLat : null,
+      handoffLng: Number.isFinite(handoffLng) ? handoffLng : null,
+      targetStationId: cleanOptionalText(raw.replacementTargetStationId || raw.targetStationId),
+      targetStationCode: cleanOptionalText(raw.replacementTargetStationCode || raw.targetStationCode),
+      targetStationName: cleanOptionalText(raw.replacementTargetStationName || raw.targetStationName),
+      targetStopOrder: Number.isFinite(Number(raw.replacementTargetStopOrder ?? raw.targetStopOrder))
+        ? Number(raw.replacementTargetStopOrder ?? raw.targetStopOrder)
+        : null,
+      replacementDelayMinutes: Number.isFinite(Number(raw.replacementDelayMinutes))
+        ? Number(raw.replacementDelayMinutes)
+        : null,
+      incidentId: cleanOptionalText(raw.incidentId),
+    };
+
+    if (!Number.isFinite(Number(takeover.handoffLat)) || !Number.isFinite(Number(takeover.handoffLng))) {
+      return { ok: false, error: 'Thiếu tọa độ bàn giao tàu thay', takeover };
+    }
+
+    const mission = findActiveTripMission({ tripId, boatCode: fromBoatCode });
+    if (!mission) {
+      const key = pendingTakeoverKey({ tripId, fromBoatCode });
+      if (key) pendingTripTakeovers.set(key, takeover);
+      console.warn(
+        `[trip-gps] TAKEOVER pending — chưa có trip local`
+        + ` trip=${tripId || '?'} from=${fromBoatCode || '?'} → ${toBoatCode}`,
+      );
+      return { ok: false, pending: true, takeover };
+    }
+
+    // Đổi key map nếu tripId trong hook khác (hiếm) — giữ nguyên id mission.
+    const result = applyTakeoverToMission(mission, takeover);
+    const key = pendingTakeoverKey({ tripId: mission.tripId, fromBoatCode });
+    if (key) pendingTripTakeovers.delete(key);
+    pendingTripTakeovers.delete(pendingTakeoverKey({ tripId, fromBoatCode }));
+    return result;
+  }
+
+  function tryApplyPendingTakeover(mission) {
+    if (!mission) return null;
+    const tripKey = pendingTakeoverKey({ tripId: mission.tripId });
+    const boatKey = pendingTakeoverKey({ fromBoatCode: mission.boatCode });
+    const takeover = (tripKey && pendingTripTakeovers.get(tripKey))
+      || (boatKey && pendingTripTakeovers.get(boatKey))
+      || null;
+    if (!takeover) return null;
+    if (tripKey) pendingTripTakeovers.delete(tripKey);
+    if (boatKey) pendingTripTakeovers.delete(boatKey);
+    // Huỷ xfer tạm (nếu đã chạy visual trước khi có trip).
+    const incidentId = cleanOptionalText(takeover.incidentId);
+    if (incidentId && state.rescueMissions?.has?.(`${incidentId}__xfer`)) {
+      state.rescueMissions.delete(`${incidentId}__xfer`);
+    }
+    return applyTakeoverToMission(mission, takeover);
+  }
+
+  /** Phase: tàu thay chạy tới điểm bàn giao rồi resume trip + tripId. */
+  async function tickToHandoff(mission, nowMs) {
+    const target = {
+      lat: Number(mission.handoffLat),
+      lng: Number(mission.handoffLng),
+    };
+    if (!Number.isFinite(target.lat) || !Number.isFinite(target.lng)) {
+      snapMissionToHandoff(mission, mission);
+      mission.status = 'Running';
+      mission.movementStatus = 'Moving';
+      refreshNextStopInfo(mission, nowMs);
+      await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
+      return;
+    }
+
+    const from = { lat: Number(mission.currentLat), lng: Number(mission.currentLng) };
+    const dist = distanceMetersFn(from, target);
+    mission.nextStationId = mission.handoffStationId || mission.handoffStationCode || mission.nextStationId;
+    mission.nextStopCode = mission.handoffStationCode || mission.nextStopCode;
+    mission.nextStopName = mission.handoffStationName
+      || (mission.handoffMissionType === 'ContinueFromStation' ? 'Bến bàn giao' : 'Hiện trường')
+      || mission.nextStopName;
+    mission.nextStopDistanceKm = Math.max(0, dist) / 1000;
+    mission.speedKmh = clampSpeedToBoatMax(
+      Number(mission.maxSpeedKmh) || Number(env.DEFAULT_SPEED_KMH || 16),
+      mission.maxSpeedKmh,
+    );
+    mission.requiredSpeedKmh = mission.speedKmh;
+    mission.nextStopEtaMin = etaMinutesFromDistance(dist, mission.speedKmh);
+    mission.movementStatus = 'Moving';
+    mission.status = 'ToHandoff';
+
+    if (dist <= HANDOFF_ARRIVE_M) {
+      snapMissionToHandoff(mission, mission);
+      mission.approachPath = null;
+      mission.approachProgress = 0;
+      mission.speedKmh = 0;
+      const stop = mission.stops?.[mission.stopIndex];
+      const planDep = parseTimeMs(stop?.plannedDepartureTime);
+      if (stop && nearStop(mission, stop) && Number.isFinite(planDep) && nowMs < planDep) {
+        mission.status = 'WaitingAtStop';
+        mission.movementStatus = 'Waiting';
+      } else {
+        mission.status = 'Running';
+        mission.movementStatus = 'Moving';
+      }
+      console.log(
+        `[trip-gps] HANDOFF xong ${mission.boatCode} trip=${mission.tripId} → ${mission.status}`
+        + ` · progress ${Math.round(Number(mission.progressMeters) || 0)}m`,
+      );
+      refreshNextStopInfo(mission, nowMs);
+      await maybeEmitStopEvents(mission);
+      await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
+      mission.lastTickAt = nowMs;
+      return;
+    }
+
+    const pathEnd = Array.isArray(mission.approachPath) && mission.approachPath.length
+      ? mission.approachPath[mission.approachPath.length - 1]
+      : null;
+    const endDrift = pathEnd ? distanceMetersFn(pathEnd, target) : Infinity;
+    if (!Array.isArray(mission.approachPath) || mission.approachPath.length < 2 || endDrift > 40) {
+      const base = resolveRiverBasePath({
+        stations: state.stations || [],
+        routes: [...state.routes.values()],
+        osmCorridor: state.osmWaterbusCorridor || [],
+      });
+      const built = buildRiverPath(from, target, base, { joinMeters: 90 });
+      mission.approachPath = built.coordinates;
+      mission.approachProgress = 0;
+    }
+
+    const elapsedSeconds = mission.lastTickAt
+      ? Math.max(0.2, Math.min(5, (nowMs - mission.lastTickAt) / 1000))
+      : 1;
+    const stepMeters = Math.max(0.5, (mission.speedKmh * 1000 / 3600) * elapsedSeconds);
+    const adv = advanceAlongCoordinates(
+      mission.approachPath,
+      mission.approachProgress || 0,
+      stepMeters,
+    );
+    mission.approachProgress = adv.progressMeters;
+    mission.currentLat = adv.lat;
+    mission.currentLng = adv.lng;
+    if (Number.isFinite(Number(adv.heading))) mission.lastHeading = Number(adv.heading);
+    refreshNextStopInfo(mission, nowMs);
+    await publishTripPoint(mission, { speedKmh: mission.speedKmh, status: 'moving' });
+    mission.lastTickAt = nowMs;
+    mission.updatedAt = new Date().toISOString();
+  }
+
   function startTripMission(row) {
     const tripId = cleanOptionalText(row.tripId || row.TripId);
     const boatCode = cleanOptionalText(row.boatCode || row.BoatCode);
@@ -733,6 +1141,14 @@ export function createTripAutorun(ctx) {
     if (state.tripMissions.has(tripId)) {
       const existing = state.tripMissions.get(tripId);
       if (ACTIVE_TRIP_STATUSES.has(String(existing.status || '')) || existing.status === 'Completed') {
+        const pending = tryApplyPendingTakeover(existing);
+        if (pending?.ok) {
+          setTimeout(() => {
+            tickOneMission(existing, Date.now()).catch((error) => {
+              console.warn(`[trip-gps] takeover-existing-tick ${tripId}: ${error.message}`);
+            });
+          }, 0);
+        }
         return existing;
       }
     }
@@ -863,6 +1279,16 @@ export function createTripAutorun(ctx) {
       + `${mission.nextStopCode || mission.nextStopName || ''} `
       + `(${jumpFromMeters != null ? `${Math.round(jumpFromMeters)}m` : 'n/a'}) · dep ${departureTime || '?'}`,
     );
+
+    const pending = tryApplyPendingTakeover(mission);
+    if (pending?.ok) {
+      setTimeout(() => {
+        tickOneMission(mission, Date.now()).catch((error) => {
+          console.warn(`[trip-gps] takeover-first-tick ${tripId}: ${error.message}`);
+        });
+      }, 0);
+      return mission;
+    }
 
     // Publish ngay tại bến xuất phát — chỉ lần nhảy khi bắt đầu trip.
     publishLiveGpsPosition({
@@ -1145,7 +1571,21 @@ export function createTripAutorun(ctx) {
       });
     }
 
-    if (isBoatInActiveRescueMission(mission.boatCode) || hasOpenIncidentForBoat(mission.boatCode)) {
+    if (String(mission.status) === 'ToHandoff') {
+      await tickToHandoff(mission, nowMs);
+      return;
+    }
+
+    // Tàu sự cố / SOS kéo → pause trip. Tàu thay sau takeover vẫn chạy (takenOverFrom).
+    if (hasOpenIncidentForBoat(mission.boatCode)) {
+      mission.status = 'Paused';
+      mission.speedKmh = 0;
+      refreshNextStopInfo(mission, nowMs);
+      await maybeEmitStopEvents(mission);
+      mission.updatedAt = new Date().toISOString();
+      return;
+    }
+    if (!mission.takenOverFrom && isBoatInActiveRescueMission(mission.boatCode)) {
       mission.status = 'Paused';
       mission.speedKmh = 0;
       refreshNextStopInfo(mission, nowMs);
@@ -1345,6 +1785,8 @@ export function createTripAutorun(ctx) {
     isBoatInActiveTripMission,
     tripMissionsPublic,
     startTripMission,
+    takeoverTripForReplacement,
+    findActiveTripMission,
   };
 }
 

@@ -2702,7 +2702,8 @@ function normalizeIncident(row, source = 'api') {
     boatId: boatId || null,
     boatCode,
     boatName: nested.boatName || nested.BoatName || boatByIdOrCode(boatId)?.boatName || null,
-    tripId: nested.tripId || nested.TripId || null,
+    tripId: cleanOptionalText(nested.tripId || nested.TripId) || null,
+    tripCode: cleanOptionalText(nested.tripCode || nested.TripCode) || null,
     incidentType: nested.incidentType || nested.IncidentType || null,
     severity: nested.severity || nested.Severity || null,
     description: nested.description || nested.Description || null,
@@ -2799,6 +2800,8 @@ function upsertIncidentRecord(incident, { removeIfResolved = true } = {}) {
     sceneLat,
     sceneLng,
     boatCode: incident.boatCode || prev.boatCode || null,
+    tripId: incident.tripId || prev.tripId || null,
+    tripCode: incident.tripCode || prev.tripCode || null,
     replacementBoatCode: incident.replacementBoatCode || prev.replacementBoatCode || null,
     rescueBoatCode: incident.rescueBoatCode || prev.rescueBoatCode || null,
     replacementMissionType: incident.replacementMissionType ?? prev.replacementMissionType ?? null,
@@ -3379,7 +3382,7 @@ function startRescueAutomation(incident) {
   }
   broadcast();
 
-  // Tàu thay khách theo replacementMissionType (contract BE).
+  // Tàu thay khách: có tripId → takeover trip ngay; không trip → chỉ điều hướng (xfer cũ).
   let transferAutomation = null;
   const replacementFields = {
     replacementMissionType: incident?.replacementMissionType
@@ -3393,6 +3396,12 @@ function startRescueAutomation(incident) {
     replacementTargetStationId: incident?.replacementTargetStationId
       || mission.replacementTargetStationId
       || null,
+    replacementTargetStationCode: incident?.replacementTargetStationCode
+      || mission.replacementTargetStationCode
+      || null,
+    replacementTargetStopOrder: incident?.replacementTargetStopOrder
+      ?? mission.replacementTargetStopOrder
+      ?? null,
     replacementDelayMinutes: incident?.replacementDelayMinutes ?? mission.replacementDelayMinutes,
     replacementEstimatedResumeAt: incident?.replacementEstimatedResumeAt
       || mission.replacementEstimatedResumeAt
@@ -3402,10 +3411,69 @@ function startRescueAutomation(incident) {
   };
   Object.assign(mission, replacementFields);
 
-  transferAutomation = startReplacementBoatAutomation(mission, {
-    incidentLat: resolvedTargetLat,
-    incidentLng: resolvedTargetLng,
-  });
+  const tripId = cleanOptionalText(incident?.tripId || open?.tripId || mission.tripId);
+  const tripCode = cleanOptionalText(incident?.tripCode || open?.tripCode || mission.tripCode);
+  if (tripId) {
+    mission.tripId = tripId;
+    mission.tripCode = tripCode;
+    if (open) {
+      open.tripId = tripId;
+      open.tripCode = tripCode;
+    }
+  }
+
+  if (mission.replacementBoatCode && tripId) {
+    let handoffLat = resolvedTargetLat;
+    let handoffLng = resolvedTargetLng;
+    const missionType = normalizeReplacementMissionType(mission.replacementMissionType)
+      || 'TransferAtIncidentLocation';
+    if (missionType === 'ContinueFromStation') {
+      const sLat = Number(mission.replacementTargetLat);
+      const sLng = Number(mission.replacementTargetLng);
+      if (Number.isFinite(sLat) && Number.isFinite(sLng)) {
+        handoffLat = sLat;
+        handoffLng = sLng;
+      } else {
+        const station = findStationForReplacementTarget(mission);
+        if (station) {
+          handoffLat = Number(station.lat);
+          handoffLng = Number(station.lng);
+        }
+      }
+    }
+    transferAutomation = tripAutorun.takeoverTripForReplacement({
+      tripId,
+      tripCode,
+      fromBoatCode: incidentBoatCode,
+      toBoatCode: mission.replacementBoatCode,
+      replacementMissionType: missionType,
+      handoffLat,
+      handoffLng,
+      incidentLat: resolvedTargetLat,
+      incidentLng: resolvedTargetLng,
+      replacementTargetLat: mission.replacementTargetLat,
+      replacementTargetLng: mission.replacementTargetLng,
+      replacementTargetStationId: mission.replacementTargetStationId,
+      replacementTargetStationCode: mission.replacementTargetStationCode,
+      replacementTargetStationName: mission.replacementTargetStationName,
+      replacementTargetStopOrder: mission.replacementTargetStopOrder,
+      replacementDelayMinutes: mission.replacementDelayMinutes,
+      incidentId,
+    });
+    // Chưa có trip local → vẫn điều tàu thay tới điểm bàn giao (visual), takeover khi trip xuất hiện.
+    if (transferAutomation?.pending) {
+      const xfer = startReplacementBoatAutomation(mission, {
+        incidentLat: resolvedTargetLat,
+        incidentLng: resolvedTargetLng,
+      });
+      transferAutomation = { ...transferAutomation, xfer };
+    }
+  } else {
+    transferAutomation = startReplacementBoatAutomation(mission, {
+      incidentLat: resolvedTargetLat,
+      incidentLng: resolvedTargetLng,
+    });
+  }
 
   return {
     started: true,
@@ -3879,7 +3947,8 @@ async function tickRescueMissions() {
  * { "event": "RescueDispatched", "incidentId": "...", "boatCode": "WB_001", "rescueBoatCode": "SOS_001", "replacementBoatCode": "WB_002", "lat": 10.77, "lng": 106.70 }
  * { "event": "IncidentResolved", "incidentId": "..." }
  *
- * RescueDispatched: SOS → hiện trường; replacement theo replacementMissionType:
+ * RescueDispatched: SOS → hiện trường (kéo, không chạy trip).
+ * Có tripId + replacementBoatCode → tàu thay takeover tripId ngay, gửi locations với trip đó.
  *   TransferAtIncidentLocation | ContinueFromStation | PassengerRecoveryRequired | None
  */
 function ingestIncidentHook(body = {}, req = null) {
@@ -4007,7 +4076,8 @@ function ingestIncidentHook(body = {}, req = null) {
     boatId: body.boatId || boat?.boatId || null,
     boatCode: body.boatCode || boat?.boatCode || null,
     boatName: body.boatName || boat?.boatName || null,
-    tripId: body.tripId || boat?.tripId || null,
+    tripId: cleanOptionalText(body.tripId || body.TripId) || boat?.tripId || null,
+    tripCode: cleanOptionalText(body.tripCode || body.TripCode) || null,
     incidentType: body.incidentType || 'OperationalIssue',
     severity: body.severity || 'High',
     description: body.description || `Hook ${event}`,
