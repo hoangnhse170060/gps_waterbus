@@ -2753,9 +2753,17 @@ function extractReplacementMissionFields(...sources) {
     replacementTargetStationId: cleanOptionalText(
       src.replacementTargetStationId || src.ReplacementTargetStationId,
     ) || null,
+    replacementTargetStationCode: cleanOptionalText(
+      src.replacementTargetStationCode || src.ReplacementTargetStationCode,
+    ) || null,
     replacementTargetStationName: cleanOptionalText(
       src.replacementTargetStationName || src.ReplacementTargetStationName,
     ) || null,
+    replacementTargetStopOrder: Number.isFinite(Number(
+      src.replacementTargetStopOrder ?? src.ReplacementTargetStopOrder,
+    ))
+      ? Number(src.replacementTargetStopOrder ?? src.ReplacementTargetStopOrder)
+      : null,
     replacementTargetLat: Number.isFinite(targetLat) ? targetLat : null,
     replacementTargetLng: Number.isFinite(targetLng) ? targetLng : null,
     replacementDelayMinutes: Number.isFinite(delayMin) ? delayMin : null,
@@ -2795,7 +2803,9 @@ function upsertIncidentRecord(incident, { removeIfResolved = true } = {}) {
     rescueBoatCode: incident.rescueBoatCode || prev.rescueBoatCode || null,
     replacementMissionType: incident.replacementMissionType ?? prev.replacementMissionType ?? null,
     replacementTargetStationId: incident.replacementTargetStationId ?? prev.replacementTargetStationId ?? null,
+    replacementTargetStationCode: incident.replacementTargetStationCode ?? prev.replacementTargetStationCode ?? null,
     replacementTargetStationName: incident.replacementTargetStationName ?? prev.replacementTargetStationName ?? null,
+    replacementTargetStopOrder: incident.replacementTargetStopOrder ?? prev.replacementTargetStopOrder ?? null,
     replacementTargetLat: incident.replacementTargetLat ?? prev.replacementTargetLat ?? null,
     replacementTargetLng: incident.replacementTargetLng ?? prev.replacementTargetLng ?? null,
     replacementDelayMinutes: incident.replacementDelayMinutes ?? prev.replacementDelayMinutes ?? null,
@@ -3480,6 +3490,7 @@ function startReplacementBoatAutomation(rescueMission, { incidentLat, incidentLn
 
 function findStationForReplacementTarget(mission) {
   const id = String(mission?.replacementTargetStationId || '').trim();
+  const code = String(mission?.replacementTargetStationCode || '').trim().toLowerCase();
   const name = String(mission?.replacementTargetStationName || '').trim().toLowerCase();
   const stations = Array.isArray(state.stations) ? state.stations : [];
   if (id) {
@@ -3488,6 +3499,12 @@ function findStationForReplacementTarget(mission) {
       || String(s.stationCode || s.code || '').trim() === id
     ));
     if (byId && Number.isFinite(Number(byId.lat)) && Number.isFinite(Number(byId.lng))) return byId;
+  }
+  if (code) {
+    const byCode = stations.find((s) => (
+      String(s.stationCode || s.code || '').trim().toLowerCase() === code
+    ));
+    if (byCode && Number.isFinite(Number(byCode.lat)) && Number.isFinite(Number(byCode.lng))) return byCode;
   }
   if (name) {
     const byName = stations.find((s) => {
