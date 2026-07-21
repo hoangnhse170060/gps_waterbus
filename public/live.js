@@ -8,7 +8,7 @@ const CLUSTER_M = 25;
 const USER_PIN_HOLD_MS = 120_000;
 const USER_PIN_HUB_CATCHUP_M = 40;
 /** Khi kéo tay: gửi GPS lên Azure tối thiểu mỗi khoảng này để FE bám kịp. */
-const DRAG_SEND_MS = 800;
+const DRAG_SEND_MS = 350;
 const ROUTE_STYLE = {
   color: '#0f766e',
   weight: 2.5,
@@ -93,6 +93,9 @@ let dragging = false;
 let draggingBoatCode = '';
 let lastDragSendAt = 0;
 let lastDragSentKey = '';
+let dragSendInflight = false;
+let dragSendPending = null;
+let persistPinsTimer = null;
 let hasFitRoutes = false;
 let heartbeatTimer = null;
 let heartbeatBusy = false;
@@ -580,7 +583,7 @@ function renderRescueOverlays(data = latest) {
   }
 }
 
-function pinBoatPosition(code, lat, lng, { user = true } = {}) {
+function pinBoatPosition(code, lat, lng, { user = true, persist = true } = {}) {
   const key = String(code || '').trim();
   if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
   pinnedPositions.set(key, {
@@ -589,6 +592,20 @@ function pinBoatPosition(code, lat, lng, { user = true } = {}) {
     at: Date.now(),
     user: Boolean(user),
   });
+  if (!persist) return;
+  // Debounce localStorage — ghi mỗi mousemove lúc kéo làm đơ UI.
+  if (persistPinsTimer) clearTimeout(persistPinsTimer);
+  persistPinsTimer = setTimeout(() => {
+    persistPinsTimer = null;
+    persistPins();
+  }, dragging ? 800 : 50);
+}
+
+function flushPersistPins() {
+  if (persistPinsTimer) {
+    clearTimeout(persistPinsTimer);
+    persistPinsTimer = null;
+  }
   persistPins();
 }
 
@@ -1734,7 +1751,7 @@ function renderHubBoats(hubBoats) {
     index += 1;
 
     const isSelected = code === selected;
-    const isDraggingSelected = isSelected && dragging;
+    const isDraggingThis = dragging && draggingBoatCode === code;
     const st = getStatus(code);
     const phase = autoPhaseForBoat(code, trueLat, trueLng);
     const signal = hasSignal(code, hub);
@@ -1801,8 +1818,9 @@ function renderHubBoats(hubBoats) {
       });
       bindDragHandlers(marker, code);
       hubMarkers.set(code, marker);
-    } else if (isDraggingSelected && canDrag) {
-      // đang kéo — không đụng popup/icon
+    } else if (isDraggingThis && canDrag) {
+      // Đang kéo tàu này — chỉ cập nhật z-index, không setLatLng / rebind (tránh đơ + mất kéo).
+      marker.setZIndexOffset(zIndex);
     } else {
       marker.setLatLng([show.lat, show.lng]);
       marker.setIcon(boatIcon(heading, iconOpts));
@@ -1827,11 +1845,12 @@ function renderHubBoats(hubBoats) {
         const oe = event.originalEvent || event;
         showBoatContextMenu(code, oe.clientX, oe.clientY);
       });
-      bindDragHandlers(marker, code);
+      // Không rebind drag khi đang kéo tàu khác — tránh reset Leaflet drag state.
+      if (!dragging) bindDragHandlers(marker, code);
       if (openPopupCode.has(code) && !marker.isPopupOpen()) marker.openPopup();
     }
 
-    if (marker && updateMs >= topUpdateMs && !isDraggingSelected) {
+    if (marker && updateMs >= topUpdateMs && !isDraggingThis) {
       topUpdateMs = updateMs;
       topMarker = marker;
     }
@@ -1925,6 +1944,7 @@ function bindDragHandlers(marker, code) {
     hideBoatContextMenu();
     dragging = true;
     draggingBoatCode = String(code || '').trim();
+    selectBoat(code, { toastMessage: false });
   });
   marker.on('drag', () => {
     if (!canDragBoat(code)) return;
@@ -1933,19 +1953,20 @@ function bindDragHandlers(marker, code) {
     const { lat, lng } = marker.getLatLng();
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
     if (boatPhaseStatusEl) boatPhaseStatusEl.textContent = phaseStatusText(code, lat, lng) || '—';
-    // Gửi GPS khi đang kéo (throttle) — FE Live Tracking bám realtime như trước.
-    pinBoatPosition(code, lat, lng, { user: true });
+    // Không persist localStorage mỗi frame — tránh đơ khi kéo.
+    pinBoatPosition(code, lat, lng, { user: true, persist: false });
     void sendDragGpsThrottled(code, lat, lng);
   });
   marker.on('dragend', async () => {
     if (!canDragBoat(code) && !dragging) return;
-    dragging = false;
-    draggingBoatCode = '';
     if (!canDragBoat(code)) {
+      dragging = false;
+      draggingBoatCode = '';
       const pin = pinnedFor(code);
       if (pin) marker.setLatLng([pin.lat, pin.lng]);
       return;
     }
+    // Giữ dragging=true đến khi pin + gửi xong — tránh SSE snap về chỗ cũ giữa chừng.
     let { lat, lng } = marker.getLatLng();
     const rescueResult = handleRescueDragEnd(code, lat, lng);
     lat = rescueResult.lat;
@@ -1961,37 +1982,58 @@ function bindDragHandlers(marker, code) {
     } else {
       setStatus(code, { phase: missionForRescue(code)?.phase === 'completed' ? 'arrived' : 'enroute' });
     }
-    pinBoatPosition(code, lat, lng, { user: true });
+    pinBoatPosition(code, lat, lng, { user: true, persist: false });
+    flushPersistPins();
     marker.setLatLng([lat, lng]);
     coordStatusEl.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
     if (boatPhaseStatusEl) boatPhaseStatusEl.textContent = phaseStatusText(code, lat, lng) || '—';
     if (boatRouteStatusEl) {
       boatRouteStatusEl.textContent = routeLabelForBoat(code) || 'Chưa gán lộ trình';
     }
-    // Burst gửi ngay — FE nhận nhanh hơn chờ heartbeat.
-    await sendLiveGps(code, lat, lng, { holdAuthority: true });
-    setTimeout(() => {
-      sendLiveGps(code, lat, lng, { quiet: true, holdAuthority: true }).catch(() => {});
-    }, 350);
-    setTimeout(() => {
-      sendLiveGps(code, lat, lng, { quiet: true, holdAuthority: true }).catch(() => {});
-    }, 900);
+    try {
+      // Burst gửi ngay — FE nhận nhanh hơn chờ heartbeat.
+      await sendLiveGps(code, lat, lng, { holdAuthority: true });
+      setTimeout(() => {
+        sendLiveGps(code, lat, lng, { quiet: true, holdAuthority: true }).catch(() => {});
+      }, 350);
+      setTimeout(() => {
+        sendLiveGps(code, lat, lng, { quiet: true, holdAuthority: true }).catch(() => {});
+      }, 900);
+    } finally {
+      dragging = false;
+      draggingBoatCode = '';
+      // Render lại sau khi bỏ qua SSE lúc kéo.
+      if (latest) render(latest);
+    }
   });
 }
 
 async function sendDragGpsThrottled(code, lat, lng) {
   const key = String(code || '').trim();
   if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
-  const now = Date.now();
-  const same = lastDragSentKey === `${key}:${lat.toFixed(5)},${lng.toFixed(5)}`;
-  if (same && now - lastDragSendAt < DRAG_SEND_MS) return;
-  if (!same && now - lastDragSendAt < Math.min(400, DRAG_SEND_MS)) return;
-  lastDragSendAt = now;
-  lastDragSentKey = `${key}:${lat.toFixed(5)},${lng.toFixed(5)}`;
+  dragSendPending = { code: key, lat, lng };
+  if (dragSendInflight) return;
+  dragSendInflight = true;
   try {
-    await sendLiveGps(key, lat, lng, { quiet: true, holdAuthority: true });
-  } catch {
-    // ignore throttle errors
+    while (dragSendPending) {
+      const now = Date.now();
+      const wait = Math.max(0, DRAG_SEND_MS - (now - lastDragSendAt));
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      const next = dragSendPending;
+      if (!next) break;
+      dragSendPending = null;
+      const sentKey = `${next.code}:${next.lat.toFixed(5)},${next.lng.toFixed(5)}`;
+      if (sentKey === lastDragSentKey && Date.now() - lastDragSendAt < DRAG_SEND_MS) continue;
+      lastDragSendAt = Date.now();
+      lastDragSentKey = sentKey;
+      try {
+        await sendLiveGps(next.code, next.lat, next.lng, { quiet: true, holdAuthority: true });
+      } catch {
+        // ignore throttle errors
+      }
+    }
+  } finally {
+    dragSendInflight = false;
   }
 }
 
@@ -2084,29 +2126,29 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = 
       };
     }
     markSignal(boatCode);
+    // Cập nhật hub local ngay cả heartbeat/drag quiet — tránh SSE stale đè vị trí kéo.
+    if (latest && Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))) {
+      const hubs = Array.isArray(latest.hubBoats) ? [...latest.hubBoats] : [];
+      const idx = hubs.findIndex((b) => String(b.boatCode) === String(boatCode));
+      const merged = {
+        ...(idx >= 0 ? hubs[idx] : {}),
+        boatCode,
+        lat: Number(lat),
+        lng: Number(lng),
+        speedKmh,
+        heading: getBoatHeading(boatCode),
+        status,
+        source: 'live',
+        recordedAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        isOnline: true,
+      };
+      if (idx >= 0) hubs[idx] = merged;
+      else hubs.push(merged);
+      latest = { ...latest, hubBoats: hubs };
+    }
     if (!quiet) {
       pinBoatPosition(boatCode, lat, lng, { user: true });
-      // Cập nhật latest.hubBoats ngay — tránh renderHubBoats(stale) nhảy về chỗ cũ.
-      if (latest) {
-        const hubs = Array.isArray(latest.hubBoats) ? [...latest.hubBoats] : [];
-        const idx = hubs.findIndex((b) => String(b.boatCode) === String(boatCode));
-        const merged = {
-          ...(idx >= 0 ? hubs[idx] : {}),
-          boatCode,
-          lat: Number(lat),
-          lng: Number(lng),
-          speedKmh,
-          heading: getBoatHeading(boatCode),
-          status,
-          source: 'live',
-          recordedAt: new Date().toISOString(),
-          receivedAt: new Date().toISOString(),
-          isOnline: true,
-        };
-        if (idx >= 0) hubs[idx] = merged;
-        else hubs.push(merged);
-        latest = { ...latest, hubBoats: hubs };
-      }
     }
     const mode = body.mode === 'follow-azure'
       ? 'follow Azure'
@@ -2119,7 +2161,9 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = 
       } else {
         toast(`Đã gửi GPS ${boatDisplayName(boatCode)}`, 'ok');
       }
-      if (latest) renderHubBoats(latest.hubBoats);
+      if (latest && !(dragging && draggingBoatCode === String(boatCode))) {
+        renderHubBoats(latest.hubBoats);
+      }
     } else if (sendStatusEl && String(selectedBoatCode || '') === String(boatCode)) {
       sendStatusEl.textContent = `Heartbeat · seq ${body.sequence || '—'} · ${mode}`;
     }
@@ -2614,6 +2658,10 @@ function render(data) {
   syncLocalIncidentFlags();
   maybeToastNewIncidents(data);
   syncRescueMissionsFromIncidents(data);
+  // Đang kéo tay → chỉ giữ data, không rebuild map/panel (tránh đơ + mất vị trí).
+  if (dragging && draggingBoatCode) {
+    return;
+  }
   renderBoatOptions(data);
   renderRoutes(data.routes, data.stations, data.riverCorridor);
   renderStations(data.stations);
