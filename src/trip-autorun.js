@@ -1339,10 +1339,27 @@ export function createTripAutorun(ctx) {
   }
 
   function tripCruiseMaxKmh(mission) {
-    const boatMax = Number(mission?.maxSpeedKmh) > 0 ? Number(mission.maxSpeedKmh) : 80;
+    const boatMax = Number(mission?.maxSpeedKmh) > 0 ? Number(mission.maxSpeedKmh) : 0;
     const azureMax = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
-    const tripMax = Math.max(1, Number(env.TRIP_MAX_SPEED_KMH || azureMax));
-    return Math.min(boatMax, tripMax, azureMax);
+    // Trần trip mặc định 32 — không lấy DEFAULT_SPEED_KMH=16 làm trần (tránh kẹt mãi 16).
+    const tripMax = Math.max(1, Number(env.TRIP_MAX_SPEED_KMH || 32));
+    const defaultSpeed = Number(env.DEFAULT_SPEED_KMH || 16);
+    // DB max ≤ default (thường 16) → coi là placeholder, cho phép lên tripMax để thẳng tăng tốc / bù lịch.
+    const effectiveBoat = boatMax > 0 && boatMax <= defaultSpeed + 0.05
+      ? Math.max(boatMax, tripMax)
+      : (boatMax > 0 ? boatMax : tripMax);
+    return Math.min(effectiveBoat, tripMax, azureMax);
+  }
+
+  /** Nhịp sông khi không/ít ràng buộc lịch — cao hơn 16 để đoạn thẳng thấy tăng tốc. */
+  function tripBaseCruiseKmh(mission) {
+    const cruise = tripCruiseMaxKmh(mission);
+    const configured = Number(env.TRIP_CRUISE_KMH);
+    if (Number.isFinite(configured) && configured >= 2) {
+      return Math.min(cruise, configured);
+    }
+    // Mặc định ~22 km/h (giữa 16 và trần 32), vẫn dưới max tàu/trip.
+    return Math.min(cruise, Math.max(18, Number(env.DEFAULT_SPEED_KMH || 16) + 6));
   }
 
   function headingDeltaDeg(a, b) {
@@ -1473,7 +1490,7 @@ export function createTripAutorun(ctx) {
     if (!(remainingKm > 0.001)) return 0;
 
     const cruise = tripCruiseMaxKmh(mission);
-    const defaultSpeed = Number(env.DEFAULT_SPEED_KMH || 16);
+    const baseCruise = tripBaseCruiseKmh(mission);
     const schedule = scheduleRemainingHours(mission, nowMs);
 
     // Làm mượt trọng số cong — tránh giật tốc độ từng tick.
@@ -1486,27 +1503,30 @@ export function createTripAutorun(ctx) {
 
     let instant;
     if (schedule.hours == null) {
-      // Không có lịch: tốc độ mặc định, chậm hơn ở cua.
-      instant = defaultSpeed / smoothW;
+      // Không có lịch: nhịp sông ~22, thẳng nhanh hơn / cong chậm hơn (không kẹt 16).
+      instant = baseCruise / smoothW;
     } else if (schedule.late || !(schedule.hours > 0)) {
-      // Trễ: chạy gần trần nhưng vẫn giảm tốc ở cua (không JUMP).
+      // Trễ: gần trần, vẫn giảm ở cua.
       instant = cruise / smoothW;
     } else {
-      // effectiveKm / hours = nhịp lịch theo độ khó; ÷ localW → thẳng nhanh, cong chậm.
-      // Tổng thời gian các đoạn vẫn ≈ remainingHours (không dồn chậm đầu / phóng cuối).
+      // Nhịp lịch theo độ khó path; ÷ w → thẳng tăng, cong giảm; tổng thời gian vẫn khớp.
       const effectiveKm = metrics.effectiveMeters / 1000;
       const paceKmh = effectiveKm / schedule.hours;
-      instant = paceKmh / smoothW;
-      if (paceKmh < 0.5) instant = defaultSpeed / smoothW;
+      if (paceKmh < 0.5) {
+        // Lịch còn rất rộng: giữ nhịp sông vừa phải, không bò / không kẹt default 16.
+        instant = Math.min(baseCruise, Math.max(8, baseCruise * 0.75)) / smoothW;
+      } else {
+        instant = paceKmh / smoothW;
+      }
     }
 
-    // Kẹp quanh nhịp lịch vật lý để không lệch quá xa (vẫn đều, không sprint).
+    // Kẹp quanh nhịp lịch vật lý — cho phép thẳng vượt trung bình (đến cruise).
     const physicalHours = schedule.hours != null && schedule.hours > 0 ? schedule.hours : null;
     if (physicalHours) {
       const avgPhysical = remainingKm / physicalHours;
       if (avgPhysical >= 0.5) {
-        const minSpeed = avgPhysical * 0.42;
-        const maxSpeed = Math.min(cruise, avgPhysical * 1.55);
+        const minSpeed = Math.max(3, avgPhysical * 0.4);
+        const maxSpeed = Math.min(cruise, Math.max(avgPhysical * 1.65, baseCruise));
         instant = Math.max(minSpeed, Math.min(maxSpeed, instant));
       }
     }
@@ -1516,7 +1536,7 @@ export function createTripAutorun(ctx) {
     // Làm mượt tốc độ so với tick trước — tránh tăng/giảm đột ngột.
     const prevSpeed = Number(mission.speedKmh);
     if (Number.isFinite(prevSpeed) && prevSpeed > 0.5 && mission.status === 'Running') {
-      const maxStep = Math.max(0.8, cruise * 0.08);
+      const maxStep = Math.max(1.2, cruise * 0.1);
       if (instant > prevSpeed + maxStep) instant = prevSpeed + maxStep;
       if (instant < prevSpeed - maxStep) instant = prevSpeed - maxStep;
     }
@@ -1865,10 +1885,10 @@ export function createTripAutorun(ctx) {
 
     const required = computeRequiredSpeedKmh(mission, nowMs);
     mission.requiredSpeedKmh = required;
-    // Early (required thấp): giảm tốc; đúng giờ / trễ: chạy ≤ trần (không JUMP giữa chuyến).
+    // Trần = tripCruiseMax (có thể > DB maxSpeed=16) — không kẹp lại DEFAULT 16.
     const speed = required <= 0
       ? 0
-      : clampSpeedToBoatMax(Math.max(1, required), mission.maxSpeedKmh);
+      : clampSpeedToBoatMax(Math.max(1, required), tripCruiseMaxKmh(mission));
     mission.speedKmh = speed;
     mission.status = 'Running';
     clearWaitingAtStop(mission);
