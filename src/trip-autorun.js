@@ -1352,6 +1352,28 @@ export function createTripAutorun(ctx) {
     const remainingKm = remainingMeters / 1000;
     if (!(remainingKm > 0.001)) return 0;
 
+    // Ưu tiên đúng giờ tới BẾN KẾ TIẾP (nếu bến đó có plannedArrivalTime riêng) —
+    // tốc độ được tự tăng/giảm theo từng chặng, miễn đúng km/thời gian của chặng đó,
+    // thay vì chỉ nhắm đúng giờ về đích cuối tuyến.
+    const stops = mission.stops || [];
+    const nextStop = stops[Number(mission.stopIndex) || 0];
+    if (nextStop) {
+      const stopArrMs = parseTimeMs(nextStop.plannedArrivalTime);
+      if (Number.isFinite(stopArrMs)) {
+        const legMeters = alongMetersToStop(mission, nextStop);
+        if (Number.isFinite(legMeters) && legMeters > 0.5) {
+          const legHours = (stopArrMs - nowMs) / 3600000;
+          if (legHours > 0) {
+            const legRequired = (legMeters / 1000) / legHours;
+            if (legRequired >= 0.5) return legRequired;
+          } else {
+            // Trễ giờ tới bến kế — chạy trần cruise cho chặng này (không JUMP).
+            return tripCruiseMaxKmh(mission);
+          }
+        }
+      }
+    }
+
     const arrMs = parseTimeMs(mission.arrivalTime);
     if (!Number.isFinite(arrMs)) {
       return Number(mission.speedKmh) || Number(env.DEFAULT_SPEED_KMH || 16);
