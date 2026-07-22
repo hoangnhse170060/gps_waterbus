@@ -572,7 +572,7 @@ const server = createServer(async (req, res) => {
       state.lastAutoSavedRoute = null;
       // Đồng bộ sequence cao hơn mọi bản tin cũ trên Azure (tránh 409 "sequence cũ").
       bumpDeviceSequence(state.collector.deviceId, state.collector);
-      hideSurveyBoatFromLiveHub();
+      publishCollectorToHub();
       broadcast();
       if (state.collector.sendToTarget && getTargetApiRoot()) {
         const sessionResult = await startTrackingSessionOnTarget(state.collector);
@@ -1004,11 +1004,10 @@ function upsertHubBoat(payload) {
   // (trước đây set suppress rồi upsert → lần kéo bị return, hub giữ chỗ cũ → FE nhảy về).
   if (!forceAccept && suppressUntil > Date.now()) return;
   if (!forceAccept && suppressUntil) hubBoatSuppressUntil.delete(code);
-  // Đang survey cùng mã → không hiện / không nhận GPS Live (Azure echo / heartbeat).
-  if (activeSurveyBoatCode() === code) {
-    state.hubBoats.delete(code);
-    return;
-  }
+  // Đang survey cùng mã: Live vẫn hiện tàu chạy theo path vẽ, nhưng CHỈ nhận
+  // vị trí từ chính survey (source='survey') — bỏ echo Azure/Live khác đè lên
+  // (tránh vị trí thật của survey bị giật lại chỗ cũ).
+  if (activeSurveyBoatCode() === code && payload.source !== 'survey') return;
 
   // Đang cứu hộ / trip lịch: chỉ nhận GPS từ publishLiveGpsPosition (forceAccept), bỏ echo Azure cũ.
   if (!forceAccept && isBoatInActiveRescueMission(code)) return;
@@ -1531,10 +1530,10 @@ function tickCollector() {
   } else {
     collector.status = 'moving';
   }
-  hideSurveyBoatFromLiveHub();
+  publishCollectorToHub();
 }
 
-/** Mã tàu đang ghi GPS survey (vẽ tuyến) — tạm ẩn khỏi Live + không đẩy GPS Live. */
+/** Mã tàu đang ghi GPS survey (vẽ tuyến) — Live hiện tàu này theo đúng vị trí survey. */
 function activeSurveyBoatCode() {
   const code = String(state.collector?.boatCode || '').trim();
   if (!code) return '';
@@ -1543,11 +1542,27 @@ function activeSurveyBoatCode() {
   return code;
 }
 
-/** Survey: ẩn tàu đó khỏi Live hub (marker/GPS Live). Survey vẫn gửi GPS riêng. */
-function hideSurveyBoatFromLiveHub() {
-  const code = activeSurveyBoatCode();
-  if (!code) return;
-  state.hubBoats.delete(code);
+/** Survey: đẩy đúng vị trí tàu đang chạy trên Bảng vẽ vào hub — Live hiện tàu chạy theo path vẽ. */
+function publishCollectorToHub() {
+  const collector = state.collector;
+  const code = String(collector?.boatCode || '').trim();
+  if (!code || !Number.isFinite(Number(collector.lat)) || !Number.isFinite(Number(collector.lng))) return;
+  upsertHubBoat({
+    boatCode: code,
+    boatId: collector.boatId,
+    boatName: collector.boatName,
+    deviceId: collector.deviceId,
+    lat: collector.lat,
+    lng: collector.lng,
+    heading: collector.heading,
+    speedKmh: collector.status === 'completed' ? 0 : collector.speedKmh,
+    status: collector.status === 'completed' ? 'idle' : 'moving',
+    isOnline: true,
+    recordedAt: formatRecordedAt(new Date()),
+    receivedAt: new Date().toISOString(),
+    forceAccept: true,
+    source: 'survey',
+  });
 }
 
 async function publishGpsPositions() {
@@ -1798,13 +1813,13 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   if (activeSurveyBoatCode() === boatCode) {
-    hideSurveyBoatFromLiveHub();
+    // Giữ đúng vị trí tàu đang chạy trên Bảng vẽ — không cho Live ghi đè (tránh đụng sequence).
     return {
       ok: false,
       skipped: true,
       soft: true,
       status: 200,
-      error: `Tàu ${boatCode} đang vẽ/ghi GPS survey — tạm ẩn trên Live và không cập nhật GPS Live (tránh đụng sequence). Các tàu khác vẫn chạy bình thường.`,
+      error: `Tàu ${boatCode} đang vẽ/ghi GPS survey — Live hiện tàu chạy theo path vẽ, không nhận GPS ghi tay từ Live (tránh đụng sequence). Các tàu khác vẫn chạy bình thường.`,
     };
   }
 
@@ -4946,6 +4961,7 @@ async function finalizeCollectorRecording() {
       recordedAt: formatRecordedAt(new Date()),
       receivedAt: new Date().toISOString(),
       forceAccept: true,
+      source: 'survey',
     });
     state.collector = null;
     state.collectorQueue = [];
@@ -4994,6 +5010,7 @@ async function finalizeCollectorRecording() {
     recordedAt: formatRecordedAt(new Date()),
     receivedAt: new Date().toISOString(),
     forceAccept: true,
+    source: 'survey',
   });
   state.collector = null;
   state.collectorQueue = [];
@@ -6051,11 +6068,6 @@ function snapshot() {
       };
     }),
     hubBoats: [...state.hubBoats.values()]
-      .filter((boat) => {
-        const surveyCode = activeSurveyBoatCode();
-        if (!surveyCode) return true;
-        return String(boat.boatCode || '').trim() !== surveyCode;
-      })
       .map((boat) => {
       const beStatus = beStatusForBoat(boat.boatCode) || boat.beStatus || boat.boatStatus || null;
       return {

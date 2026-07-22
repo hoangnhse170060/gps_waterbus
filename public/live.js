@@ -637,31 +637,14 @@ function activeSurveyBoatCode(data = latest) {
   return code;
 }
 
-/** Khi đang ghi GPS survey — không hiện / không pin tàu đó trên Live. */
-function clearSurveyBoatFromLive(data = latest) {
-  const code = activeSurveyBoatCode(data);
-  if (!code) return;
-  pinnedPositions.delete(code);
-  const marker = hubMarkers.get(code);
-  if (marker) {
-    marker.remove();
-    hubMarkers.delete(code);
-  }
-  if (selectedBoatCode === code) {
-    selectedBoatCode = null;
-  }
-}
-
 /** Cập nhật pin từ hub GPS — trừ khi user đang kéo tay hoặc đang cứu hộ tự động.
  *  Giữ vị trí cuối nếu hub nhảy xa bất thường (tránh teleport khi Azure/SSE lệch).
  */
 function syncLiveHubPins(hubBoats) {
-  const surveyCode = activeSurveyBoatCode();
   let changed = false;
   for (const boat of hubBoats || []) {
     const code = String(boat?.boatCode || '').trim();
     if (!code) continue;
-    if (surveyCode && code === surveyCode) continue;
     if (dragging && draggingBoatCode === code) continue;
     // Mission cứu hộ tự set pin từ currentLat — không để hub/Azure kéo về bến.
     if (isBoatInActiveAutomatedRescue(code)) continue;
@@ -854,23 +837,21 @@ function boatUpdateMs(code, hubByCode = null, data = latest) {
 }
 
 function mapBoatCodes(data = latest, hubBoats = null) {
-  const surveyCode = activeSurveyBoatCode(data);
   const codes = new Set(
     catalogBoats(data).map((b) => String(b.boatCode).trim()).filter(Boolean),
   );
-  if (surveyCode) codes.delete(surveyCode);
   for (const row of openIncidentsList(data)) {
     const code = String(row.boatCode || '').trim();
-    if (code && code !== surveyCode) codes.add(code);
+    if (code) codes.add(code);
     const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
-    if (rescue && rescue !== surveyCode) codes.add(rescue);
+    if (rescue) codes.add(rescue);
     const transfer = String(row.replacementBoatCode || '').trim();
-    if (transfer && transfer !== surveyCode) codes.add(transfer);
+    if (transfer) codes.add(transfer);
   }
   const hubByCode = new Map();
   for (const boat of (hubBoats || data?.hubBoats || [])) {
     const code = String(boat?.boatCode || '').trim();
-    if (!code || code === surveyCode) continue;
+    if (!code) continue;
     hubByCode.set(code, boat);
   }
   return [...codes].sort((a, b) => {
@@ -1700,14 +1681,11 @@ function renderHubBoats(hubBoats) {
   syncLiveHubPins(hubBoats);
   // Mission cứu hộ ghi đè sau — bám currentLat/incidentCurrentLat khi đang kéo.
   syncAutomatedRescuePins(hubBoats);
-  // Đang survey: tạm ẩn tàu đó khỏi Live (Survey vẫn gửi GPS riêng).
-  clearSurveyBoatFromLive();
   syncHeadingsFromHub(hubBoats);
   const hubByCode = new Map();
   for (const boat of hubBoats || []) {
     const code = String(boat.boatCode || '').trim();
     if (!code) continue;
-    if (code === activeSurveyBoatCode()) continue;
     hubByCode.set(code, boat);
   }
 
