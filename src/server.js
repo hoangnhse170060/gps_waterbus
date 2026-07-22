@@ -626,6 +626,7 @@ const server = createServer(async (req, res) => {
           averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
           cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
           estimatedDurationMin: stopped.estimatedDurationMin ?? null,
+          berthBufferMin: stopped.berthBufferMin ?? null,
           stoppedAt: new Date().toISOString(),
           targetSessionStarted: Boolean(stopped.targetSessionStarted),
         };
@@ -1789,7 +1790,7 @@ async function publishLiveGpsPosition(body = {}) {
 
   if (!isLiveMapBoatCode(boatCode)) {
     state.hubBoats.delete(boatCode);
-    return {
+  return {
       ok: false,
       status: 403,
       error: `Tàu ${boatCode} không hoạt động (Inactive) — không gửi GPS / không hiện map.`,
@@ -2381,6 +2382,20 @@ function exactDurationMinutes(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
   return Number(n.toFixed(2));
+}
+
+/** Đệm cập bến / tăng giảm tốc (phút mỗi chặng) — admin chỉnh trên GPS. */
+function resolveBerthBufferMin(body = {}, session = null) {
+  const candidates = [
+    body.berthBufferMin,
+    body.berthBufferMinutes,
+    session?.berthBufferMin,
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n >= 0) return Math.min(60, Math.round(n * 10) / 10);
+  }
+  return 0;
 }
 
 /** Tốc độ chạy survey: ưu tiên tốc độ cài lúc vẽ/ghi — bỏ 0/1 (sau khi tàu dừng). */
@@ -4670,8 +4685,9 @@ async function saveRouteFromGpsOnTarget(session, body) {
   }));
   if (stops.length) {
     const snapped = snapCoordinatesToStops(coordinates, stops, detectRadius);
-    // Phút đoạn = km ÷ tốc độ user cài (không dùng DEFAULT 16).
-    const stopsExact = attachSegmentTravelMinutes(snapped, stops, averageSpeedKmh).map((stop) => ({
+    const berthBufferMin = resolveBerthBufferMin(body, session);
+    // Phút đoạn = (km ÷ tốc độ) + đệm cập bến admin.
+    const stopsExact = attachSegmentTravelMinutes(snapped, stops, averageSpeedKmh, berthBufferMin).map((stop) => ({
       stationId: stop.stationId,
       stationCode: stop.stationCode || null,
       stationName: stop.stationName || null,
@@ -4680,6 +4696,8 @@ async function saveRouteFromGpsOnTarget(session, body) {
       lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
       isPickupAllowed: stop.isPickupAllowed !== false,
       isDropoffAllowed: stop.isDropoffAllowed !== false,
+      cruiseTravelMin: exactDurationMinutes(stop.cruiseTravelMin),
+      berthBufferMin: stop.berthBufferMin == null ? null : Number(stop.berthBufferMin),
       standardTravelMin: exactDurationMinutes(stop.standardTravelMin),
       segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
       travelSource: stop.travelSource || 'gps',
@@ -4950,6 +4968,7 @@ async function finalizeCollectorRecording() {
     reverseRouteName: stopped.reverseRouteName || null,
     averageSpeedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
     estimatedDurationMin: stopped.estimatedDurationMin ?? null,
+    berthBufferMin: stopped.berthBufferMin ?? null,
     cruiseSpeedKmh: stopped.cruiseSpeedKmh || null,
     speedKmh: stopped.cruiseSpeedKmh || stopped.speedKmh || null,
     stoppedAt: new Date().toISOString(),
@@ -5063,6 +5082,7 @@ async function saveRecordedRoute(body) {
         endStationId: state.collector.endStationId,
         averageSpeedKmh: state.collector.cruiseSpeedKmh || state.collector.speedKmh,
         estimatedDurationMin: state.collector.estimatedDurationMin,
+        berthBufferMin: state.collector.berthBufferMin ?? null,
         cruiseSpeedKmh: state.collector.cruiseSpeedKmh,
         speedKmh: state.collector.cruiseSpeedKmh || state.collector.speedKmh,
       }
@@ -5084,6 +5104,7 @@ async function saveRecordedRoute(body) {
     status: body.status || 'Active',
     averageSpeedKmh: speed,
     estimatedDurationMin: body.estimatedDurationMin ?? session.estimatedDurationMin ?? null,
+    berthBufferMin: resolveBerthBufferMin(body, session),
     startStationId: body.startStationId || session.startStationId || null,
     endStationId: body.endStationId || session.endStationId || null,
     routeType: body.routeType || session.routeType || null,
@@ -5117,13 +5138,15 @@ async function createCapturedRoute(body) {
   );
   points = snapCoordinatesToStops(points, normalizedStops, detectRadius);
   const lengthMeters = routeLength(points);
-  // phút = (km / tốc_độ_chạy) × 60 · khớp panel lúc vẽ (vd 0.22) — không ép int ≥ 1.
+  // phút = (km / tốc_độ_chạy) × 60 + đệm · khớp panel lúc vẽ — không ép int ≥ 1.
   const baseDistanceKm = round(lengthMeters / 1000, 3);
-  const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh);
+  const berthBufferMin = resolveBerthBufferMin(body, null);
+  const stopsWithTravel = attachSegmentTravelMinutes(points, normalizedStops, averageSpeedKmh, berthBufferMin);
+  const segmentCount = Math.max(0, (stopsWithTravel.length || 1) - 1);
   const estimatedDurationExact = exactDurationMinutes(
     body.estimatedDurationMin != null && Number(body.estimatedDurationMin) > 0
       ? Number(body.estimatedDurationMin)
-      : ((baseDistanceKm / averageSpeedKmh) * 60),
+      : ((baseDistanceKm / averageSpeedKmh) * 60) + (berthBufferMin * segmentCount),
   ) || 0;
   // Cột DB estimated_duration_min là int — chỉ làm tròn khi ghi DB; API trả số thập phân đúng.
   const estimatedDurationMinDb = Math.max(1, Math.round(estimatedDurationExact || 1));
@@ -5640,6 +5663,7 @@ function startCollector(body) {
     cruiseSpeedKmh: speedKmh,
     maxSpeedKmh,
     estimatedDurationMin,
+    berthBufferMin: resolveBerthBufferMin(body, null),
     heading: start.heading,
     lat: start.lat,
     lng: start.lng,
@@ -5708,7 +5732,7 @@ async function queryJson(sql) {
   if (typeof value === 'string') {
     try {
       return JSON.parse(value);
-    } catch (parseError) {
+      } catch (parseError) {
       throw new Error(`Cannot parse SQL JSON: ${parseError.message}`);
     }
   }
@@ -5809,21 +5833,24 @@ function nearestPathProbe(path, stop) {
 }
 
 /**
- * Gắn standardTravelMin = thời gian chạy GPS×tốc độ thôi:
- * phút = (km đường GPS ÷ tốc độ) × 60 (1 số thập phân). Không lấy lịch / BE.
+ * Gắn standardTravelMin = chạy thuần (km÷tốc độ)×60 + đệm cập bến (admin).
+ * Không lấy lịch / BE. berthBufferMin = phút mỗi chặng.
  */
-function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
+function attachSegmentTravelMinutes(coordinates, stops, speedKmh, berthBufferMin = 0) {
   const path = Array.isArray(coordinates)
     ? coordinates.filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
     : [];
   const list = Array.isArray(stops) ? stops.map((s) => ({ ...s })) : [];
   const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
+  const buffer = Number(berthBufferMin) > 0 ? Number(berthBufferMin) : 0;
   const nearM = Number(env.STOP_DETECT_RADIUS_M || 200);
   if (!list.length) return [];
   if (list.length === 1 || path.length < 2) {
     return list.map((stop) => ({
       ...stop,
       standardTravelMin: null,
+      cruiseTravelMin: null,
+      berthBufferMin: null,
       segmentDistanceKm: null,
       travelSource: null,
     }));
@@ -5847,21 +5874,45 @@ function attachSegmentTravelMinutes(coordinates, stops, speedKmh) {
 
   return list.map((stop, index) => {
     if (index === 0) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
+      return {
+        ...stop,
+        standardTravelMin: null,
+        cruiseTravelMin: null,
+        berthBufferMin: null,
+        segmentDistanceKm: null,
+        travelSource: null,
+      };
     }
     const prev = probes[index - 1];
     const cur = probes[index];
     if (prev.distToPath > nearM || cur.distToPath > nearM) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
+      return {
+        ...stop,
+        standardTravelMin: null,
+        cruiseTravelMin: null,
+        berthBufferMin: null,
+        segmentDistanceKm: null,
+        travelSource: null,
+      };
     }
     const meters = cur.alongMeters - prev.alongMeters;
     if (!(meters > 5)) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
+      return {
+        ...stop,
+        standardTravelMin: null,
+        cruiseTravelMin: null,
+        berthBufferMin: null,
+        segmentDistanceKm: null,
+        travelSource: null,
+      };
     }
     const km = meters / 1000;
-    const minutes = Number(((km / speed) * 60).toFixed(2));
+    const cruise = Number(((km / speed) * 60).toFixed(2));
+    const minutes = Number((cruise + buffer).toFixed(2));
     return {
       ...stop,
+      cruiseTravelMin: cruise > 0 ? cruise : null,
+      berthBufferMin: cruise > 0 ? buffer : null,
       standardTravelMin: minutes > 0 ? minutes : null,
       segmentDistanceKm: round(km, 3),
       travelSource: 'gps',
@@ -5984,15 +6035,15 @@ function snapshot() {
       const beStatus = beStatusForBoat(boat) || boat.beStatus || null;
       const effectiveStatus = beStatus || neonStatus;
       return {
-        ...boat,
+      ...boat,
         neonStatus,
         beStatus,
         dbStatus: effectiveStatus,
         effectiveStatus,
-        lat: round(boat.lat, 7),
-        lng: round(boat.lng, 7),
-        heading: round(boat.heading, 0),
-        speedKmh: round(boat.speedKmh, 1),
+      lat: round(boat.lat, 7),
+      lng: round(boat.lng, 7),
+      heading: round(boat.heading, 0),
+      speedKmh: round(boat.speedKmh, 1),
       };
     }),
     hubBoats: [...state.hubBoats.values()]
@@ -6231,7 +6282,7 @@ function handleEvents(req, res) {
   res.write(': connected\n\n');
   clients.add(res);
   try {
-    res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
+  res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
   } catch (error) {
     console.error(`[events] initial snapshot failed: ${error.message}`);
   }

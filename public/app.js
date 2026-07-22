@@ -38,6 +38,7 @@ const startStationEl = document.querySelector('#startStation');
 const endStationEl = document.querySelector('#endStation');
 const collectorBoatCodeEl = document.querySelector('#collectorBoatCode');
 const collectorSpeedEl = document.querySelector('#collectorSpeed');
+const berthBufferMinEl = document.querySelector('#berthBufferMin');
 const boatSpeedHintEl = document.querySelector('#boatSpeedHint');
 const captureTripIdEl = document.querySelector('#captureTripId');
 const sendIntervalSecEl = document.querySelector('#sendIntervalSec');
@@ -62,6 +63,8 @@ const drawPointsEl = document.querySelector('#drawPoints');
 const routeResultEl = document.querySelector('#routeResult');
 const estimateKmEl = document.querySelector('#estimateKm');
 const estimateSpeedEl = document.querySelector('#estimateSpeed');
+const estimateCruiseMinEl = document.querySelector('#estimateCruiseMin');
+const estimateBufferMinEl = document.querySelector('#estimateBufferMin');
 const estimateMinEl = document.querySelector('#estimateMin');
 const stationCountEl = document.querySelector('#stationCount');
 const routeCodeHintEl = document.querySelector('#routeCodeHint');
@@ -489,6 +492,20 @@ collectorSpeedEl?.addEventListener('input', () => {
   applyBoatSpeedLimits();
   updateDrawStats();
 });
+berthBufferMinEl?.addEventListener('input', () => {
+  persistBerthBufferMin();
+  updateDrawStats();
+});
+
+// Khôi phục đệm admin đã chỉnh.
+try {
+  const savedBuffer = localStorage.getItem('surveyBerthBufferMin');
+  if (berthBufferMinEl && savedBuffer != null && savedBuffer !== '' && Number.isFinite(Number(savedBuffer))) {
+    berthBufferMinEl.value = String(Number(savedBuffer));
+  }
+} catch {
+  /* ignore */
+}
 
 function loadBoatDrafts() {
   try {
@@ -521,6 +538,7 @@ function snapshotActiveDraft() {
     reverseRouteCode: reverseRouteCodeEl?.value.trim() || '',
     reverseRouteName: reverseRouteNameEl?.value.trim() || '',
     speedKmh: Number(collectorSpeedEl?.value || 16),
+    berthBufferMin: getBerthBufferMinutes(),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -560,6 +578,10 @@ function applyBoatDraft(draft) {
   if (reverseRouteCodeEl) reverseRouteCodeEl.value = data.reverseRouteCode || '';
   if (reverseRouteNameEl) reverseRouteNameEl.value = data.reverseRouteName || '';
   if (collectorSpeedEl && Number(data.speedKmh) > 0) collectorSpeedEl.value = String(data.speedKmh);
+  if (berthBufferMinEl && Number.isFinite(Number(data.berthBufferMin))) {
+    berthBufferMinEl.value = String(Number(data.berthBufferMin));
+    persistBerthBufferMin();
+  }
   updateReverseRouteUi();
   rebuildCaptureMarkers();
   renderCaptureLine();
@@ -814,7 +836,7 @@ function setDrawTool(tool) {
       map.getContainer().style.cursor = '';
       captureStatusEl.textContent = `Không vẽ: ${block}`;
       notifyWarn(`Không vẽ: ${block}`);
-      renderCaptureState();
+renderCaptureState();
       return;
     }
   }
@@ -961,14 +983,14 @@ function connectEvents() {
   eventsSource = new EventSource('/events');
   eventsSource.onmessage = (message) => {
     try {
-      latest = JSON.parse(message.data);
+  latest = JSON.parse(message.data);
     } catch {
       return;
     }
     if (renderFrame) return;
     renderFrame = requestAnimationFrame(() => {
       renderFrame = null;
-      render(latest);
+  render(latest);
     });
   };
   eventsSource.onerror = () => {
@@ -1010,7 +1032,7 @@ function render(data) {
   const routesFp = routesFingerprint(data.routes);
   if (stationsFp !== lastStationsFingerprint) {
     lastStationsFingerprint = stationsFp;
-    renderStations(data.stations);
+  renderStations(data.stations);
     renderStationOptions(data.stations, 'Chọn bến có sẵn...');
     restoreStationSelections();
   } else if (latest?.stations) {
@@ -1200,6 +1222,8 @@ function buildSurveyStops() {
     isPickupAllowed: stop.isFirst || routeType === 'SightseeingLoop' || !stop.isLast,
     isDropoffAllowed: stop.isLast || routeType === 'SightseeingLoop' || !stop.isFirst,
     standardTravelMin: stop.standardTravelMin,
+    cruiseTravelMin: stop.cruiseTravelMin,
+    berthBufferMin: stop.berthBufferMin,
     segmentDistanceKm: stop.segmentDistanceKm,
   }));
 }
@@ -1239,9 +1263,17 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
     : [];
   const list = Array.isArray(stops) ? stops.map((s) => ({ ...s })) : [];
   const speed = Number(speedKmh) > 0 ? Number(speedKmh) : 16;
+  const buffer = getBerthBufferMinutes();
   if (!list.length) return [];
   if (list.length === 1 || path.length < 2) {
-    return list.map((stop) => ({ ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null }));
+    return list.map((stop) => ({
+      ...stop,
+      standardTravelMin: null,
+      cruiseTravelMin: null,
+      berthBufferMin: null,
+      segmentDistanceKm: null,
+      travelSource: null,
+    }));
   }
 
   const probes = list.map((stop) => (
@@ -1260,21 +1292,48 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
   }
 
   return list.map((stop, index) => {
-    if (index === 0) return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
-    const prevStop = list[index - 1];
+    if (index === 0) {
+      return {
+        ...stop,
+        standardTravelMin: null,
+        cruiseTravelMin: null,
+        berthBufferMin: null,
+        segmentDistanceKm: null,
+        travelSource: null,
+      };
+    }
     const prev = probes[index - 1];
     const cur = probes[index];
     if (prev.distToPath > STOP_DETECT_RADIUS_M || cur.distToPath > STOP_DETECT_RADIUS_M) {
-      return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
+      return {
+        ...stop,
+        standardTravelMin: null,
+        cruiseTravelMin: null,
+        berthBufferMin: null,
+        segmentDistanceKm: null,
+        travelSource: null,
+      };
     }
     const meters = cur.alongMeters - prev.alongMeters;
-    if (!(meters > 5)) return { ...stop, standardTravelMin: null, segmentDistanceKm: null, travelSource: null };
+    if (!(meters > 5)) {
+      return {
+        ...stop,
+        standardTravelMin: null,
+        cruiseTravelMin: null,
+        berthBufferMin: null,
+        segmentDistanceKm: null,
+        travelSource: null,
+      };
+    }
     const km = meters / 1000;
-    // Chỉ thời gian chạy GPS×tốc độ — không lấy lịch / BE.
-    const minutes = Number(((km / speed) * 60).toFixed(2));
+    const cruise = Number(((km / speed) * 60).toFixed(2));
+    const display = Number((cruise + buffer).toFixed(2));
     return {
       ...stop,
-      standardTravelMin: minutes > 0 ? minutes : null,
+      cruiseTravelMin: cruise > 0 ? cruise : null,
+      berthBufferMin: cruise > 0 ? buffer : null,
+      // Gửi BE/Charter: phút hiện = chạy + đệm admin.
+      standardTravelMin: display > 0 ? display : null,
       segmentDistanceKm: roundNumber(km, 3),
       travelSource: 'gps',
     };
@@ -1316,9 +1375,13 @@ function updateStopChainPreview(orderedInput) {
   const parts = [];
   withTravel.forEach((stop, index) => {
     if (index > 0) {
+      const cruise = stop.cruiseTravelMin;
+      const buf = Number(stop.berthBufferMin) || 0;
       const src = stop.travelSource === 'schedule' ? ' lịch' : (stop.travelSource === 'gps' ? ' GPS' : '');
       const min = stop.standardTravelMin != null
-        ? `${stop.standardTravelMin} phút${src}`
+        ? (buf > 0 && cruise != null
+          ? `${stop.standardTravelMin} phút (${cruise}+${buf} đệm)`
+          : `${stop.standardTravelMin} phút${src}`)
         : 'chưa đo';
       const km = stop.segmentDistanceKm != null ? ` · ${stop.segmentDistanceKm} km` : '';
       parts.push(`<span class="stop-seg${stop.standardTravelMin == null ? ' is-missing' : ''}${stop.travelSource === 'schedule' ? ' is-schedule' : ''}">${escapeHtml(min)}${escapeHtml(km)}</span>`);
@@ -1340,7 +1403,8 @@ function surveySaveFields() {
     startStationId: startStationEl.value || captureState.points[0]?.stationId || null,
     endStationId: endStationEl.value || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId || null,
     stops: buildSurveyStops(),
-    // Đúng số trên panel lúc vẽ — (km ÷ tốc độ cài) × 60 (vd 0.22).
+    berthBufferMin: getBerthBufferMinutes(),
+    // Phút hiện = chạy thuần + đệm cập bến (admin).
     estimatedDurationMin: pathMinutes > 0 ? Number(pathMinutes.toFixed(2)) : null,
   };
   const inferredType = getSurveyRouteType();
@@ -2167,8 +2231,22 @@ function estimateTravelMinutes(meters, speedKmh) {
   const speed = clampNumber(Number(speedKmh) || 16, 0.1, max);
   const km = Number(meters) / 1000;
   if (!(km > 0) || !(speed > 0)) return 0;
-  // phút = (km / vận_tốc_đăng_ký_kmh) × 60
+  // phút chạy thuần = (km / vận_tốc_kmh) × 60
   return (km / speed) * 60;
+}
+
+function getBerthBufferMinutes() {
+  const raw = Number(berthBufferMinEl?.value);
+  if (!Number.isFinite(raw) || raw < 0) return 0;
+  return Math.min(60, Math.round(raw * 10) / 10);
+}
+
+function persistBerthBufferMin() {
+  try {
+    localStorage.setItem('surveyBerthBufferMin', String(getBerthBufferMinutes()));
+  } catch {
+    /* ignore */
+  }
 }
 
 function catalogBoats(data = latest) {
@@ -2195,12 +2273,24 @@ function getSurveySpeedKmh() {
   return clampNumber(Number(collectorSpeedEl?.value || 16), 0.1, max);
 }
 
-/** Thời gian chạy lúc vẽ = (quãng đường ÷ tốc độ cài) × 60 — không lấy lịch/BE. */
+/** Thời gian gửi BE = chạy thuần + đệm cập bến (mỗi chặng đã cộng trong stops; tổng path cộng 1 lần đệm × số chặng). */
 function getSurveyPathEstimatedMinutes(points = null) {
+  const ordered = collectOrderedStopsFromClicks();
+  if (ordered.length >= 2) {
+    const withTravel = attachSegmentTravelMinutesFe(
+      Array.isArray(points) && points.length >= 2 ? points : getPathCoordinates(),
+      ordered,
+      getSurveySpeedKmh(),
+    );
+    const sum = withTravel.reduce((acc, stop) => acc + (Number(stop.standardTravelMin) || 0), 0);
+    if (sum > 0) return sum;
+  }
   const path = Array.isArray(points) && points.length >= 2
     ? points
     : (lockedSurveyPath?.length >= 2 ? lockedSurveyPath : getPathCoordinates());
-  return estimateTravelMinutes(pathLengthMeters(path), getSurveySpeedKmh());
+  const cruise = estimateTravelMinutes(pathLengthMeters(path), getSurveySpeedKmh());
+  const segments = Math.max(1, ordered.length - 1);
+  return cruise + getBerthBufferMinutes() * segments;
 }
 
 function applyBoatSpeedLimits() {
@@ -2279,14 +2369,19 @@ function updateDrawStats() {
   const boat = findBoatByCode(collectorBoatCodeEl?.value);
   const max = boat ? boatMaxSpeedKmh(boat) : null;
   const km = meters / 1000;
-  const minutesExact = estimateTravelMinutes(meters, speed);
+  const cruiseExact = estimateTravelMinutes(meters, speed);
+  const buffer = getBerthBufferMinutes();
+  const ordered = collectOrderedStopsFromClicks();
+  const segmentCount = Math.max(ordered.length >= 2 ? ordered.length - 1 : (meters > 0 ? 1 : 0), 0);
+  const totalBuffer = buffer * segmentCount;
+  const totalExact = getSurveyPathEstimatedMinutes();
   const kmText = meters < 1000
     ? `${Math.round(meters)} m`
     : `${km.toFixed(3)} km`;
   if (drawDistanceEl) drawDistanceEl.textContent = kmText;
   if (drawDurationEl) {
     drawDurationEl.textContent = meters > 0
-      ? `${minutesExact.toFixed(2)} phút`
+      ? `${totalExact.toFixed(2)} phút`
       : '0 phút';
   }
   if (drawPointsEl) drawPointsEl.textContent = `${captureState.points.length} điểm`;
@@ -2300,16 +2395,26 @@ function updateDrawStats() {
       ? `${speed} km/h (max ${max})`
       : `${speed} km/h`;
   }
+  if (estimateCruiseMinEl) {
+    estimateCruiseMinEl.textContent = meters > 0
+      ? `${cruiseExact.toFixed(2)} phút`
+      : '0 phút';
+  }
+  if (estimateBufferMinEl) {
+    estimateBufferMinEl.textContent = totalBuffer > 0
+      ? `${totalBuffer.toFixed(1)} phút (${buffer}×${segmentCount} chặng)`
+      : '0 phút';
+  }
   if (estimateMinEl) {
     estimateMinEl.textContent = meters > 0
-      ? `${minutesExact.toFixed(2)} phút`
+      ? `${totalExact.toFixed(2)} phút`
       : '0 phút';
   }
   const formulaEl = document.querySelector('#estimateFormula');
   if (formulaEl) {
     formulaEl.textContent = meters > 0
-      ? `(${km.toFixed(3)} km ÷ ${speed} km/h) × 60 = ${minutesExact.toFixed(2)} phút`
-      : 'phút = (km ÷ tốc độ chạy) × 60 · tốc độ ≤ max đăng ký';
+      ? `(${km.toFixed(3)} km ÷ ${speed} km/h)×60 = ${cruiseExact.toFixed(2)}p chạy + ${totalBuffer.toFixed(1)}p đệm = ${totalExact.toFixed(2)}p`
+      : 'phút gửi BE = chạy thuần + đệm cập bến (admin chỉnh)';
   }
   updateStopChainPreview();
 }
@@ -2782,13 +2887,13 @@ function renderRouteResult(body) {
     <div class="route-result-head">
       <strong>${escapeHtml(body.routeName || body.routeCode || '')}</strong>
       <span>${escapeHtml(body.routeCode || '')}</span>
-    </div>
+        </div>
     <div class="route-result-meta">
       <span>BE: <b>${escapeHtml(body.routeType || (getSurveyRouteType() === 'SightseeingLoop' ? 'SightseeingLoop' : 'route nguồn'))}</b></span>
       <span>Quãng đường: <b>${distance != null ? `${distance} km` : '?'}</b></span>
       <span>Thời gian chạy: <b>${durationText != null ? `${durationText} phút` : '?'}</b></span>
       <span>Số bến: <b>${stops.length}</b></span>
-    </div>
+      </div>
     ${stops.length
       ? `<div class="route-result-stops-title">Thứ tự bến đã đẩy lên BE</div><ol class="route-result-stops">${stopLines}</ol>`
       : '<p class="meta">Chưa có station trong route_stops — kiểm tra payload stops[] gửi BE.</p>'}
@@ -3565,7 +3670,7 @@ function handleStationDoubleClick(station) {
 function formatTime(value) {
   if (!value) return '';
   try {
-    return new Date(value).toLocaleTimeString('vi-VN');
+  return new Date(value).toLocaleTimeString('vi-VN');
   } catch {
     return String(value);
   }

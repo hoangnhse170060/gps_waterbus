@@ -172,9 +172,11 @@
             <div class="route-estimate" id="routeEstimate">
               <div><span>Quãng đường (km)</span><strong id="estimateKm">0 km</strong></div>
               <div><span>Vận tốc (km/h)</span><strong id="estimateSpeed">16 km/h</strong></div>
-              <div><span>Thời gian (phút)</span><strong id="estimateMin">0 phút</strong></div>
+              <div><span>Chạy thuần</span><strong id="estimateCruiseMin">0 phút</strong></div>
+              <div><span>Đệm cập bến</span><strong id="estimateBufferMin">0 phút</strong></div>
+              <div><span>Tổng (phút)</span><strong id="estimateMin">0 phút</strong></div>
             </div>
-            <p class="meta estimate-note" id="estimateFormula">phút = (km ÷ tốc độ chạy) × 60 · tốc độ ≤ max đăng ký</p>
+            <p class="meta estimate-note" id="estimateFormula">phút gửi BE = chạy thuần + đệm cập bến (admin chỉnh)</p>
 
             <label>
               <span>Mã tuyến (routeCode)</span>
@@ -216,9 +218,14 @@
               </label>
               <label>
                 <span>Tốc độ chạy (km/h)</span>
-                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16" title="Chỉ dùng khi đoạn không có trong lịch Waterbus; ≤ max đăng ký">
+                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16" title="Tốc độ giữa sông; ≤ max đăng ký">
               </label>
             </div>
+            <label>
+              <span>Đệm cập bến / tăng giảm tốc (phút mỗi chặng)</span>
+              <input id="berthBufferMin" type="number" min="0" max="60" step="0.5" value="0" title="Admin chỉnh. Cộng vào phút chạy thuần trước khi gửi BE/Charter">
+              <small class="field-hint">VD TT↔BD ~1,4p chạy + 4p đệm ≈ 5,4p. Để 0 nếu BE tự cộng đệm.</small>
+            </label>
           </div>
 
           <div class="recording-actions">
@@ -250,6 +257,6 @@
     <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
     <script src="/geo-distance.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
-    <script src="/app.js?v=20260722a"></script>
+    <script src="/app.js?v=20260722c"></script>
   </body>
 </html>
