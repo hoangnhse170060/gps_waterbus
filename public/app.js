@@ -1969,18 +1969,22 @@ function renderCaptureLine() {
     path = expandPath(captureState.points);
   }
   if (!path || path.length < 2) return;
-  const style = (captureState.finished || running)
+  const isDone = captureState.finished || running;
+  const style = isDone
     ? { ...SURVEY_ROUTE_STYLE }
     : { ...DRAFT_ROUTE_STYLE };
   captureLine = L.polyline(
     path.map((p) => [p.lat, p.lng]),
     {
       ...style,
-      weight: (captureState.finished || running) ? 6 : 4.5,
+      weight: isDone ? 6 : 4.5,
       interactive: false,
       smoothFactor: 0,
     },
-  ).addTo(map);
+  );
+  // Vẽ xong (đã hoàn tất/đang chạy): theo đúng toggle ẩn/hiện tuyến.
+  // Đang vẽ dở (chưa xong): luôn hiện để còn thấy điểm vừa chấm.
+  if (!isDone || showSavedRoutes) captureLine.addTo(map);
 
   const idx = captureState.selectedSegmentIndex;
   if (!running && !riverPathOverride && idx > 0 && captureState.points[idx]?.segmentType === 'curve') {
@@ -3283,6 +3287,15 @@ function applySavedRoutesVisibility() {
       if (!map.hasLayer(layer)) layer.addTo(map);
     } else if (map.hasLayer(layer)) {
       map.removeLayer(layer);
+    }
+  }
+  // Đường đang vẽ mà đã xong (hoặc đang chạy) cũng theo toggle này.
+  // Đang vẽ dở (chưa finishDraw) thì luôn giữ hiện, không ẩn theo toggle.
+  if (captureLine && (captureState.finished || recordingActive)) {
+    if (showSavedRoutes) {
+      if (!map.hasLayer(captureLine)) captureLine.addTo(map);
+    } else if (map.hasLayer(captureLine)) {
+      map.removeLayer(captureLine);
     }
   }
   if (!showSavedRoutes) {
