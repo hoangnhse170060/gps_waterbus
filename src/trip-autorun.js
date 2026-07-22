@@ -1511,8 +1511,30 @@ export function createTripAutorun(ctx) {
     mission.nextStationId = next.stationId || next.stationCode || null;
     mission.nextStopCode = next.stationCode || next.stationId || null;
     mission.nextStopName = next.stationName || next.stationCode || 'Bến kế';
-    mission.nextStopDistanceKm = Math.max(0, metersToNext) / 1000;
     mission.nextStopPlannedArrivalAt = next.plannedArrivalTime || null;
+
+    // Đang dừng chờ xuất bến: km = 0, ETA = phút còn lại tới plannedDepartureTime
+    // (không lấy ETA chạy với tốc độ 0 → FE hiện sai "<1p").
+    if (mission.status === 'WaitingAtStop') {
+      mission.nextStopDistanceKm = 0;
+      const waitUntil = parseTimeMs(mission.waitingUntil)
+        || parseTimeMs(next.plannedDepartureTime);
+      if (Number.isFinite(waitUntil)) {
+        mission.waitingUntil = mission.waitingUntil || new Date(waitUntil).toISOString();
+        mission.waitingStationName = mission.waitingStationName
+          || next.stationName
+          || next.stationCode
+          || null;
+        mission.waitingStationCode = mission.waitingStationCode || next.stationCode || null;
+        mission.nextStopEtaMin = Math.max(0, (waitUntil - nowMs) / 60000);
+      } else {
+        mission.nextStopEtaMin = null;
+      }
+      mission.movementStatus = movementStatusFor(mission);
+      return;
+    }
+
+    mission.nextStopDistanceKm = Math.max(0, metersToNext) / 1000;
 
     // remainingMinutes = ETA di chuyển (quãng đường / tốc độ), không phải countdown lịch.
     // Lịch kế hoạch FE lấy từ /operations/schedule.

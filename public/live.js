@@ -1000,7 +1000,12 @@ function autoPhaseForBoat(code, lat, lng) {
 
 /** "3:45" — phút:giây còn lại tới plannedDepartureTime (rỗng nếu đã hết/không có mốc). */
 function waitingCountdownLabel(trip) {
-  const untilMs = trip?.waitingUntil ? Date.parse(trip.waitingUntil) : NaN;
+  let untilMs = trip?.waitingUntil ? Date.parse(trip.waitingUntil) : NaN;
+  // Fallback: nextStopEtaMin lúc WaitingAtStop = phút chờ xuất bến (server đã set).
+  if (!Number.isFinite(untilMs) && trip?.status === 'WaitingAtStop') {
+    const eta = Number(trip.nextStopEtaMin);
+    if (Number.isFinite(eta) && eta > 0) untilMs = Date.now() + eta * 60000;
+  }
   if (!Number.isFinite(untilMs)) return '';
   const remainMs = untilMs - Date.now();
   if (remainMs <= 0) return '';
@@ -1008,6 +1013,33 @@ function waitingCountdownLabel(trip) {
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/** Ví dụ: "Ba Son · 1.2 km · ~8p" — WaitingAtStop: "Ba Son · xuất bến còn 3:45". */
+function tripNextStopLabel(trip) {
+  if (!trip) return '';
+  if (trip.status === 'WaitingAtStop') {
+    const name = String(
+      trip.waitingStationName || trip.nextStopName || trip.nextStopCode || '',
+    ).trim();
+    const countdown = waitingCountdownLabel(trip);
+    if (countdown) {
+      return name ? `${name} · xuất bến còn ${countdown}` : `xuất bến còn ${countdown}`;
+    }
+    return name ? `${name} · đang dừng chờ xuất bến` : 'đang dừng chờ xuất bến';
+  }
+  const name = String(trip.nextStopName || trip.nextStopCode || '').trim();
+  const km = Number(trip.nextStopDistanceKm);
+  const eta = Number(trip.nextStopEtaMin);
+  const parts = [];
+  if (name) parts.push(name);
+  if (Number.isFinite(km) && km >= 0 && km < 100) {
+    parts.push(km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km < 10 ? 1 : 0)} km`);
+  }
+  if (Number.isFinite(eta) && eta >= 0 && eta < 24 * 60) {
+    parts.push(eta < 1 ? '<1p' : `~${Math.round(eta)}p`);
+  }
+  return parts.join(' · ');
 }
 
 function phaseStatusText(code, lat, lng) {
@@ -1027,11 +1059,11 @@ function phaseStatusText(code, lat, lng) {
       return nextLabel ? `Trip · chờ xuất bến · ${nextLabel}` : `Trip · chờ xuất bến · ${spd} km/h`;
     }
     if (trip.status === 'WaitingAtStop') {
-      const station = trip.waitingStationName || null;
+      const station = trip.waitingStationName || trip.nextStopName || null;
       const countdown = waitingCountdownLabel(trip);
       const base = station
         ? `Trip · dừng ở ${station}`
-        : (nextLabel ? `Trip · chờ bến · ${nextLabel}` : `Trip · chờ bến · ${spd} km/h`);
+        : 'Trip · đang dừng chờ xuất bến';
       return countdown ? `${base} · còn ${countdown}` : base;
     }
     if (trip.status === 'Paused') return 'Trip · tạm dừng (cứu hộ)';
@@ -1284,7 +1316,7 @@ function renderBoatOptions(data) {
   boatOptionsSignature = signature;
   const boats = catalogBoats(data);
   boatSelectEl.innerHTML = [
-    '<option value="">Chọn tàu...</option>',
+    '<option value="">Tất cả tàu (tổng quan)</option>',
     ...boats.map((boat) => {
       const max = Number(boat.maxSpeedKmh) || '';
       const name = boat.boatName ? ` · ${boat.boatName}` : '';
@@ -1305,12 +1337,21 @@ function renderBoatOptions(data) {
 function updateDeviceHint() {
   const code = selectedBoatCode || boatSelectEl.value;
   if (!code) {
-    deviceHintEl.textContent = 'Chuột phải tàu → Mở khóa kéo để di chuyển.';
+    deviceHintEl.textContent = 'Tổng quan mọi tàu · chọn tàu để chỉ xem tàu đó và đường của nó.';
     deviceHintEl.className = 'live-hint';
     return;
   }
   const trip = activeTripForBoat(code);
   if (trip) {
+    if (trip.status === 'WaitingAtStop') {
+      const station = trip.waitingStationName || trip.nextStopName || 'bến';
+      const countdown = waitingCountdownLabel(trip);
+      deviceHintEl.textContent = countdown
+        ? `${code} · dừng ở ${station} · xuất bến còn ${countdown} · khóa kéo tay`
+        : `${code} · dừng ở ${station} · đang chờ xuất bến · khóa kéo tay`;
+      deviceHintEl.className = 'live-hint is-ok';
+      return;
+    }
     const spd = Number.isFinite(Number(trip.speedKmh)) ? Math.round(Number(trip.speedKmh)) : 0;
     const nextLabel = tripNextStopLabel(trip);
     deviceHintEl.textContent = nextLabel
@@ -1339,23 +1380,6 @@ function activeTripForBoat(code, data = latest) {
     if (String(row.boatCode || '').trim() !== key) return false;
     return ['Pending', 'ToDeparture', 'Boarding', 'Running', 'WaitingAtStop', 'Paused'].includes(String(row.status || ''));
   }) || null;
-}
-
-/** Ví dụ: "Ba Son · 1.2 km · ~8p" */
-function tripNextStopLabel(trip) {
-  if (!trip) return '';
-  const name = String(trip.nextStopName || trip.nextStopCode || '').trim();
-  const km = Number(trip.nextStopDistanceKm);
-  const eta = Number(trip.nextStopEtaMin);
-  const parts = [];
-  if (name) parts.push(name);
-  if (Number.isFinite(km) && km >= 0 && km < 100) {
-    parts.push(km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(km < 10 ? 1 : 0)} km`);
-  }
-  if (Number.isFinite(eta) && eta >= 0 && eta < 24 * 60) {
-    parts.push(eta < 1 ? '<1p' : `~${Math.round(eta)}p`);
-  }
-  return parts.join(' · ');
 }
 
 /** Ưu tiên tốc độ trip GPS / hub; fallback tốc độ kéo tay local. */
@@ -1651,28 +1675,102 @@ const LIVE_ROUTE_STYLE = {
   dashArray: null,
 };
 
+const LIVE_FOCUS_ROUTE_STYLE = {
+  color: '#f59e0b',
+  weight: 5,
+  opacity: 0.92,
+  dashArray: null,
+};
+
+/** Mã tuyến đang gắn với tàu (trip ưu tiên, rồi catalog boat). */
+function routeCodesForBoat(code, data = latest) {
+  const key = String(code || '').trim();
+  if (!key) return new Set();
+  const codes = new Set();
+  const trip = activeTripForBoat(key, data);
+  const tripRoute = String(trip?.routeCode || '').trim();
+  if (tripRoute) codes.add(tripRoute.toLowerCase());
+  const boat = (data?.boats || []).find((b) => String(b.boatCode) === key);
+  const boatRoute = String(boat?.routeCode || '').trim();
+  if (boatRoute) codes.add(boatRoute.toLowerCase());
+  return codes;
+}
+
+function routeMatchesBoatFocus(route, focusCodes) {
+  if (!focusCodes?.size) return true;
+  const code = String(route?.routeCode || '').trim().toLowerCase();
+  return Boolean(code && focusCodes.has(code));
+}
+
+/** Đang chọn tàu → chỉ hiện tàu đó + đường của nó; bỏ chọn → hiện hết. */
+function isBoatFocusActive() {
+  return Boolean(String(selectedBoatCode || '').trim());
+}
+
+function fitFocusedBoatView(code) {
+  const key = String(code || '').trim();
+  if (!key || !latest) return;
+  const focusCodes = routeCodesForBoat(key, latest);
+  const bounds = [];
+  for (const route of latest.routes || []) {
+    if (!routeMatchesBoatFocus(route, focusCodes)) continue;
+    for (const p of route.coordinates || []) {
+      if (Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng))) {
+        bounds.push([Number(p.lat), Number(p.lng)]);
+      }
+    }
+  }
+  const marker = hubMarkers.get(key);
+  if (marker) {
+    const ll = marker.getLatLng();
+    bounds.push([ll.lat, ll.lng]);
+  }
+  if (bounds.length >= 2) {
+    try {
+      map.fitBounds(bounds, { padding: [56, 56], maxZoom: 15, animate: true });
+    } catch {
+      if (marker) map.panTo(marker.getLatLng(), { animate: true });
+    }
+  } else if (marker) {
+    map.panTo(marker.getLatLng(), { animate: true });
+  }
+}
+
 function renderRoutes(routes, stations, riverCorridor) {
   const seen = new Set();
   const bounds = [];
+  const focusActive = isBoatFocusActive();
+  const focusCodes = focusActive ? routeCodesForBoat(selectedBoatCode, latest) : null;
 
   // Live: vẽ đường đã có (tham khảo, mờ) — tàu vẫn bám path phía server, không phụ thuộc line này.
+  // Khi chọn tàu: chỉ hiện tuyến khớp routeCode của tàu đó.
   void riverCorridor;
   (routes || []).forEach((route) => {
     const latlngs = (route.coordinates || [])
       .filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
       .map((p) => [Number(p.lat), Number(p.lng)]);
     if (latlngs.length < 2) return;
+    const focused = focusActive && routeMatchesBoatFocus(route, focusCodes);
+    if (focusActive && !focused) {
+      const existing = routeLayers.get(route.routeId);
+      if (existing && map.hasLayer(existing)) map.removeLayer(existing);
+      seen.add(route.routeId);
+      return;
+    }
     seen.add(route.routeId);
+    const style = focused ? LIVE_FOCUS_ROUTE_STYLE : LIVE_ROUTE_STYLE;
     let layer = routeLayers.get(route.routeId);
     if (!layer) {
-      layer = L.polyline(latlngs, { ...LIVE_ROUTE_STYLE, smoothFactor: 0, interactive: false });
+      layer = L.polyline(latlngs, { ...style, smoothFactor: 0, interactive: false });
       layer.addTo(map);
       layer.bindTooltip(`${route.routeCode || ''} · ${route.routeName || ''}`.trim(), { sticky: true });
       routeLayers.set(route.routeId, layer);
     } else {
       layer.setLatLngs(latlngs);
+      layer.setStyle({ ...style, smoothFactor: 0 });
       if (!map.hasLayer(layer)) layer.addTo(map);
     }
+    if (focused && typeof layer.bringToFront === 'function') layer.bringToFront();
     for (const p of latlngs) bounds.push(p);
   });
   for (const [id, layer] of [...routeLayers.entries()]) {
@@ -1687,7 +1785,7 @@ function renderRoutes(routes, stations, riverCorridor) {
     bounds.push([Number(station.lat), Number(station.lng)]);
   }
 
-  if (!hasFitRoutes && bounds.length) {
+  if (!hasFitRoutes && bounds.length && !focusActive) {
     hasFitRoutes = true;
     map.fitBounds(bounds, { padding: [48, 48], maxZoom: 14 });
   }
@@ -1709,8 +1807,12 @@ function renderHubBoats(hubBoats) {
   }
 
   const catalog = catalogBoats();
-  const codes = mapBoatCodes(latest, hubBoats);
-  const codeSet = new Set(codes);
+  const allCodes = mapBoatCodes(latest, hubBoats);
+  const focusKey = String(selectedBoatCode || '').trim();
+  // Chọn tàu → chỉ hiện tàu đó trên map; bỏ chọn → hiện tất cả.
+  const codes = focusKey ? [focusKey] : allCodes;
+  const codeSet = new Set(allCodes);
+  if (focusKey) codeSet.add(focusKey);
   const updateMsByCode = new Map(
     codes.map((code) => [code, boatUpdateMs(code, hubByCode, latest)]),
   );
@@ -1926,7 +2028,7 @@ function renderHubBoats(hubBoats) {
   syncBoatControls();
 }
 
-function selectBoat(code, { toastMessage = false } = {}) {
+function selectBoat(code, { toastMessage = false, fitFocus = true } = {}) {
   const key = String(code || '').trim();
   if (!key) return;
   selectedBoatCode = key;
@@ -1934,13 +2036,16 @@ function selectBoat(code, { toastMessage = false } = {}) {
   if (boatSelectEl) boatSelectEl.value = key;
   updateDeviceHint();
   syncBoatControls();
-  if (latest) renderHubBoats(latest.hubBoats);
+  if (latest) {
+    renderRoutes(latest.routes, latest.stations, latest.riverCorridor);
+    renderHubBoats(latest.hubBoats);
+  }
   const marker = hubMarkers.get(key);
   if (marker) {
     if (canDragBoat(key)) marker.dragging?.enable?.();
     else marker.dragging?.disable?.();
-    map.panTo(marker.getLatLng(), { animate: true });
   }
+  if (fitFocus) fitFocusedBoatView(key);
   if (toastMessage) {
     toast(
       canDragBoat(key)
@@ -1948,6 +2053,35 @@ function selectBoat(code, { toastMessage = false } = {}) {
         : `${boatDisplayName(key)} — chuột phải → Mở khóa kéo`,
       canDragBoat(key) ? 'ok' : 'warn',
     );
+  }
+}
+
+function clearBoatFocus({ fitOverview = true } = {}) {
+  selectedBoatCode = '';
+  localStorage.removeItem('liveGpsBoatCode');
+  if (boatSelectEl) boatSelectEl.value = '';
+  updateDeviceHint();
+  syncBoatControls();
+  if (latest) {
+    renderRoutes(latest.routes, latest.stations, latest.riverCorridor);
+    renderHubBoats(latest.hubBoats);
+    if (fitOverview) {
+      const bounds = [];
+      for (const route of latest.routes || []) {
+        for (const p of route.coordinates || []) {
+          if (Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng))) {
+            bounds.push([Number(p.lat), Number(p.lng)]);
+          }
+        }
+      }
+      if (bounds.length >= 2) {
+        try {
+          map.fitBounds(bounds, { padding: [48, 48], maxZoom: 14, animate: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 }
 
@@ -2826,16 +2960,12 @@ boatSelectEl?.addEventListener('blur', () => {
 
 boatSelectEl.addEventListener('change', () => {
   hideBoatContextMenu();
-  selectedBoatCode = boatSelectEl.value.trim();
-  if (selectedBoatCode) localStorage.setItem('liveGpsBoatCode', selectedBoatCode);
-  else localStorage.removeItem('liveGpsBoatCode');
-  updateDeviceHint();
-  syncBoatControls();
-  if (latest) renderHubBoats(latest.hubBoats);
-  const marker = hubMarkers.get(selectedBoatCode);
-  if (marker) {
-    map.panTo(marker.getLatLng(), { animate: true });
+  const next = boatSelectEl.value.trim();
+  if (!next) {
+    clearBoatFocus();
+    return;
   }
+  selectBoat(next, { fitFocus: true });
 });
 
 boatCtxToggleLockBtn?.addEventListener('click', (event) => {
@@ -3116,3 +3246,22 @@ startSnapshotPoll();
 resyncAzurePositions().finally(() => {
   startHeartbeat();
 });
+
+/** Đếm ngược xuất bến (mm:ss) cập nhật mỗi giây khi tàu đang WaitingAtStop. */
+setInterval(() => {
+  const code = String(selectedBoatCode || '').trim();
+  if (!code) return;
+  const trip = activeTripForBoat(code);
+  if (!trip || trip.status !== 'WaitingAtStop') return;
+  const pin = pinnedFor(code);
+  if (boatPhaseStatusEl && pin) {
+    boatPhaseStatusEl.textContent = phaseStatusText(code, pin.lat, pin.lng) || '—';
+  }
+  updateDeviceHint();
+  const marker = hubMarkers.get(code);
+  if (marker?.getPopup?.()?.isOpen?.()) {
+    const catalogBoat = catalogBoats().find((b) => String(b.boatCode) === code);
+    const hub = (latest?.hubBoats || []).find((b) => String(b.boatCode || '').trim() === code);
+    marker.setPopupContent(boatPopupHtml(code, catalogBoat, hub, pin?.lat, pin?.lng));
+  }
+}, 1000);
