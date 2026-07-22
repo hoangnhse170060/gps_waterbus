@@ -568,13 +568,17 @@ function applyBoatDraft(draft) {
   updateRouteTypeHint();
 }
 
-/** Chọn tàu → nạp bản vẽ GPS của đúng tàu đó. Bỏ chọn → xóa đường trên map, không ghi GPS. */
+/** Chọn tàu → nạp bản vẽ của tàu đó.
+ *  Cho phép vẽ trước / chọn tàu sau: nếu đang có đường trên map mà tàu mới chưa có draft
+ *  → giữ nguyên đường và gắn cho tàu vừa chọn (không xóa).
+ */
 function switchBoatDraft(nextBoatCode) {
   const next = String(nextBoatCode || '').trim();
+  const prev = String(selectedCollectorBoatCode || '').trim();
   if (recordingActive || lockedSurveyPath) {
     captureStatusEl.textContent = 'Đang ghi GPS — không đổi tàu lúc này.';
     notifyWarn('Đang ghi GPS — không đổi tàu lúc này.');
-    if (collectorBoatCodeEl) collectorBoatCodeEl.value = selectedCollectorBoatCode || '';
+    if (collectorBoatCodeEl) collectorBoatCodeEl.value = prev || '';
     return;
   }
   if (next) {
@@ -582,18 +586,39 @@ function switchBoatDraft(nextBoatCode) {
     if (block) {
       captureStatusEl.textContent = `Tàu ${next} ${block}.`;
       notifyWarn(`Không đi dò: ${next} ${block}`);
-      if (collectorBoatCodeEl) collectorBoatCodeEl.value = selectedCollectorBoatCode || '';
+      if (collectorBoatCodeEl) collectorBoatCodeEl.value = prev || '';
       return;
     }
   }
-  if (selectedCollectorBoatCode && selectedCollectorBoatCode !== next) {
-    saveActiveBoatDraft(selectedCollectorBoatCode);
+
+  // Đổi tàu khác → lưu draft tàu cũ.
+  if (prev && prev !== next) {
+    saveActiveBoatDraft(prev);
   }
+
   selectedCollectorBoatCode = next;
   if (collectorBoatCodeEl) collectorBoatCodeEl.value = next;
   if (next) localStorage.setItem('surveyBoatCode', next);
   else localStorage.removeItem('surveyBoatCode');
-  applyBoatDraft(next ? (boatDrafts[next] || null) : null);
+
+  const existingDraft = next ? boatDrafts[next] : null;
+  const hasCanvas = captureState.points.length > 0
+    || Boolean(captureRouteCodeEl?.value.trim())
+    || Boolean(startStationEl?.value);
+
+  if (!next) {
+    // Bỏ chọn tàu → xóa đường đang vẽ.
+    applyBoatDraft(null);
+  } else if (existingDraft && (prev || !hasCanvas)) {
+    // Có draft sẵn của tàu này → nạp (trừ khi vừa gắn đường hiện tại vào tàu trống).
+    applyBoatDraft(existingDraft);
+  } else if (hasCanvas && (!existingDraft || !prev)) {
+    // Vẽ trước / chọn tàu sau, hoặc tàu chưa có draft → giữ đường, gắn vào tàu.
+    saveActiveBoatDraft(next);
+  } else {
+    applyBoatDraft(existingDraft || null);
+  }
+
   applyBoatSpeedLimits();
   updateDrawStats();
   const pts = captureState.points.length;
@@ -2212,10 +2237,13 @@ function renderCollectorBoatOptions(boats) {
     const name = boat.boatName ? ` · ${boat.boatName}` : '';
     const block = boatSurveyBlockReason(boat.boatCode);
     const tag = block ? ` · ${block}` : ` · max ${max} km/h`;
+    const isCurrent = String(boat.boatCode) === String(previous);
     return {
       code: boat.boatCode,
       label: `${boat.boatCode}${name}${tag}`,
-      disabled: Boolean(block),
+      // Giữ tàu đang chọn selectable — tránh browser reset về "Chọn tàu..."
+      disabled: Boolean(block) && !isCurrent,
+      blocked: Boolean(block),
     };
   });
   collectorBoatCodeEl.innerHTML = [
@@ -2224,22 +2252,22 @@ function renderCollectorBoatOptions(boats) {
       `<option value="${escapeHtml(item.code)}"${item.disabled ? ' disabled' : ''}>${escapeHtml(item.label)}</option>`
     )),
   ].join('');
-  const preferred = options.some((item) => item.code === previous && !item.disabled)
-    ? previous
-    : '';
-  if (previous && !preferred) {
+
+  const stillInList = options.some((item) => item.code === previous);
+  const preferred = stillInList ? previous : '';
+
+  // Chỉ bỏ chọn khi tàu biến mất khỏi catalog.
+  if (previous && !stillInList) {
     selectedCollectorBoatCode = '';
     localStorage.removeItem('surveyBoatCode');
+  } else if (preferred) {
+    selectedCollectorBoatCode = preferred;
+    localStorage.setItem('surveyBoatCode', preferred);
   }
-  collectorBoatCodeEl.value = preferred;
-  selectedCollectorBoatCode = preferred;
-  if (preferred) localStorage.setItem('surveyBoatCode', preferred);
-  else localStorage.removeItem('surveyBoatCode');
+  collectorBoatCodeEl.value = preferred || '';
   // Không tự chọn tàu đầu — user phải chọn. Có tàu đã chọn thì nạp bản vẽ của đúng tàu.
-  if (preferred) {
-    if (!captureState.points.length && boatDrafts[preferred]) {
-      applyBoatDraft(boatDrafts[preferred]);
-    }
+  if (preferred && !captureState.points.length && boatDrafts[preferred]) {
+    applyBoatDraft(boatDrafts[preferred]);
   }
   applyBoatSpeedLimits();
   updateDrawStats();
