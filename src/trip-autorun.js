@@ -1345,48 +1345,182 @@ export function createTripAutorun(ctx) {
     return Math.min(boatMax, tripMax, azureMax);
   }
 
-  function computeRequiredSpeedKmh(mission, nowMs) {
-    const rawRemaining = Math.max(0, Number(mission.lengthMeters) - Number(mission.progressMeters));
-    // Trần hợp lý tuyến sông — tránh geometry lỗi → tốc độ ~0 và đứng im.
-    const remainingMeters = Math.min(rawRemaining, 80_000);
-    const remainingKm = remainingMeters / 1000;
-    if (!(remainingKm > 0.001)) return 0;
+  function headingDeltaDeg(a, b) {
+    let d = Math.abs(Number(a) - Number(b)) % 360;
+    if (d > 180) d = 360 - d;
+    return d;
+  }
 
-    // Ưu tiên đúng giờ tới BẾN KẾ TIẾP (nếu bến đó có plannedArrivalTime riêng) —
-    // tốc độ được tự tăng/giảm theo từng chặng, miễn đúng km/thời gian của chặng đó,
-    // thay vì chỉ nhắm đúng giờ về đích cuối tuyến.
+  /**
+   * Trọng số cong ≥ 1: thẳng ≈ 1, cua gắt ≈ 1.8–2.1.
+   * Dùng để phân bổ thời gian đều theo “độ khó” path — không dồn chậm đầu / phóng cuối.
+   */
+  function curveWeightFromTurnDeg(turnDeg) {
+    const turn = Math.max(0, Number(turnDeg) || 0);
+    return 1 + Math.min(1.1, (turn / 90) * 0.85);
+  }
+
+  /**
+   * Đo phần path còn lại [progress → endMeters]:
+   * physicalMeters, effectiveMeters (= Σ len×w), localWeight tại vị trí tàu.
+   */
+  function remainingPathMetrics(mission, endMeters) {
+    const coords = mission.coordinates || [];
+    const startM = Math.max(0, Number(mission.progressMeters) || 0);
+    const endM = Math.min(
+      Number(mission.lengthMeters) || 0,
+      Number.isFinite(Number(endMeters)) ? Number(endMeters) : (Number(mission.lengthMeters) || 0),
+    );
+    const fallbackPhysical = Math.max(0, endM - startM);
+    if (coords.length < 2 || !(fallbackPhysical > 0.5)) {
+      return { physicalMeters: fallbackPhysical, effectiveMeters: fallbackPhysical, localWeight: 1 };
+    }
+
+    let along = 0;
+    let physical = 0;
+    let effective = 0;
+    let localWeight = 1;
+    let localSet = false;
+    let prevBearing = null;
+
+    for (let i = 1; i < coords.length; i += 1) {
+      const a = coords[i - 1];
+      const b = coords[i];
+      const segLen = distanceMetersFn(a, b);
+      if (!(segLen > 0.01)) continue;
+      const bearing = bearingTo(a, b);
+      const segStart = along;
+      const segEnd = along + segLen;
+      along = segEnd;
+
+      if (segEnd <= startM + 0.01) {
+        prevBearing = bearing;
+        continue;
+      }
+      if (segStart >= endM - 0.01) break;
+
+      const overlap = Math.max(0, Math.min(segEnd, endM) - Math.max(segStart, startM));
+      if (!(overlap > 0)) {
+        prevBearing = bearing;
+        continue;
+      }
+
+      const turnIn = prevBearing == null ? 0 : headingDeltaDeg(prevBearing, bearing);
+      let turnOut = 0;
+      if (i + 1 < coords.length) {
+        const nextLen = distanceMetersFn(b, coords[i + 1]);
+        if (nextLen > 0.01) turnOut = headingDeltaDeg(bearing, bearingTo(b, coords[i + 1]));
+      }
+      const w = curveWeightFromTurnDeg(Math.max(turnIn, turnOut));
+      physical += overlap;
+      effective += overlap * w;
+
+      // Trọng số ngay tại mũi tàu (đoạn đang đứng / sắp vào trong ~30m).
+      if (!localSet && Math.max(segStart, startM) <= startM + 30) {
+        localWeight = w;
+        localSet = true;
+      }
+      prevBearing = bearing;
+    }
+
+    if (!(physical > 0)) {
+      return { physicalMeters: fallbackPhysical, effectiveMeters: fallbackPhysical, localWeight: 1 };
+    }
+    return {
+      physicalMeters: physical,
+      effectiveMeters: Math.max(physical, effective),
+      localWeight: localSet ? localWeight : 1,
+    };
+  }
+
+  /** Mốc km dọc path cần tới đúng giờ (bến kế hoặc đích tuyến). */
+  function scheduleHorizonMeters(mission) {
+    const fullEnd = Number(mission.lengthMeters) || 0;
+    const progress = Number(mission.progressMeters) || 0;
+    const stops = mission.stops || [];
+    const nextStop = stops[Number(mission.stopIndex) || 0];
+    if (nextStop) {
+      const along = alongMetersToStop(mission, nextStop);
+      if (Number.isFinite(along) && along > 0.5) {
+        return Math.min(fullEnd, progress + along);
+      }
+    }
+    return fullEnd;
+  }
+
+  function scheduleRemainingHours(mission, nowMs) {
     const stops = mission.stops || [];
     const nextStop = stops[Number(mission.stopIndex) || 0];
     if (nextStop) {
       const stopArrMs = parseTimeMs(nextStop.plannedArrivalTime);
       if (Number.isFinite(stopArrMs)) {
-        const legMeters = alongMetersToStop(mission, nextStop);
-        if (Number.isFinite(legMeters) && legMeters > 0.5) {
-          const legHours = (stopArrMs - nowMs) / 3600000;
-          if (legHours > 0) {
-            const legRequired = (legMeters / 1000) / legHours;
-            if (legRequired >= 0.5) return legRequired;
-          } else {
-            // Trễ giờ tới bến kế — chạy trần cruise cho chặng này (không JUMP).
-            return tripCruiseMaxKmh(mission);
-          }
-        }
+        return { hours: (stopArrMs - nowMs) / 3600000, late: stopArrMs <= nowMs };
+      }
+    }
+    const arrMs = parseTimeMs(mission.arrivalTime);
+    if (!Number.isFinite(arrMs)) return { hours: null, late: false };
+    return { hours: (arrMs - nowMs) / 3600000, late: arrMs <= nowMs };
+  }
+
+  /**
+   * Tốc độ tức thời: phân bổ thời gian còn lại theo độ khó path (thẳng nhanh, cong chậm),
+   * tổng thời gian vẫn khớp lịch — không chậm dồn đầu rồi phóng cuối.
+   */
+  function computeRequiredSpeedKmh(mission, nowMs) {
+    const endMeters = scheduleHorizonMeters(mission);
+    const metrics = remainingPathMetrics(mission, endMeters);
+    const remainingKm = metrics.physicalMeters / 1000;
+    if (!(remainingKm > 0.001)) return 0;
+
+    const cruise = tripCruiseMaxKmh(mission);
+    const defaultSpeed = Number(env.DEFAULT_SPEED_KMH || 16);
+    const schedule = scheduleRemainingHours(mission, nowMs);
+
+    // Làm mượt trọng số cong — tránh giật tốc độ từng tick.
+    const prevW = Number(mission.curveWeightSmooth);
+    const localW = Math.max(1, Number(metrics.localWeight) || 1);
+    const smoothW = Number.isFinite(prevW) && prevW > 0
+      ? (prevW * 0.72 + localW * 0.28)
+      : localW;
+    mission.curveWeightSmooth = smoothW;
+
+    let instant;
+    if (schedule.hours == null) {
+      // Không có lịch: tốc độ mặc định, chậm hơn ở cua.
+      instant = defaultSpeed / smoothW;
+    } else if (schedule.late || !(schedule.hours > 0)) {
+      // Trễ: chạy gần trần nhưng vẫn giảm tốc ở cua (không JUMP).
+      instant = cruise / smoothW;
+    } else {
+      // effectiveKm / hours = nhịp lịch theo độ khó; ÷ localW → thẳng nhanh, cong chậm.
+      // Tổng thời gian các đoạn vẫn ≈ remainingHours (không dồn chậm đầu / phóng cuối).
+      const effectiveKm = metrics.effectiveMeters / 1000;
+      const paceKmh = effectiveKm / schedule.hours;
+      instant = paceKmh / smoothW;
+      if (paceKmh < 0.5) instant = defaultSpeed / smoothW;
+    }
+
+    // Kẹp quanh nhịp lịch vật lý để không lệch quá xa (vẫn đều, không sprint).
+    const physicalHours = schedule.hours != null && schedule.hours > 0 ? schedule.hours : null;
+    if (physicalHours) {
+      const avgPhysical = remainingKm / physicalHours;
+      if (avgPhysical >= 0.5) {
+        const minSpeed = avgPhysical * 0.42;
+        const maxSpeed = Math.min(cruise, avgPhysical * 1.55);
+        instant = Math.max(minSpeed, Math.min(maxSpeed, instant));
       }
     }
 
-    const arrMs = parseTimeMs(mission.arrivalTime);
-    if (!Number.isFinite(arrMs)) {
-      return Number(mission.speedKmh) || Number(env.DEFAULT_SPEED_KMH || 16);
+    instant = Math.max(1, Math.min(cruise, instant));
+
+    // Làm mượt tốc độ so với tick trước — tránh tăng/giảm đột ngột.
+    const prevSpeed = Number(mission.speedKmh);
+    if (Number.isFinite(prevSpeed) && prevSpeed > 0.5 && mission.status === 'Running') {
+      const maxStep = Math.max(0.8, cruise * 0.08);
+      if (instant > prevSpeed + maxStep) instant = prevSpeed + maxStep;
+      if (instant < prevSpeed - maxStep) instant = prevSpeed - maxStep;
     }
-    const remainingHours = (arrMs - nowMs) / 3600000;
-    if (!(remainingHours > 0)) {
-      // Trễ giờ về — chạy trần cruise (không JUMP giữa chuyến).
-      return tripCruiseMaxKmh(mission);
-    }
-    // Nếu lịch còn rất xa so với quãng đường (ETA ảo) → dùng tốc độ mặc định.
-    const required = remainingKm / remainingHours;
-    if (required < 0.5) return Number(env.DEFAULT_SPEED_KMH || 16);
-    return required;
+    return instant;
   }
 
   function nearStop(mission, stop, radius = STOP_ARRIVED_M) {
