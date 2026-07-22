@@ -1644,25 +1644,48 @@ function renderStations(stations) {
   }
 }
 
+const LIVE_ROUTE_STYLE = {
+  color: '#0f766e',
+  weight: 3,
+  opacity: 0.45,
+  dashArray: null,
+};
+
 function renderRoutes(routes, stations, riverCorridor) {
   const seen = new Set();
   const bounds = [];
 
-  // Live: không vẽ đường Neon / corridor đè lên map (tàu vẫn bám path phía server).
-  // Chỉ fit bounds theo bến nếu chưa fit.
+  // Live: vẽ đường đã có (tham khảo, mờ) — tàu vẫn bám path phía server, không phụ thuộc line này.
+  void riverCorridor;
+  (routes || []).forEach((route) => {
+    const latlngs = (route.coordinates || [])
+      .filter((p) => Number.isFinite(Number(p?.lat)) && Number.isFinite(Number(p?.lng)))
+      .map((p) => [Number(p.lat), Number(p.lng)]);
+    if (latlngs.length < 2) return;
+    seen.add(route.routeId);
+    let layer = routeLayers.get(route.routeId);
+    if (!layer) {
+      layer = L.polyline(latlngs, { ...LIVE_ROUTE_STYLE, smoothFactor: 0, interactive: false });
+      layer.addTo(map);
+      layer.bindTooltip(`${route.routeCode || ''} · ${route.routeName || ''}`.trim(), { sticky: true });
+      routeLayers.set(route.routeId, layer);
+    } else {
+      layer.setLatLngs(latlngs);
+      if (!map.hasLayer(layer)) layer.addTo(map);
+    }
+    for (const p of latlngs) bounds.push(p);
+  });
   for (const [id, layer] of [...routeLayers.entries()]) {
-    layer.remove();
-    routeLayers.delete(id);
+    if (!seen.has(id)) {
+      layer.remove();
+      routeLayers.delete(id);
+    }
   }
 
   for (const station of stations || []) {
     if (!Number.isFinite(Number(station?.lat)) || !Number.isFinite(Number(station?.lng))) continue;
     bounds.push([Number(station.lat), Number(station.lng)]);
   }
-  // Giữ tham số để tương thích caller — không render polyline.
-  void routes;
-  void riverCorridor;
-  void seen;
 
   if (!hasFitRoutes && bounds.length) {
     hasFitRoutes = true;
