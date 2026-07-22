@@ -103,6 +103,8 @@ let incidentBusy = false;
 let incidentToastSeeded = false;
 const toastedIncidentIds = new Set();
 const toastedRescueKeys = new Set();
+const toastedWaitingKeys = new Set();
+let waitingToastSeeded = false;
 let eventsReconnectTimer = null;
 let eventsBackoffMs = 1000;
 let lastEventsAt = 0;
@@ -996,6 +998,18 @@ function autoPhaseForBoat(code, lat, lng) {
   return 'stopped';
 }
 
+/** "3:45" — phút:giây còn lại tới plannedDepartureTime (rỗng nếu đã hết/không có mốc). */
+function waitingCountdownLabel(trip) {
+  const untilMs = trip?.waitingUntil ? Date.parse(trip.waitingUntil) : NaN;
+  if (!Number.isFinite(untilMs)) return '';
+  const remainMs = untilMs - Date.now();
+  if (remainMs <= 0) return '';
+  const totalSec = Math.round(remainMs / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
 function phaseStatusText(code, lat, lng) {
   const rescueLabel = rescuePhaseLabel(code);
   if (rescueLabel) return rescueLabel;
@@ -1013,7 +1027,12 @@ function phaseStatusText(code, lat, lng) {
       return nextLabel ? `Trip · chờ xuất bến · ${nextLabel}` : `Trip · chờ xuất bến · ${spd} km/h`;
     }
     if (trip.status === 'WaitingAtStop') {
-      return nextLabel ? `Trip · chờ bến · ${nextLabel}` : `Trip · chờ bến · ${spd} km/h`;
+      const station = trip.waitingStationName || null;
+      const countdown = waitingCountdownLabel(trip);
+      const base = station
+        ? `Trip · dừng ở ${station}`
+        : (nextLabel ? `Trip · chờ bến · ${nextLabel}` : `Trip · chờ bến · ${spd} km/h`);
+      return countdown ? `${base} · còn ${countdown}` : base;
     }
     if (trip.status === 'Paused') return 'Trip · tạm dừng (cứu hộ)';
     if (trip.status === 'Running') {
@@ -2642,6 +2661,38 @@ function maybeToastNewIncidents(data) {
   }
 }
 
+/** Toast 1 lần khi tàu bắt đầu dừng chờ ở bến — kèm số phút dự kiến (đến khi hết đếm ngược sẽ tự dọn). */
+function maybeToastWaitingAtStop(data) {
+  const list = Array.isArray(data?.tripMissions) ? data.tripMissions : [];
+  const activeKeys = new Set();
+  const waiting = list.filter((trip) => trip.status === 'WaitingAtStop' && trip.waitingUntil);
+  for (const trip of waiting) {
+    activeKeys.add(`${trip.tripId}:${trip.waitingUntil}`);
+  }
+  for (const key of [...toastedWaitingKeys]) {
+    if (!activeKeys.has(key)) toastedWaitingKeys.delete(key);
+  }
+  // Lần đầu vào trang: seed im lặng — không toast cho lượt chờ đã bắt đầu từ trước.
+  if (!waitingToastSeeded) {
+    for (const key of activeKeys) toastedWaitingKeys.add(key);
+    waitingToastSeeded = true;
+    return;
+  }
+  for (const trip of waiting) {
+    const key = `${trip.tripId}:${trip.waitingUntil}`;
+    if (toastedWaitingKeys.has(key)) continue;
+    toastedWaitingKeys.add(key);
+    const untilMs = Date.parse(trip.waitingUntil);
+    const remainMin = Number.isFinite(untilMs)
+      ? Math.max(1, Math.round((untilMs - Date.now()) / 60000))
+      : null;
+    const name = boatDisplayName(trip.boatCode) || trip.boatCode;
+    const station = trip.waitingStationName || trip.nextStopName || 'bến';
+    const suffix = remainMin != null ? ` — khoảng ${remainMin} phút nữa xuất bến` : '';
+    toast(`${name} đang dừng ở ${station}${suffix}`, 'ok', 5000);
+  }
+}
+
 function render(data) {
   latest = data;
   const stamp = document.querySelector('#buildStamp');
@@ -2658,6 +2709,7 @@ function render(data) {
   }
   syncLocalIncidentFlags();
   maybeToastNewIncidents(data);
+  maybeToastWaitingAtStop(data);
   syncRescueMissionsFromIncidents(data);
   // Đang kéo tay → chỉ giữ data, không rebuild map/panel (tránh đơ + mất vị trí).
   if (dragging && draggingBoatCode) {

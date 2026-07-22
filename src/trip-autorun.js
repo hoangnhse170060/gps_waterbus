@@ -144,6 +144,10 @@ export function createTripAutorun(ctx) {
       nextStopPlannedArrivalAt: mission.nextStopPlannedArrivalAt || null,
       remainingDistanceKm: round3(mission.remainingDistanceKm),
       remainingEtaMin: round1(mission.remainingEtaMin),
+      // Đang dừng tại bến (WaitingAtStop): giờ dự kiến rời bến — FE tự đếm ngược.
+      waitingUntil: mission.waitingUntil || null,
+      waitingStationName: mission.waitingStationName || null,
+      waitingStationCode: mission.waitingStationCode || null,
       movementStatus: mission.movementStatus || null,
       lastError: mission.lastError || null,
       completedAt: mission.completedAt || null,
@@ -248,6 +252,22 @@ export function createTripAutorun(ctx) {
         plannedDepartureTime: stop.plannedDepartureTime || stop.PlannedDepartureTime || stop.departureTime || null,
       };
     }).sort((a, b) => a.stopOrder - b.stopOrder);
+  }
+
+  /** Đứng chờ tại bến tới đúng plannedDepartureTime — lưu mốc giờ để FE đếm ngược. */
+  function markWaitingAtStop(mission, stop, planDepMs) {
+    mission.status = 'WaitingAtStop';
+    mission.movementStatus = 'Waiting';
+    mission.waitingUntil = Number.isFinite(planDepMs) ? new Date(planDepMs).toISOString() : null;
+    mission.waitingStationName = stop?.stationName || stop?.stationCode || null;
+    mission.waitingStationCode = stop?.stationCode || null;
+  }
+
+  /** Rời khỏi trạng thái chờ (chạy tiếp / kết thúc trip) — xoá mốc đếm ngược. */
+  function clearWaitingAtStop(mission) {
+    mission.waitingUntil = null;
+    mission.waitingStationName = null;
+    mission.waitingStationCode = null;
   }
 
   function tripSnapToRiverEnabled() {
@@ -1083,11 +1103,11 @@ export function createTripAutorun(ctx) {
       const stop = mission.stops?.[mission.stopIndex];
       const planDep = parseTimeMs(stop?.plannedDepartureTime);
       if (stop && nearStop(mission, stop) && Number.isFinite(planDep) && nowMs < planDep) {
-        mission.status = 'WaitingAtStop';
-        mission.movementStatus = 'Waiting';
+        markWaitingAtStop(mission, stop, planDep);
       } else {
         mission.status = 'Running';
         mission.movementStatus = 'Moving';
+        clearWaitingAtStop(mission);
       }
       console.log(
         `[trip-gps] HANDOFF xong ${mission.boatCode} trip=${mission.tripId} → ${mission.status}`
@@ -1648,7 +1668,7 @@ export function createTripAutorun(ctx) {
       const stop = stops[stopIndex];
       const planDep = parseTimeMs(stop.plannedDepartureTime);
       if (nearStop(mission, stop) && Number.isFinite(planDep) && nowMs < planDep) {
-        mission.status = 'WaitingAtStop';
+        markWaitingAtStop(mission, stop, planDep);
         mission.stopIndex = stopIndex;
         mission.speedKmh = 0;
         refreshNextStopInfo(mission, nowMs);
@@ -1673,6 +1693,7 @@ export function createTripAutorun(ctx) {
       : clampSpeedToBoatMax(Math.max(1, required), mission.maxSpeedKmh);
     mission.speedKmh = speed;
     mission.status = 'Running';
+    clearWaitingAtStop(mission);
 
     const elapsedSeconds = mission.lastTickAt
       ? Math.max(0.2, Math.min(5, (nowMs - mission.lastTickAt) / 1000))
