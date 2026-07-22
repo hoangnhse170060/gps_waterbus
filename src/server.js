@@ -4702,9 +4702,9 @@ async function saveRouteFromGpsOnTarget(session, body) {
       segmentDistanceKm: stop.segmentDistanceKm == null ? null : Number(stop.segmentDistanceKm),
       travelSource: stop.travelSource || 'gps',
     }));
-    // Gửi BE: standardTravelMin / estimatedDurationMin là int ≥ 1 (tránh 400).
-    // UI vẫn giữ bản thập phân đúng panel (vd 0.28) qua outboundStops.
-    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'false');
+    // Chốt contract BE: standardTravelMin/estimatedDurationMin gửi số thập phân
+    // (vd 5.4), KHÔNG ép int nữa. AZURE_EXACT_TRAVEL_MIN=false (legacy) mới ép int.
+    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'true');
     const stopsForAzure = stopsExact.map((stop) => ({
       stationId: stop.stationId,
       stationCode: stop.stationCode,
@@ -4727,12 +4727,16 @@ async function saveRouteFromGpsOnTarget(session, body) {
       sequence: index + 1,
       recordedAt: point.recordedAt || coordinates[Math.min(index, coordinates.length - 1)]?.recordedAt || formatRecordedAt(new Date()),
     }));
-    // Ưu tiên đúng số panel lúc vẽ — UI giữ thập phân; BE nhận int ≥ 1.
+    // BE: estimatedDurationMin phải = tổng standardTravelMin các stop sau stop đầu
+    // (đúng những gì đã gửi trong payload.stops) — không tính riêng từ path/speed
+    // để tránh lệch số với tổng BE tự cộng lại.
+    const stopsSumExact = sumTravelMinutes(stopsExact) || null;
     const pathKm = routeLength(snapped) / 1000;
     const lockedMin = exactDurationMinutes(
       body.estimatedDurationMin ?? session?.estimatedDurationMin,
     );
-    const pathMinutesExact = lockedMin
+    const pathMinutesExact = stopsSumExact
+      ?? lockedMin
       ?? exactDurationMinutes((pathKm / averageSpeedKmh) * 60);
     payload.estimatedDurationMin = preferExactTravel
       ? pathMinutesExact
@@ -4750,7 +4754,7 @@ async function saveRouteFromGpsOnTarget(session, body) {
     );
     const pathMinutesExact = lockedMin
       ?? exactDurationMinutes((pathKm / averageSpeedKmh) * 60);
-    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'false');
+    const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'true');
     payload.estimatedDurationMin = preferExactTravel
       ? pathMinutesExact
       : Math.max(1, Math.round(Number(pathMinutesExact) || 1));
