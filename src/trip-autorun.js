@@ -124,6 +124,8 @@ export function createTripAutorun(ctx) {
       handoffMissionType: mission.handoffMissionType || null,
       departureTime: mission.departureTime,
       arrivalTime: mission.arrivalTime,
+      delayActive: Boolean(mission.delayActive),
+      delayInfo: mission.delayInfo || null,
       progressMeters: round1(mission.progressMeters),
       lengthMeters: round1(mission.lengthMeters),
       speedKmh: round1(mission.speedKmh),
@@ -234,12 +236,52 @@ export function createTripAutorun(ctx) {
     }
   }
 
+  function firstDefined(...values) {
+    for (const value of values) {
+      if (value != null && value !== '') return value;
+    }
+    return null;
+  }
+
+  function readDelayInfo(row = {}) {
+    const raw = row.delayInfo || row.DelayInfo || null;
+    if (!raw || typeof raw !== 'object') {
+      return { isDelayActive: false, raw: null };
+    }
+    const active = raw.isDelayActive === true
+      || raw.IsDelayActive === true
+      || String(raw.status || raw.Status || '').toLowerCase() === 'active';
+    return { isDelayActive: active, raw };
+  }
+
+  /**
+   * Giờ hiệu lực theo contract BE: adjusted* ?? planned*.
+   * Staff bấm delay/resume → BE tính giờ mới → GPS chỉ đọc field này.
+   */
   function normalizeStops(rawStops) {
     if (!Array.isArray(rawStops)) return [];
     return rawStops.map((stop, index) => {
       const pair = sanitizeLatLng(
         stop.lat ?? stop.Latitude ?? stop.latitude,
         stop.lng ?? stop.lon ?? stop.Longitude ?? stop.longitude,
+      );
+      const plannedArrival = firstDefined(
+        stop.plannedArrivalTime,
+        stop.PlannedArrivalTime,
+        stop.arrivalTime,
+      );
+      const plannedDeparture = firstDefined(
+        stop.plannedDepartureTime,
+        stop.PlannedDepartureTime,
+        stop.departureTime,
+      );
+      const adjustedArrival = firstDefined(
+        stop.adjustedArrivalTime,
+        stop.AdjustedArrivalTime,
+      );
+      const adjustedDeparture = firstDefined(
+        stop.adjustedDepartureTime,
+        stop.AdjustedDepartureTime,
       );
       return {
         stationId: cleanOptionalText(stop.stationId || stop.StationId) || null,
@@ -248,10 +290,107 @@ export function createTripAutorun(ctx) {
         stopOrder: Number(stop.stopOrder ?? stop.StopOrder) || index + 1,
         lat: pair?.lat ?? null,
         lng: pair?.lng ?? null,
-        plannedArrivalTime: stop.plannedArrivalTime || stop.PlannedArrivalTime || stop.arrivalTime || null,
-        plannedDepartureTime: stop.plannedDepartureTime || stop.PlannedDepartureTime || stop.departureTime || null,
+        // Giờ hiệu lực để chạy / chờ xuất bến.
+        plannedArrivalTime: adjustedArrival ?? plannedArrival ?? null,
+        plannedDepartureTime: adjustedDeparture ?? plannedDeparture ?? null,
+        // Giữ bản gốc + adjusted để debug / Live.
+        originalPlannedArrivalTime: plannedArrival || null,
+        originalPlannedDepartureTime: plannedDeparture || null,
+        adjustedArrivalTime: adjustedArrival || null,
+        adjustedDepartureTime: adjustedDeparture || null,
       };
     }).sort((a, b) => a.stopOrder - b.stopOrder);
+  }
+
+  function effectiveTripDeparture(row = {}) {
+    return firstDefined(
+      row.adjustedDepartureTime,
+      row.AdjustedDepartureTime,
+      row.departureTime,
+      row.DepartureTime,
+    );
+  }
+
+  function effectiveTripArrival(row = {}) {
+    return firstDefined(
+      row.adjustedArrivalTime,
+      row.AdjustedArrivalTime,
+      row.arrivalTime,
+      row.ArrivalTime,
+    );
+  }
+
+  /** Đồng bộ lịch BE (kể cả sau delay) vào mission đang chạy — không restart trip. */
+  function applyBeScheduleToMission(mission, row) {
+    if (!mission || !row) return false;
+    const beforeDep = mission.departureTime;
+    const beforeArr = mission.arrivalTime;
+    const beforeDelay = Boolean(mission.delayActive);
+
+    mission.departureTime = effectiveTripDeparture(row) || mission.departureTime;
+    mission.arrivalTime = effectiveTripArrival(row) || mission.arrivalTime;
+    const delay = readDelayInfo(row);
+    mission.delayActive = delay.isDelayActive;
+    mission.delayInfo = delay.raw;
+
+    const nextStops = normalizeStops(row.stops || row.Stops || []);
+    if (nextStops.length) {
+      const byKey = new Map();
+      for (const stop of nextStops) {
+        const key = String(stop.stationId || stop.stationCode || stop.stopOrder);
+        byKey.set(key, stop);
+      }
+      mission.stops = (mission.stops || []).map((prev) => {
+        const key = String(prev.stationId || prev.stationCode || prev.stopOrder);
+        const newer = byKey.get(key);
+        if (!newer) return prev;
+        return {
+          ...prev,
+          ...newer,
+          // Giữ toạ độ đã sanitize nếu bản due thiếu lat/lng.
+          lat: Number.isFinite(Number(newer.lat)) ? newer.lat : prev.lat,
+          lng: Number.isFinite(Number(newer.lng)) ? newer.lng : prev.lng,
+        };
+      });
+      // Thêm stop mới nếu BE bổ sung (hiếm).
+      for (const newer of nextStops) {
+        const key = String(newer.stationId || newer.stationCode || newer.stopOrder);
+        const exists = (mission.stops || []).some((s) => (
+          String(s.stationId || s.stationCode || s.stopOrder) === key
+        ));
+        if (!exists) mission.stops.push(newer);
+      }
+      mission.stops.sort((a, b) => a.stopOrder - b.stopOrder);
+    }
+
+    // Đang chờ bến → cập nhật mốc đếm ngược theo giờ hiệu lực mới.
+    if (mission.status === 'WaitingAtStop' || mission.status === 'Boarding') {
+      const stop = mission.stops?.[Number(mission.stopIndex) || 0];
+      const planDep = parseTimeMs(stop?.plannedDepartureTime)
+        || parseTimeMs(mission.departureTime);
+      if (Number.isFinite(planDep)) {
+        mission.waitingUntil = new Date(planDep).toISOString();
+        if (stop) {
+          mission.waitingStationName = stop.stationName || stop.stationCode || mission.waitingStationName;
+          mission.waitingStationCode = stop.stationCode || mission.waitingStationCode;
+        }
+      } else if (mission.delayActive) {
+        mission.waitingUntil = null; // chờ staff/BE chỉnh giờ
+      }
+    }
+
+    mission.updatedAt = new Date().toISOString();
+    const changed = beforeDep !== mission.departureTime
+      || beforeArr !== mission.arrivalTime
+      || beforeDelay !== Boolean(mission.delayActive);
+    if (changed) {
+      console.log(
+        `[trip-gps] schedule sync ${mission.boatCode} trip=${mission.tripId}`
+        + ` delay=${mission.delayActive ? 'ON' : 'off'}`
+        + ` dep=${mission.departureTime || '-'} arr=${mission.arrivalTime || '-'}`,
+      );
+    }
+    return changed;
   }
 
   /** Đứng chờ tại bến tới đúng plannedDepartureTime — lưu mốc giờ để FE đếm ngược. */
@@ -481,7 +620,7 @@ export function createTripAutorun(ctx) {
       .replace('{stationId}', encodeURIComponent(stationId));
   }
 
-  async function postStopEvent(mission, stop, event) {
+  async function postStopEvent(mission, stop, event, { occurredAt = null } = {}) {
     const tripId = cleanOptionalText(mission?.tripId);
     const stationId = cleanOptionalText(stop?.stationId || stop?.stationCode);
     const boatCode = cleanOptionalText(mission?.boatCode);
@@ -490,6 +629,15 @@ export function createTripAutorun(ctx) {
     const key = `${stationId}:${event}`;
     if (mission.stopEventsSent.has(key)) return { ok: true, skipped: true, reason: 'already-sent' };
 
+    let occurredMs = Date.now();
+    if (occurredAt != null) {
+      const parsed = typeof occurredAt === 'number' ? occurredAt : Date.parse(String(occurredAt));
+      if (Number.isFinite(parsed)) occurredMs = parsed;
+    }
+    const occurredIso = formatRecordedAt
+      ? formatRecordedAt(new Date(occurredMs))
+      : new Date(occurredMs).toISOString();
+
     const result = await requestTargetApi({
       method: 'POST',
       pathname: stopEventPath(tripId, stationId),
@@ -497,7 +645,7 @@ export function createTripAutorun(ctx) {
       payload: {
         boatCode,
         event,
-        occurredAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
+        occurredAt: occurredIso,
         lat: Number.isFinite(Number(mission.currentLat)) ? Number(mission.currentLat) : null,
         lng: Number.isFinite(Number(mission.currentLng)) ? Number(mission.currentLng) : null,
       },
@@ -510,6 +658,21 @@ export function createTripAutorun(ctx) {
       console.warn(`[trip-gps] event ${event} FAIL ${stationId}: ${result.error || result.status}`);
     }
     return result;
+  }
+
+  /** Xuất bến đúng giờ kế hoạch — không đợi ra xa 45m rồi mới Departed (tránh TRỄ 1P trên BE). */
+  async function emitDepartedOnSchedule(mission, stop, planDepMs = NaN) {
+    if (!stop) return;
+    const stationId = cleanOptionalText(stop.stationId || stop.stationCode);
+    if (!stationId) return;
+    if (!mission.stopEventsSent) mission.stopEventsSent = new Set();
+    // Cần Arrived trước (contract).
+    if (!mission.stopEventsSent.has(`${stationId}:Arrived`)) {
+      await postStopEvent(mission, stop, 'Arrived');
+    }
+    const occurred = Number.isFinite(planDepMs) ? planDepMs : Date.now();
+    await postStopEvent(mission, stop, 'Departed', { occurredAt: occurred });
+    if (mission.atStationId === stationId) mission.atStationId = null;
   }
 
   function distanceToStopMeters(mission, stop) {
@@ -574,6 +737,7 @@ export function createTripAutorun(ctx) {
 
   function movementStatusFor(mission) {
     const st = String(mission.status || '');
+    if (mission.delayActive && (st === 'WaitingAtStop' || st === 'Boarding')) return 'Delayed';
     if (st === 'ToDeparture') return 'Moving';
     if (st === 'Boarding') return 'Boarding';
     if (st === 'WaitingAtStop') return 'AtStation';
@@ -1196,8 +1360,9 @@ export function createTripAutorun(ctx) {
       || Number(env.DEFAULT_SPEED_KMH || 16)
       || 16;
 
-    const departureTime = row.departureTime || row.DepartureTime || null;
-    const arrivalTime = row.arrivalTime || row.ArrivalTime || null;
+    const departureTime = effectiveTripDeparture(row);
+    const arrivalTime = effectiveTripArrival(row);
+    const delay = readDelayInfo(row);
     const start = pointAtDistance(coordinates, 0);
 
     const mission = {
@@ -1206,6 +1371,8 @@ export function createTripAutorun(ctx) {
       routeCode: cleanOptionalText(row.routeCode || row.RouteCode) || null,
       departureTime,
       arrivalTime,
+      delayActive: delay.isDelayActive,
+      delayInfo: delay.raw,
       estimatedDurationMin: Number(row.estimatedDurationMin ?? row.EstimatedDurationMin) || null,
       baseDistanceKm: Number(row.baseDistanceKm ?? row.BaseDistanceKm) || (lengthMeters / 1000),
       coordinates,
@@ -1834,9 +2001,12 @@ export function createTripAutorun(ctx) {
       return;
     }
 
-    // Trước giờ khởi hành: đứng tại bến xuất phát (không teleport về đầu path).
-    if (Number.isFinite(depMs) && nowMs < depMs) {
-      mission.status = 'Boarding';
+    // Trước giờ khởi hành (adjusted ?? planned): đứng tại bến xuất phát.
+    // Delay active mà đã qua giờ cũ → vẫn đứng chờ BE/staff (không Departed).
+    const delayHoldDeparture = Boolean(mission.delayActive)
+      && (!Number.isFinite(depMs) || nowMs >= depMs);
+    if ((Number.isFinite(depMs) && nowMs < depMs) || delayHoldDeparture) {
+      mission.status = delayHoldDeparture ? 'WaitingAtStop' : 'Boarding';
       mission.progressMeters = 0;
       if (Number.isFinite(Number(mission.departureLat))) {
         mission.currentLat = Number(mission.departureLat);
@@ -1850,8 +2020,17 @@ export function createTripAutorun(ctx) {
       mission.speedKmh = 0;
       mission.requiredSpeedKmh = computeRequiredSpeedKmh(
         { ...mission, progressMeters: 0 },
-        depMs,
+        Number.isFinite(depMs) ? depMs : nowMs,
       );
+      if (delayHoldDeparture) {
+        mission.movementStatus = 'Delayed';
+        mission.waitingUntil = Number.isFinite(depMs) && depMs > nowMs
+          ? new Date(depMs).toISOString()
+          : null;
+        const stop0 = mission.stops?.[0];
+        mission.waitingStationName = stop0?.stationName || stop0?.stationCode || mission.waitingStationName;
+        mission.waitingStationCode = stop0?.stationCode || mission.waitingStationCode;
+      }
       refreshNextStopInfo(mission, nowMs);
       await maybeEmitStopEvents(mission);
       await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
@@ -1859,14 +2038,27 @@ export function createTripAutorun(ctx) {
       return;
     }
 
-    // Early tại bến: chờ plannedDepartureTime.
+    // Early tại bến: chờ giờ hiệu lực (adjusted ?? planned). Nếu delay đang active
+    // mà chưa có giờ adjusted mới → đứng chờ (không Departed).
     const stops = mission.stops || [];
     let stopIndex = Number(mission.stopIndex) || 0;
     while (stopIndex < stops.length) {
       const stop = stops[stopIndex];
       const planDep = parseTimeMs(stop.plannedDepartureTime);
-      if (nearStop(mission, stop) && Number.isFinite(planDep) && nowMs < planDep) {
-        markWaitingAtStop(mission, stop, planDep);
+      const delayHold = Boolean(mission.delayActive)
+        && (!Number.isFinite(planDep) || nowMs >= planDep);
+      if (nearStop(mission, stop) && (delayHold || (Number.isFinite(planDep) && nowMs < planDep))) {
+        markWaitingAtStop(
+          mission,
+          stop,
+          delayHold && !(Number.isFinite(planDep) && nowMs < planDep) ? NaN : planDep,
+        );
+        if (delayHold) {
+          mission.movementStatus = 'Delayed';
+          mission.waitingUntil = Number.isFinite(planDep) && planDep > nowMs
+            ? new Date(planDep).toISOString()
+            : null;
+        }
         mission.stopIndex = stopIndex;
         mission.speedKmh = 0;
         refreshNextStopInfo(mission, nowMs);
@@ -1875,7 +2067,11 @@ export function createTripAutorun(ctx) {
         mission.lastTickAt = nowMs;
         return;
       }
-      if (nearStop(mission, stop) && (!Number.isFinite(planDep) || nowMs >= planDep)) {
+      if (nearStop(mission, stop) && !delayHold && (!Number.isFinite(planDep) || nowMs >= planDep)) {
+        // Rời chờ → Departed ngay theo giờ kế hoạch (tránh đợi >45m rồi TRỄ 1P trên BE).
+        if (Number.isFinite(planDep) || mission.status === 'WaitingAtStop') {
+          await emitDepartedOnSchedule(mission, stop, planDep);
+        }
         stopIndex += 1;
         mission.stopIndex = stopIndex;
         continue;
@@ -1932,9 +2128,8 @@ export function createTripAutorun(ctx) {
       const codes = eligibleBoatCodes();
       let loggedAuthToUi = false;
       for (const boatCode of codes) {
-        if (isBoatInActiveTripMission(boatCode)) continue;
         if (isBoatInActiveRescueMission(boatCode)) continue;
-        // Chỉ ghi 1 dòng đỏ vào API log khi auth sai — tránh flood mỗi tàu × mỗi 30s.
+        // Vẫn poll khi đang chạy trip — để nhận adjusted*/delayInfo sau staff delay.
         const silent = loggedAuthToUi;
         const due = await fetchDueTrips({
           boatCode,
@@ -1954,8 +2149,16 @@ export function createTripAutorun(ctx) {
         for (const row of due.trips) {
           const tripBoat = cleanOptionalText(row.boatCode || row.BoatCode) || boatCode;
           if (tripBoat !== boatCode) continue;
+          const tripId = cleanOptionalText(row.tripId || row.TripId);
+          const existing = tripId ? state.tripMissions.get(tripId) : null;
+          if (existing && ACTIVE_TRIP_STATUSES.has(String(existing.status || ''))) {
+            applyBeScheduleToMission(existing, row);
+            continue;
+          }
+          // Đang chạy trip khác của cùng tàu → không start trip mới.
+          if (isBoatInActiveTripMission(boatCode)) continue;
+          // Delay active + chưa có giờ adjusted hợp lệ: vẫn start để đứng chờ (GPS vẫn push).
           startTripMission({ ...row, boatCode: tripBoat });
-          // Một trip đang chạy / vừa start cho tàu này là đủ.
           if (isBoatInActiveTripMission(boatCode)) break;
         }
       }

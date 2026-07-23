@@ -1022,6 +1022,13 @@ function tripNextStopLabel(trip) {
     const name = String(
       trip.waitingStationName || trip.nextStopName || trip.nextStopCode || '',
     ).trim();
+    if (trip.delayActive) {
+      const countdown = waitingCountdownLabel(trip);
+      if (countdown) {
+        return name ? `${name} · DELAY · còn ${countdown}` : `DELAY · còn ${countdown}`;
+      }
+      return name ? `${name} · DELAY · chờ staff` : 'DELAY · chờ staff cho đi';
+    }
     const countdown = waitingCountdownLabel(trip);
     if (countdown) {
       return name ? `${name} · xuất bến còn ${countdown}` : `xuất bến còn ${countdown}`;
@@ -1055,16 +1062,27 @@ function phaseStatusText(code, lat, lng) {
         ? `Trip · về bến XP · ${nextLabel} · ${spd} km/h`
         : `Trip · về bến xuất phát · ${spd} km/h`;
     }
-    if (trip.status === 'Boarding') {
-      return nextLabel ? `Trip · chờ xuất bến · ${nextLabel}` : `Trip · chờ xuất bến · ${spd} km/h`;
-    }
     if (trip.status === 'WaitingAtStop') {
       const station = trip.waitingStationName || trip.nextStopName || null;
       const countdown = waitingCountdownLabel(trip);
+      if (trip.delayActive) {
+        const base = station
+          ? `Trip · DELAY · chờ xuất ${station}`
+          : 'Trip · DELAY · chờ staff cho đi';
+        return countdown ? `${base} · còn ${countdown}` : base;
+      }
       const base = station
         ? `Trip · dừng ở ${station}`
         : 'Trip · đang dừng chờ xuất bến';
       return countdown ? `${base} · còn ${countdown}` : base;
+    }
+    if (trip.status === 'Boarding') {
+      if (trip.delayActive) {
+        return nextLabel
+          ? `Trip · DELAY · chờ xuất · ${nextLabel}`
+          : 'Trip · DELAY · chờ staff cho đi';
+      }
+      return nextLabel ? `Trip · chờ xuất bến · ${nextLabel}` : `Trip · chờ xuất bến · ${spd} km/h`;
     }
     if (trip.status === 'Paused') return 'Trip · tạm dừng (cứu hộ)';
     if (trip.status === 'Running') {
