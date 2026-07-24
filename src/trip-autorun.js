@@ -2001,12 +2001,14 @@ export function createTripAutorun(ctx) {
       return;
     }
 
-    // Trước giờ khởi hành (adjusted ?? planned): đứng tại bến xuất phát.
-    // Delay active mà đã qua giờ cũ → vẫn đứng chờ BE/staff (không Departed).
-    const delayHoldDeparture = Boolean(mission.delayActive)
-      && (!Number.isFinite(depMs) || nowMs >= depMs);
-    if ((Number.isFinite(depMs) && nowMs < depMs) || delayHoldDeparture) {
-      mission.status = delayHoldDeparture ? 'WaitingAtStop' : 'Boarding';
+    // Trước giờ khởi hành: chỉ boarding khi CHƯA rời bến XP (progress ≈ 0).
+    // Không đụng delay mid-route ở đây.
+    if (
+      Number.isFinite(depMs)
+      && nowMs < depMs
+      && Number(mission.progressMeters || 0) < 5
+    ) {
+      mission.status = 'Boarding';
       mission.progressMeters = 0;
       if (Number.isFinite(Number(mission.departureLat))) {
         mission.currentLat = Number(mission.departureLat);
@@ -2020,17 +2022,8 @@ export function createTripAutorun(ctx) {
       mission.speedKmh = 0;
       mission.requiredSpeedKmh = computeRequiredSpeedKmh(
         { ...mission, progressMeters: 0 },
-        Number.isFinite(depMs) ? depMs : nowMs,
+        depMs,
       );
-      if (delayHoldDeparture) {
-        mission.movementStatus = 'Delayed';
-        mission.waitingUntil = Number.isFinite(depMs) && depMs > nowMs
-          ? new Date(depMs).toISOString()
-          : null;
-        const stop0 = mission.stops?.[0];
-        mission.waitingStationName = stop0?.stationName || stop0?.stationCode || mission.waitingStationName;
-        mission.waitingStationCode = stop0?.stationCode || mission.waitingStationCode;
-      }
       refreshNextStopInfo(mission, nowMs);
       await maybeEmitStopEvents(mission);
       await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
@@ -2038,27 +2031,63 @@ export function createTripAutorun(ctx) {
       return;
     }
 
-    // Early tại bến: chờ giờ hiệu lực (adjusted ?? planned). Nếu delay đang active
-    // mà chưa có giờ adjusted mới → đứng chờ (không Departed).
+    // Staff delay (delayInfo.isDelayActive): ĐỨNG YÊN tại vị trí mới nhất.
+    // Tuyệt đối không reset progress / nhảy về bến đầu.
+    if (mission.delayActive) {
+      mission.speedKmh = 0;
+      mission.requiredSpeedKmh = 0;
+      mission.movementStatus = 'Delayed';
+      // Giữ status WaitingAtStop nếu đang ở bến; còn không giữ Running nhưng đứng im.
+      if (mission.status !== 'WaitingAtStop' && mission.status !== 'Boarding') {
+        mission.status = 'Running';
+      }
+      // Chỉ neo về bến XP khi thật sự chưa xuất phát.
+      if (Number(mission.progressMeters || 0) < 5) {
+        if (Number.isFinite(Number(mission.departureLat))) {
+          mission.currentLat = Number(mission.departureLat);
+          mission.currentLng = Number(mission.departureLng);
+        }
+        mission.progressMeters = 0;
+        mission.status = 'WaitingAtStop';
+        const stop0 = mission.stops?.[0];
+        mission.waitingStationName = stop0?.stationName || stop0?.stationCode || null;
+        mission.waitingStationCode = stop0?.stationCode || null;
+        mission.waitingUntil = Number.isFinite(depMs) && depMs > nowMs
+          ? new Date(depMs).toISOString()
+          : null;
+      } else {
+        // Mid-route / đã đi: giữ nguyên progressMeters + lat/lng hiện tại.
+        const stop = mission.stops?.[Number(mission.stopIndex) || 0];
+        const planDep = parseTimeMs(stop?.plannedDepartureTime);
+        mission.waitingUntil = Number.isFinite(planDep) && planDep > nowMs
+          ? new Date(planDep).toISOString()
+          : null;
+        mission.waitingStationName = stop?.stationName || stop?.stationCode || mission.waitingStationName;
+        mission.waitingStationCode = stop?.stationCode || mission.waitingStationCode;
+      }
+      // Bám đúng toạ độ path tại progress hiện tại (tránh lệch marker).
+      if (Number(mission.progressMeters || 0) >= 5) {
+        const hold = pointAtDistance(coords, Number(mission.progressMeters) || 0);
+        mission.currentLat = hold.lat;
+        mission.currentLng = hold.lng;
+        if (hold.heading) mission.lastHeading = hold.heading;
+      }
+      refreshNextStopInfo(mission, nowMs);
+      await maybeEmitStopEvents(mission);
+      await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
+      mission.lastTickAt = nowMs;
+      mission.updatedAt = new Date().toISOString();
+      return;
+    }
+
+    // Early tại bến: chờ giờ hiệu lực (adjusted ?? planned). Không còn delayActive ở đây.
     const stops = mission.stops || [];
     let stopIndex = Number(mission.stopIndex) || 0;
     while (stopIndex < stops.length) {
       const stop = stops[stopIndex];
       const planDep = parseTimeMs(stop.plannedDepartureTime);
-      const delayHold = Boolean(mission.delayActive)
-        && (!Number.isFinite(planDep) || nowMs >= planDep);
-      if (nearStop(mission, stop) && (delayHold || (Number.isFinite(planDep) && nowMs < planDep))) {
-        markWaitingAtStop(
-          mission,
-          stop,
-          delayHold && !(Number.isFinite(planDep) && nowMs < planDep) ? NaN : planDep,
-        );
-        if (delayHold) {
-          mission.movementStatus = 'Delayed';
-          mission.waitingUntil = Number.isFinite(planDep) && planDep > nowMs
-            ? new Date(planDep).toISOString()
-            : null;
-        }
+      if (nearStop(mission, stop) && Number.isFinite(planDep) && nowMs < planDep) {
+        markWaitingAtStop(mission, stop, planDep);
         mission.stopIndex = stopIndex;
         mission.speedKmh = 0;
         refreshNextStopInfo(mission, nowMs);
@@ -2067,7 +2096,7 @@ export function createTripAutorun(ctx) {
         mission.lastTickAt = nowMs;
         return;
       }
-      if (nearStop(mission, stop) && !delayHold && (!Number.isFinite(planDep) || nowMs >= planDep)) {
+      if (nearStop(mission, stop) && (!Number.isFinite(planDep) || nowMs >= planDep)) {
         // Rời chờ → Departed ngay theo giờ kế hoạch (tránh đợi >45m rồi TRỄ 1P trên BE).
         if (Number.isFinite(planDep) || mission.status === 'WaitingAtStop') {
           await emitDepartedOnSchedule(mission, stop, planDep);
