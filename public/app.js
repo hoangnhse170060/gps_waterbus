@@ -79,7 +79,6 @@ const workflowStepsEl = document.querySelector('#workflowSteps');
 const routeStopsListEl = document.querySelector('#routeStopsList');
 const toastHostEl = document.querySelector('#toastHost');
 const charterRequestListEl = document.querySelector('#charterRequestList');
-const charterStatusFilterEl = document.querySelector('#charterStatusFilter');
 const charterRefreshBtnEl = document.querySelector('#charterRefreshBtn');
 const charterActiveBannerEl = document.querySelector('#charterActiveBanner');
 const charterActiveTitleEl = document.querySelector('#charterActiveTitle');
@@ -4058,13 +4057,11 @@ function renderCharterRequestList(items) {
   charterRequestListEl.innerHTML = list.map((item) => {
     const id = item.requestId || item.id || '';
     const code = item.bookingCode || item.bookingId || id;
-    const status = item.status || 'Pending';
     const stopCount = Array.isArray(item.stops) ? item.stops.length : (item.stopCount || '');
     const stopsHint = stopCount ? `${stopCount} bến` : 'mở để xem bến';
     return `
       <li>
         <button type="button" class="charter-request-item${activeCharterRequest?.requestId === id ? ' is-active' : ''}" data-request-id="${escapeHtml(id)}">
-          <span class="charter-status">${escapeHtml(status)}</span>
           <strong>${escapeHtml(code)}</strong>
           <small>${escapeHtml(stopsHint)} · ${escapeHtml(id)}</small>
         </button>
@@ -4078,7 +4075,8 @@ function renderCharterRequestList(items) {
 
 async function loadCharterRequests() {
   if (!charterRequestListEl) return;
-  const status = charterStatusFilterEl?.value || 'Pending';
+  // GPS chỉ vẽ — luôn lấy Pending, không UI đổi/lọc status.
+  const status = 'Pending';
   charterRequestListEl.classList.add('is-empty');
   charterRequestListEl.innerHTML = '<li class="charter-request-empty">Đang tải yêu cầu…</li>';
   try {
@@ -4092,7 +4090,6 @@ async function loadCharterRequests() {
 }
 
 charterRefreshBtnEl?.addEventListener('click', () => loadCharterRequests());
-charterStatusFilterEl?.addEventListener('change', () => loadCharterRequests());
 charterClearBtnEl?.addEventListener('click', () => clearActiveCharterRequest());
 
 loadCharterRequests();
