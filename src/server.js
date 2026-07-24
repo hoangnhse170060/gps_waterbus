@@ -426,13 +426,13 @@ const server = createServer(async (req, res) => {
         return sendJson(res, detail);
       }
     }
-    // Charter → GPS: list / detail / in-progress / complete yêu cầu vẽ tuyến.
+    // Charter → GPS: list / detail / in-progress / complete (auth hook như trip due, không JWT).
     if (url.pathname === '/api/charter/route-draw-requests' && req.method === 'GET') {
       const status = cleanOptionalText(url.searchParams.get('status')) || 'Pending';
       const result = await requestTargetApi({
         method: 'GET',
         pathname: `/api/charter-bookings/admin/route-draw-requests?status=${encodeURIComponent(status)}`,
-        auth: 'bearer',
+        auth: 'hook',
       });
       if (!result.ok) {
         return sendJson(res, {
@@ -460,7 +460,7 @@ const server = createServer(async (req, res) => {
           const result = await requestTargetApi({
             method: 'GET',
             pathname: basePath,
-            auth: 'bearer',
+            auth: 'hook',
           });
           if (!result.ok) {
             return sendJson(res, {
@@ -473,7 +473,7 @@ const server = createServer(async (req, res) => {
           const result = await requestTargetApi({
             method: 'PATCH',
             pathname: `${basePath}/in-progress`,
-            auth: 'bearer',
+            auth: 'hook',
           });
           if (!result.ok) {
             return sendJson(res, {
@@ -5595,7 +5595,7 @@ async function completeCharterRouteDrawRequest(requestId, routeId) {
     method: 'POST',
     pathname: `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(id)}/complete`,
     payload: { routeId: rid },
-    auth: 'bearer',
+    auth: 'hook',
   });
 }
 
