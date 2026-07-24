@@ -78,6 +78,14 @@ const stopChainPreviewEl = document.querySelector('#stopChainPreview');
 const workflowStepsEl = document.querySelector('#workflowSteps');
 const routeStopsListEl = document.querySelector('#routeStopsList');
 const toastHostEl = document.querySelector('#toastHost');
+const charterRequestListEl = document.querySelector('#charterRequestList');
+const charterStatusFilterEl = document.querySelector('#charterStatusFilter');
+const charterRefreshBtnEl = document.querySelector('#charterRefreshBtn');
+const charterActiveBannerEl = document.querySelector('#charterActiveBanner');
+const charterActiveTitleEl = document.querySelector('#charterActiveTitle');
+const charterActiveMetaEl = document.querySelector('#charterActiveMeta');
+const charterUseCandidateBtnEl = document.querySelector('#charterUseCandidateBtn');
+const charterClearBtnEl = document.querySelector('#charterClearBtn');
 
 function toast(message, type = 'info', ms = 3200) {
   const text = String(message || '').trim();
@@ -121,6 +129,10 @@ let selectedRouteStops = [];
 let selectedRouteId = '';
 // Mặc định ẩn tuyến DB trên map survey — tránh lẫn với đường đang vẽ (BD-TT…).
 let showSavedRoutes = false;
+/** Yêu cầu charter đang mở trên Bảng vẽ (preload bến / candidate). */
+let activeCharterRequest = null;
+let charterCandidateLayer = null;
+let charterStopLayer = null;
 let latest = null;
 let hasFitInitialRoutes = false;
 let lastStationsFingerprint = '';
@@ -1097,8 +1109,9 @@ function getSelectedEndStation() {
     || null;
 }
 
-/** Chỉ suy từ bến đầu/cuối cho UI local — BE tự phân loại, không gửi routeType. */
+/** Charter đang mở → CharterReference; không thì suy từ bến đầu/cuối. */
 function getSurveyRouteType() {
+  if (activeCharterRequest?.requestId) return 'CharterReference';
   const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
   const endPoint = [...captureState.points].reverse().find((p) => p.source === 'station-end');
   const endId = endStationEl?.value || endPoint?.stationId || '';
@@ -1210,7 +1223,10 @@ function collectOrderedStopsFromClicks() {
 
 function buildSurveyStops() {
   const routeType = getSurveyRouteType();
-  const ordered = collectOrderedStopsFromClicks();
+  let ordered = collectOrderedStopsFromClicks();
+  if (activeCharterRequest?.stops?.length) {
+    ordered = charterStopsAsOrdered(activeCharterRequest.stops);
+  }
   const withTravel = attachSegmentTravelMinutesFe(getPathCoordinates(), ordered, getSurveySpeedKmh());
   return withTravel.map((stop) => ({
     stationId: stop.stationId,
@@ -1342,11 +1358,20 @@ function attachSegmentTravelMinutesFe(coordinates, stops, speedKmh) {
 
 function updateRouteTypeHint() {
   const type = getSurveyRouteType();
-  const ordered = collectOrderedStopsFromClicks();
+  const ordered = activeCharterRequest?.stops?.length
+    ? charterStopsAsOrdered(activeCharterRequest.stops)
+    : collectOrderedStopsFromClicks();
   const viaCount = Math.max(0, ordered.length - 2);
   const isLoop = type === 'SightseeingLoop';
   if (routeTypeHintEl) {
-    if (ordered.length >= 2) {
+    if (type === 'CharterReference') {
+      const code = activeCharterRequest?.bookingCode || activeCharterRequest?.bookingId || '';
+      routeTypeHintEl.textContent = code
+        ? `Charter · booking ${code} · ${ordered.length} bến theo yêu cầu · CharterReference (isBookable=false).`
+        : `CharterReference · ${ordered.length} bến · isBookable=false.`;
+      routeTypeHintEl.classList.add('is-ok');
+      routeTypeHintEl.classList.remove('is-error');
+    } else if (ordered.length >= 2) {
       if (isLoop) {
         routeTypeHintEl.textContent = 'Vòng sightseeing (cùng bến đầu/cuối) — BE tự lưu sightseeing loop · không ghé bến giữa.';
       } else {
@@ -1408,6 +1433,14 @@ function surveySaveFields() {
     estimatedDurationMin: pathMinutes > 0 ? Number(pathMinutes.toFixed(2)) : null,
   };
   const inferredType = getSurveyRouteType();
+  if (inferredType === 'CharterReference' && activeCharterRequest?.requestId) {
+    fields.routeType = 'CharterReference';
+    fields.isBookable = false;
+    fields.charterRequestId = activeCharterRequest.requestId;
+    fields.bookingId = activeCharterRequest.bookingId || null;
+    fields.createReverseRoute = false;
+    return fields;
+  }
   const wantReverse = Boolean(createReverseRouteEl?.checked)
     && inferredType !== 'SightseeingLoop'
     && (fields.stops?.length || 0) >= 2;
@@ -1534,13 +1567,14 @@ function validateReverseRouteCode() {
 function updateReverseRouteUi({ suggest = false } = {}) {
   const type = getSurveyRouteType();
   const isLoop = type === 'SightseeingLoop';
-  if (isLoop && createReverseRouteEl) {
+  const isCharter = type === 'CharterReference';
+  if ((isLoop || isCharter) && createReverseRouteEl) {
     createReverseRouteEl.checked = false;
     createReverseRouteEl.disabled = true;
   } else if (createReverseRouteEl) {
     createReverseRouteEl.disabled = false;
   }
-  const show = Boolean(createReverseRouteEl?.checked) && !isLoop;
+  const show = Boolean(createReverseRouteEl?.checked) && !isLoop && !isCharter;
   if (reverseFieldsEl) reverseFieldsEl.hidden = !show;
   if (show && suggest) maybeSuggestReverseRoute();
   else if (show) validateReverseRouteCode();
@@ -2737,6 +2771,13 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
+    if (body.charterComplete?.ok) {
+      notifyOk(`Đã gắn route vào booking charter · request Done`);
+      clearActiveCharterRequest({ refresh: true });
+    } else if (activeCharterRequest?.requestId && body.routeId) {
+      const done = await completeCharterRequest(activeCharterRequest.requestId, body.routeId);
+      if (done) clearActiveCharterRequest({ refresh: true });
+    }
     hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear) {
       setDrawTool('pan');
@@ -3706,5 +3747,401 @@ function clampNumber(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.min(Math.max(value, min), max);
 }
+
+/* —— Charter route-draw requests (BE: /api/charter-bookings/admin/...) —— */
+
+function charterStopsAsOrdered(stops) {
+  return [...(stops || [])]
+    .map((stop, index, arr) => {
+      const catalog = findStationInCatalog(stop.stationId) || {};
+      const lat = Number.isFinite(Number(stop.latitude))
+        ? Number(stop.latitude)
+        : Number(stop.lat ?? catalog.lat);
+      const lng = Number.isFinite(Number(stop.longitude))
+        ? Number(stop.longitude)
+        : Number(stop.lng ?? catalog.lng);
+      return {
+        stationId: String(stop.stationId || catalog.stationId || ''),
+        stationCode: stop.stationCode || catalog.stationCode || null,
+        stationName: stop.stationName || catalog.stationName || stop.stationCode || null,
+        lat,
+        lng,
+        stopOrder: Number(stop.stopOrder) || index + 1,
+        stayDurationMinutes: Number.isFinite(Number(stop.stayDurationMinutes))
+          ? Number(stop.stayDurationMinutes)
+          : null,
+        note: stop.note || null,
+        source: index === 0 ? 'station' : (index === arr.length - 1 ? 'station-end' : 'station-via'),
+        clicked: true,
+        isFirst: index === 0,
+        isLast: index === arr.length - 1,
+      };
+    })
+    .filter((s) => s.stationId)
+    .sort((a, b) => a.stopOrder - b.stopOrder)
+    .map((stop, index, arr) => ({
+      ...stop,
+      stopOrder: index + 1,
+      isFirst: index === 0,
+      isLast: index === arr.length - 1,
+      source: index === 0 ? 'station' : (index === arr.length - 1 ? 'station-end' : 'station-via'),
+    }));
+}
+
+function extractGeometryCoordinates(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    if (!raw.length) return [];
+    // [[lng,lat], ...]
+    if (Array.isArray(raw[0]) && Number.isFinite(Number(raw[0][0]))) {
+      return raw
+        .map((c) => ({ lat: Number(c[1]), lng: Number(c[0]) }))
+        .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    }
+    // [{lat,lng}, ...]
+    if (raw[0] && typeof raw[0] === 'object' && !Array.isArray(raw[0])) {
+      return raw
+        .map((p) => ({
+          lat: Number(p.lat ?? p.latitude ?? p.Latitude),
+          lng: Number(p.lng ?? p.lon ?? p.longitude ?? p.Longitude),
+        }))
+        .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    }
+    // single [lng, lat]
+    if (typeof raw[0] === 'number' && raw.length >= 2) {
+      return [{ lat: Number(raw[1]), lng: Number(raw[0]) }];
+    }
+    return raw.flatMap((item) => extractGeometryCoordinates(item)).filter((p) => (
+      Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng))
+    ));
+  }
+  if (typeof raw !== 'object') return [];
+  if (raw.type === 'Feature') return extractGeometryCoordinates(raw.geometry);
+  if (raw.type === 'FeatureCollection') {
+    return (raw.features || []).flatMap((f) => extractGeometryCoordinates(f));
+  }
+  if (raw.type === 'LineString' && Array.isArray(raw.coordinates)) {
+    return raw.coordinates.map((c) => ({ lat: Number(c[1]), lng: Number(c[0]) }));
+  }
+  if (raw.type === 'MultiLineString' && Array.isArray(raw.coordinates)) {
+    return raw.coordinates.flatMap((line) => line.map((c) => ({ lat: Number(c[1]), lng: Number(c[0]) })));
+  }
+  if (Array.isArray(raw.coordinates)) return extractGeometryCoordinates(raw.coordinates);
+  if (Array.isArray(raw.routeGeometry)) return extractGeometryCoordinates(raw.routeGeometry);
+  if (raw.routeGeometry && typeof raw.routeGeometry === 'object') {
+    return extractGeometryCoordinates(raw.routeGeometry);
+  }
+  if (raw.geojson) return extractGeometryCoordinates(raw.geojson);
+  if (Number.isFinite(Number(raw.lat)) && Number.isFinite(Number(raw.lng))) {
+    return [{ lat: Number(raw.lat), lng: Number(raw.lng) }];
+  }
+  if (Number.isFinite(Number(raw.latitude)) && Number.isFinite(Number(raw.longitude))) {
+    return [{ lat: Number(raw.latitude), lng: Number(raw.longitude) }];
+  }
+  return [];
+}
+
+function candidateRouteCoordinates(detail) {
+  const fromRoute = extractGeometryCoordinates(detail?.candidateRoute);
+  if (fromRoute.length >= 2) return fromRoute;
+  const legs = detail?.candidateLegs;
+  if (Array.isArray(legs) && legs.length) {
+    const merged = legs.flatMap((leg) => extractGeometryCoordinates(leg?.routeGeometry || leg?.geometry || leg));
+    if (merged.length >= 2) return merged;
+  }
+  return [];
+}
+
+function candidateRouteId(detail) {
+  const route = detail?.candidateRoute;
+  if (!route || typeof route !== 'object') return null;
+  return route.routeId || route.id || route.RouteId || null;
+}
+
+function clearCharterMapLayers() {
+  if (charterCandidateLayer) {
+    charterCandidateLayer.remove();
+    charterCandidateLayer = null;
+  }
+  if (charterStopLayer) {
+    charterStopLayer.remove();
+    charterStopLayer = null;
+  }
+}
+
+function renderCharterStopPins(stops) {
+  clearCharterMapLayers();
+  const ordered = charterStopsAsOrdered(stops);
+  if (!ordered.length) return;
+  charterStopLayer = L.layerGroup().addTo(map);
+  const bounds = [];
+  ordered.forEach((stop) => {
+    if (!Number.isFinite(stop.lat) || !Number.isFinite(stop.lng)) return;
+    bounds.push([stop.lat, stop.lng]);
+    const label = stop.stationCode || String(stop.stopOrder);
+    const marker = L.marker([stop.lat, stop.lng], {
+      icon: L.divIcon({
+        className: 'charter-stop-pin',
+        html: `<span>${escapeHtml(label)}</span>`,
+        iconSize: [34, 34],
+        iconAnchor: [17, 17],
+      }),
+      zIndexOffset: 800,
+    });
+    const stay = stop.stayDurationMinutes != null ? ` · dừng ${stop.stayDurationMinutes}p` : '';
+    marker.bindTooltip(
+      `#${stop.stopOrder} ${stop.stationName || stop.stationCode || stop.stationId}${stay}`,
+      { direction: 'top', offset: [0, -12] },
+    );
+    charterStopLayer.addLayer(marker);
+  });
+  if (bounds.length) {
+    map.fitBounds(bounds, { padding: [56, 56], maxZoom: 15 });
+  }
+}
+
+function renderCharterCandidatePreview(coords) {
+  if (!coords || coords.length < 2) return;
+  if (!charterCandidateLayer) charterCandidateLayer = L.layerGroup().addTo(map);
+  const line = L.polyline(
+    coords.map((p) => [p.lat, p.lng]),
+    {
+      color: '#2563eb',
+      weight: 5,
+      opacity: 0.85,
+      dashArray: '8 6',
+    },
+  );
+  charterCandidateLayer.addLayer(line);
+}
+
+function applyCharterStationsToForm(stops) {
+  const ordered = charterStopsAsOrdered(stops);
+  if (!ordered.length) return;
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
+  setStationComboValue('start', first.stationId, { emitChange: false });
+  setStationComboValue('end', last.stationId, { emitChange: false });
+  syncEndStationDisplay();
+  const codes = ordered.map((s) => s.stationCode || s.stationName || s.stationId).filter(Boolean);
+  if (captureRouteCodeEl && !captureRouteCodeEl.value.trim()) {
+    const booking = activeCharterRequest?.bookingCode || 'CHARTER';
+    captureRouteCodeEl.value = `${booking}`.replace(/\s+/g, '-').slice(0, 40);
+  }
+  if (captureRouteNameEl && !captureRouteNameEl.value.trim()) {
+    captureRouteNameEl.value = codes.length >= 2
+      ? `${codes[0]} - ${codes[codes.length - 1]}`
+      : (activeCharterRequest?.bookingCode || 'Charter route');
+  }
+  if (createReverseRouteEl) {
+    createReverseRouteEl.checked = false;
+    createReverseRouteEl.disabled = true;
+  }
+  updateReverseRouteUi();
+  updateRouteTypeHint();
+  checkRouteCodeDuplicate();
+}
+
+function loadCandidateIntoCapture(coords, stops) {
+  if (!coords || coords.length < 2) return false;
+  clearCapturePoints();
+  coords.forEach((point, index) => {
+    addCapturePoint({ lat: point.lat, lng: point.lng }, {
+      source: index === 0 ? 'manual' : 'manual',
+    });
+  });
+  // Gắn nhãn bến gần điểm path.
+  const ordered = charterStopsAsOrdered(stops);
+  ordered.forEach((stop) => {
+    if (!Number.isFinite(stop.lat) || !Number.isFinite(stop.lng)) return;
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    captureState.points.forEach((p, idx) => {
+      const d = haversineMeters(p, stop);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = idx;
+      }
+    });
+    if (bestIdx < 0 || bestDist > 250) return;
+    const point = captureState.points[bestIdx];
+    point.stationId = stop.stationId;
+    point.label = stop.stationName;
+    point.source = stop.isFirst ? 'station' : (stop.isLast ? 'station-end' : 'station-via');
+  });
+  applyCharterStationsToForm(stops);
+  finishDraw();
+  renderCaptureState();
+  return true;
+}
+
+function updateCharterActiveBanner() {
+  if (!charterActiveBannerEl) return;
+  if (!activeCharterRequest?.requestId) {
+    charterActiveBannerEl.hidden = true;
+    charterActiveBannerEl.classList.add('is-empty');
+    if (charterUseCandidateBtnEl) charterUseCandidateBtnEl.hidden = true;
+    return;
+  }
+  charterActiveBannerEl.hidden = false;
+  charterActiveBannerEl.classList.remove('is-empty');
+  const code = activeCharterRequest.bookingCode || activeCharterRequest.bookingId || activeCharterRequest.requestId;
+  if (charterActiveTitleEl) {
+    charterActiveTitleEl.textContent = `Đang xử lý · ${code}`;
+  }
+  const stopNames = charterStopsAsOrdered(activeCharterRequest.stops)
+    .map((s) => s.stationCode || s.stationName)
+    .filter(Boolean)
+    .join(' → ');
+  const hasCandidate = Boolean(candidateRouteId(activeCharterRequest) || candidateRouteCoordinates(activeCharterRequest).length >= 2);
+  if (charterActiveMetaEl) {
+    charterActiveMetaEl.textContent = hasCandidate
+      ? `${stopNames || '—'} · có candidate route sẵn`
+      : `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
+  }
+  if (charterUseCandidateBtnEl) {
+    charterUseCandidateBtnEl.hidden = !candidateRouteId(activeCharterRequest);
+  }
+  charterRequestListEl?.querySelectorAll('.charter-request-item').forEach((btn) => {
+    btn.classList.toggle('is-active', btn.dataset.requestId === activeCharterRequest.requestId);
+  });
+}
+
+function clearActiveCharterRequest({ refresh = false } = {}) {
+  activeCharterRequest = null;
+  clearCharterMapLayers();
+  updateCharterActiveBanner();
+  updateRouteTypeHint();
+  if (refresh) loadCharterRequests();
+}
+
+async function completeCharterRequest(requestId, routeId) {
+  if (!requestId || !routeId) return false;
+  try {
+    const response = await fetch(
+      `/api/charter/route-draw-requests/${encodeURIComponent(requestId)}/complete`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ routeId }),
+      },
+    );
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `Complete HTTP ${response.status}`);
+    notifyOk('Charter request Done — đã gắn route vào booking');
+    return true;
+  } catch (error) {
+    notifyErr(`Complete charter thất bại: ${error.message}`);
+    return false;
+  }
+}
+
+async function openCharterRequest(requestId) {
+  if (!requestId) return;
+  try {
+    const detailRes = await fetch(`/api/charter/route-draw-requests/${encodeURIComponent(requestId)}`);
+    const detail = await detailRes.json();
+    if (!detailRes.ok) throw new Error(detail.error || `HTTP ${detailRes.status}`);
+
+    // Đánh dấu đang xử lý (không chặn nếu lỗi).
+    fetch(`/api/charter/route-draw-requests/${encodeURIComponent(requestId)}/in-progress`, {
+      method: 'PATCH',
+    }).catch(() => {});
+
+    activeCharterRequest = detail;
+    if (recordingActive || lockedSurveyPath) {
+      notifyWarn('Đang ghi/khóa path — chỉ nổi bến charter, không đổi bản vẽ hiện tại.');
+      renderCharterStopPins(detail.stops || []);
+      const preview = candidateRouteCoordinates(detail);
+      if (preview.length >= 2) renderCharterCandidatePreview(preview);
+      updateCharterActiveBanner();
+      return;
+    }
+
+    clearCapturePoints();
+    applyCharterStationsToForm(detail.stops || []);
+    renderCharterStopPins(detail.stops || []);
+
+    const coords = candidateRouteCoordinates(detail);
+    if (coords.length >= 2) {
+      renderCharterCandidatePreview(coords);
+      loadCandidateIntoCapture(coords, detail.stops || []);
+      captureStatusEl.textContent = 'Charter: đã nạp candidate route — chỉnh nếu cần rồi ghi GPS & lưu.';
+      notifyOk('Đã nổi bến + path sẵn từ candidate');
+    } else {
+      // Chỉ hiện bến — admin tự vẽ.
+      setDrawTool('draw');
+      captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
+      notifyInfo('Chưa có path sẵn — hãy vẽ tuyến giữa các bến');
+    }
+    updateCharterActiveBanner();
+    updateWorkflow('draw');
+  } catch (error) {
+    notifyErr(`Mở yêu cầu charter thất bại: ${error.message}`);
+  }
+}
+
+async function useCandidateRouteAsComplete() {
+  const routeId = candidateRouteId(activeCharterRequest);
+  const requestId = activeCharterRequest?.requestId;
+  if (!routeId || !requestId) {
+    notifyWarn('Không có candidateRoute.routeId để dùng sẵn');
+    return;
+  }
+  const ok = await completeCharterRequest(requestId, routeId);
+  if (ok) clearActiveCharterRequest({ refresh: true });
+}
+
+function renderCharterRequestList(items) {
+  if (!charterRequestListEl) return;
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    charterRequestListEl.classList.add('is-empty');
+    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không có yêu cầu ở trạng thái này.</li>';
+    return;
+  }
+  charterRequestListEl.classList.remove('is-empty');
+  charterRequestListEl.innerHTML = list.map((item) => {
+    const id = item.requestId || item.id || '';
+    const code = item.bookingCode || item.bookingId || id;
+    const status = item.status || 'Pending';
+    const stopCount = Array.isArray(item.stops) ? item.stops.length : (item.stopCount || '');
+    const stopsHint = stopCount ? `${stopCount} bến` : 'mở để xem bến';
+    return `
+      <li>
+        <button type="button" class="charter-request-item${activeCharterRequest?.requestId === id ? ' is-active' : ''}" data-request-id="${escapeHtml(id)}">
+          <span class="charter-status">${escapeHtml(status)}</span>
+          <strong>${escapeHtml(code)}</strong>
+          <small>${escapeHtml(stopsHint)} · ${escapeHtml(id)}</small>
+        </button>
+      </li>
+    `;
+  }).join('');
+  charterRequestListEl.querySelectorAll('.charter-request-item').forEach((btn) => {
+    btn.addEventListener('click', () => openCharterRequest(btn.dataset.requestId));
+  });
+}
+
+async function loadCharterRequests() {
+  if (!charterRequestListEl) return;
+  const status = charterStatusFilterEl?.value || 'Pending';
+  charterRequestListEl.classList.add('is-empty');
+  charterRequestListEl.innerHTML = '<li class="charter-request-empty">Đang tải yêu cầu…</li>';
+  try {
+    const response = await fetch(`/api/charter/route-draw-requests?status=${encodeURIComponent(status)}`);
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    renderCharterRequestList(body.items || []);
+  } catch (error) {
+    charterRequestListEl.innerHTML = `<li class="charter-request-empty">Lỗi: ${escapeHtml(error.message)}</li>`;
+  }
+}
+
+charterRefreshBtnEl?.addEventListener('click', () => loadCharterRequests());
+charterStatusFilterEl?.addEventListener('change', () => loadCharterRequests());
+charterClearBtnEl?.addEventListener('click', () => clearActiveCharterRequest());
+charterUseCandidateBtnEl?.addEventListener('click', () => useCandidateRouteAsComplete());
+
+loadCharterRequests();
 
 renderCaptureState();

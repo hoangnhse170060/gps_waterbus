@@ -426,6 +426,81 @@ const server = createServer(async (req, res) => {
         return sendJson(res, detail);
       }
     }
+    // Charter → GPS: list / detail / in-progress / complete yêu cầu vẽ tuyến.
+    if (url.pathname === '/api/charter/route-draw-requests' && req.method === 'GET') {
+      const status = cleanOptionalText(url.searchParams.get('status')) || 'Pending';
+      const result = await requestTargetApi({
+        method: 'GET',
+        pathname: `/api/charter-bookings/admin/route-draw-requests?status=${encodeURIComponent(status)}`,
+        auth: 'bearer',
+      });
+      if (!result.ok) {
+        return sendJson(res, {
+          error: result.error || 'Không lấy được danh sách yêu cầu charter',
+          status: result.status,
+          items: [],
+        }, result.status || 502);
+      }
+      return sendJson(res, {
+        ok: true,
+        status,
+        items: unwrapCharterRequestList(result.data),
+        raw: result.data,
+      });
+    }
+    {
+      const charterMatch = url.pathname.match(
+        /^\/api\/charter\/route-draw-requests\/([^/]+)(?:\/(in-progress|complete))?$/,
+      );
+      if (charterMatch) {
+        const requestId = decodeURIComponent(charterMatch[1]);
+        const action = charterMatch[2] || null;
+        const basePath = `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(requestId)}`;
+        if (!action && req.method === 'GET') {
+          const result = await requestTargetApi({
+            method: 'GET',
+            pathname: basePath,
+            auth: 'bearer',
+          });
+          if (!result.ok) {
+            return sendJson(res, {
+              error: result.error || 'Không lấy được chi tiết yêu cầu charter',
+            }, result.status || 502);
+          }
+          return sendJson(res, normalizeCharterRequestDetail(result.data));
+        }
+        if (action === 'in-progress' && req.method === 'PATCH') {
+          const result = await requestTargetApi({
+            method: 'PATCH',
+            pathname: `${basePath}/in-progress`,
+            auth: 'bearer',
+          });
+          if (!result.ok) {
+            return sendJson(res, {
+              error: result.error || 'Không đánh dấu InProgress',
+            }, result.status || 502);
+          }
+          return sendJson(res, {
+            ok: true,
+            requestId,
+            data: result.data,
+          });
+        }
+        if (action === 'complete' && req.method === 'POST') {
+          const body = await readJson(req);
+          const routeId = cleanOptionalText(body.routeId);
+          if (!routeId) return sendJson(res, { error: 'Thiếu routeId' }, 400);
+          const result = await completeCharterRouteDrawRequest(requestId, routeId);
+          if (!result.ok) {
+            return sendJson(res, {
+              error: result.error || 'Complete charter request thất bại',
+              status: result.status,
+            }, result.status || 502);
+          }
+          return sendJson(res, { ok: true, requestId, routeId, data: result.data });
+        }
+      }
+    }
     if (url.pathname === '/api/recording/save-route' && req.method === 'POST') {
       const body = await readJson(req);
       const session = state.lastRecordingSession;
@@ -619,6 +694,8 @@ const server = createServer(async (req, res) => {
           startStationId: stopped.startStationId || null,
           endStationId: stopped.endStationId || null,
           routeType: stopped.routeType || null,
+          charterRequestId: stopped.charterRequestId || null,
+          bookingId: stopped.bookingId || null,
           stops: Array.isArray(stopped.stops) ? stopped.stops : null,
           createReverseRoute: Boolean(stopped.createReverseRoute),
           reverseRouteCode: stopped.reverseRouteCode || null,
@@ -4648,12 +4725,23 @@ async function saveRouteFromGpsOnTarget(session, body) {
   if (startStationId) payload.startStationId = startStationId;
   if (endStationId) payload.endStationId = endStationId;
 
-  // Contract mới: GPS không gửi routeType/isBookable — BE tự phân loại
-  // (start≠end → route nguồn; start=end → sightseeing loop).
+  // Regular/sightseeing: BE tự phân loại. Charter (yêu cầu vẽ): gửi rõ type.
   const inferredLoop = Boolean(startStationId && endStationId && startStationId === endStationId);
+  const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
+  const resolvedType = resolveRouteType(body, session, startStationId, endStationId);
+  const isCharter = resolvedType === 'CharterReference' || Boolean(charterRequestId);
+  if (isCharter) {
+    payload.routeType = 'CharterReference';
+    payload.isBookable = false;
+    if (charterRequestId) payload.charterRequestId = charterRequestId;
+    if (cleanOptionalText(body.bookingId || session?.bookingId)) {
+      payload.bookingId = cleanOptionalText(body.bookingId || session?.bookingId);
+    }
+  }
 
   const wantReverse = Boolean(body.createReverseRoute ?? session?.createReverseRoute)
-    && !inferredLoop;
+    && !inferredLoop
+    && !isCharter;
   if (wantReverse) {
     let reverseCode = cleanOptionalText(body.reverseRouteCode || session?.reverseRouteCode);
     let reverseName = cleanOptionalText(body.reverseRouteName || session?.reverseRouteName);
@@ -4925,7 +5013,34 @@ async function persistRecordingSession(body, sessionInput = null) {
     state.lastRecordingSession = null;
   }
 
-  return { ...route, savedTo, warning, ok: true };
+  const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
+  let charterComplete = null;
+  const savedRouteId = cleanOptionalText(route?.routeId || route?.id || route?.RouteId);
+  if (charterRequestId && savedRouteId) {
+    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, savedRouteId);
+    if (!charterComplete.ok) {
+      warning = [
+        warning,
+        `Charter complete lỗi: ${charterComplete.error || charterComplete.status}`,
+      ].filter(Boolean).join(' · ');
+      console.warn(
+        `[save-route] charter complete ${charterRequestId} → ${savedRouteId}: ${charterComplete.error}`,
+      );
+    } else {
+      console.log(`[save-route] charter request ${charterRequestId} completed with route ${savedRouteId}`);
+    }
+  }
+
+  return {
+    ...route,
+    savedTo,
+    warning,
+    ok: true,
+    charterRequestId: charterRequestId || null,
+    charterComplete: charterComplete
+      ? { ok: charterComplete.ok, status: charterComplete.status, error: charterComplete.error || null }
+      : null,
+  };
 }
 
 let finalizeTimer = null;
@@ -4982,6 +5097,8 @@ async function finalizeCollectorRecording() {
     startStationId: stopped.startStationId || null,
     endStationId: stopped.endStationId || null,
     routeType: stopped.routeType || null,
+    charterRequestId: stopped.charterRequestId || null,
+    bookingId: stopped.bookingId || null,
     stops: Array.isArray(stopped.stops) ? stopped.stops : null,
     createReverseRoute: Boolean(stopped.createReverseRoute),
     reverseRouteCode: stopped.reverseRouteCode || null,
@@ -5418,13 +5535,68 @@ function clampSpeedToBoatMax(speedKmh, maxSpeedKmh) {
 
 function resolveRouteType(body = {}, session = null, startStationId = '', endStationId = '') {
   const explicit = cleanOptionalText(body.routeType || session?.routeType);
+  const charterReq = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
+  if (charterReq || /charter/i.test(explicit)) return 'CharterReference';
   if (/sightseeingloop|loop/i.test(explicit)) return 'SightseeingLoop';
-  if (/charter/i.test(explicit)) return 'CharterReference';
   if (/regular/i.test(explicit)) return 'Regular';
   const start = cleanOptionalText(startStationId || body.startStationId || session?.startStationId);
   const end = cleanOptionalText(endStationId || body.endStationId || session?.endStationId);
   if (start && end && start === end) return 'SightseeingLoop';
   return 'Regular';
+}
+
+function unwrapCharterRequestList(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.items)) return data.items;
+  if (Array.isArray(data.data)) return data.data;
+  if (Array.isArray(data.requests)) return data.requests;
+  if (Array.isArray(data.result)) return data.result;
+  return [];
+}
+
+function normalizeCharterRequestDetail(raw) {
+  const data = (raw && typeof raw === 'object' && raw.data && !raw.requestId)
+    ? raw.data
+    : raw;
+  if (!data || typeof data !== 'object') return { error: 'Empty charter request' };
+  const stops = Array.isArray(data.stops) ? data.stops : [];
+  return {
+    ...data,
+    requestId: cleanOptionalText(data.requestId || data.id) || null,
+    bookingId: cleanOptionalText(data.bookingId) || null,
+    bookingCode: cleanOptionalText(data.bookingCode) || null,
+    status: cleanOptionalText(data.status) || null,
+    stops: stops.map((stop, index) => ({
+      stationId: cleanOptionalText(stop.stationId || stop.StationId) || null,
+      stationCode: cleanOptionalText(stop.stationCode || stop.StationCode) || null,
+      stationName: cleanOptionalText(stop.stationName || stop.StationName) || null,
+      stopOrder: Number(stop.stopOrder ?? stop.StopOrder) || index + 1,
+      latitude: Number(stop.latitude ?? stop.lat ?? stop.Latitude),
+      longitude: Number(stop.longitude ?? stop.lng ?? stop.lon ?? stop.Longitude),
+      stayDurationMinutes: Number.isFinite(Number(stop.stayDurationMinutes))
+        ? Number(stop.stayDurationMinutes)
+        : null,
+      note: cleanOptionalText(stop.note) || null,
+    })).sort((a, b) => a.stopOrder - b.stopOrder),
+    candidateRoute: data.candidateRoute || data.CandidateRoute || null,
+    candidateLegs: data.candidateLegs || data.CandidateLegs || null,
+    resultRoute: data.resultRoute || data.ResultRoute || null,
+  };
+}
+
+async function completeCharterRouteDrawRequest(requestId, routeId) {
+  const id = cleanOptionalText(requestId);
+  const rid = cleanOptionalText(routeId);
+  if (!id || !rid) {
+    return { ok: false, status: 400, error: 'Thiếu requestId hoặc routeId', data: null };
+  }
+  return requestTargetApi({
+    method: 'POST',
+    pathname: `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(id)}/complete`,
+    payload: { routeId: rid },
+    auth: 'bearer',
+  });
 }
 
 function haversineMetersSimple(a, b) {
@@ -5698,8 +5870,12 @@ function startCollector(body) {
     startStationId,
     endStationId,
     routeType,
+    charterRequestId: cleanOptionalText(body.charterRequestId) || null,
+    bookingId: cleanOptionalText(body.bookingId) || null,
     stops,
-    createReverseRoute: Boolean(body.createReverseRoute) && routeType !== 'SightseeingLoop',
+    createReverseRoute: Boolean(body.createReverseRoute)
+      && routeType !== 'SightseeingLoop'
+      && routeType !== 'CharterReference',
     reverseRouteCode: cleanOptionalText(body.reverseRouteCode) || null,
     reverseRouteName: cleanOptionalText(body.reverseRouteName) || null,
     sendIntervalMs: clamp(Number(body.sendIntervalMs || 5000), 3000, 10000),

@@ -10,7 +10,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-    <link rel="stylesheet" href="/styles.css?v=20260718h">
+    <link rel="stylesheet" href="/styles.css?v=20260724c">
   </head>
   <body>
     <script>
@@ -117,6 +117,34 @@
             <h2>Thu thập tuyến đường</h2>
           </div>
         </div>
+
+        <section class="charter-request-section" id="charterRequestSection">
+          <div class="section-header">
+            <h2>Yêu cầu Charter</h2>
+            <button type="button" class="secondary charter-refresh-btn" id="charterRefreshBtn" title="Tải lại danh sách">↻</button>
+          </div>
+          <div class="charter-filter-row">
+            <select id="charterStatusFilter" aria-label="Lọc trạng thái yêu cầu">
+              <option value="Pending" selected>Pending</option>
+              <option value="InProgress">InProgress</option>
+              <option value="Done">Done</option>
+              <option value="Cancelled">Cancelled</option>
+            </select>
+          </div>
+          <div class="charter-active-banner is-empty" id="charterActiveBanner" hidden>
+            <div class="charter-active-text">
+              <strong id="charterActiveTitle">Chưa chọn yêu cầu</strong>
+              <p id="charterActiveMeta"></p>
+            </div>
+            <div class="charter-active-actions">
+              <button type="button" class="secondary" id="charterUseCandidateBtn" hidden>Dùng route sẵn</button>
+              <button type="button" class="secondary" id="charterClearBtn">Bỏ chọn</button>
+            </div>
+          </div>
+          <ul class="charter-request-list is-empty" id="charterRequestList">
+            <li class="charter-request-empty">Đang tải yêu cầu…</li>
+          </ul>
+        </section>
 
         <div class="workflow-steps" id="workflowSteps">
           <div class="step is-active" data-step="draw"><span>1</span> Chọn 2 bến</div>
@@ -257,6 +285,6 @@
     <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
     <script src="/geo-distance.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
-    <script src="/app.js?v=20260722d"></script>
+    <script src="/app.js?v=20260724c"></script>
   </body>
 </html>

@@ -1278,8 +1278,138 @@ input.is-invalid {
 
 .capture-section,
 .route-section,
-.boat-section {
+.boat-section,
+.charter-request-section {
   margin-bottom: 18px;
+}
+
+.charter-request-section {
+  border: 1px solid #d6e0f0;
+  border-radius: 8px;
+  padding: 13px;
+  background: #f7f9ff;
+}
+
+.charter-filter-row {
+  margin: 0 0 8px;
+}
+
+.charter-refresh-btn {
+  min-width: 36px;
+  padding: 0 10px;
+}
+
+.charter-request-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.charter-request-list.is-empty .charter-request-empty {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 2px;
+}
+
+.charter-request-item {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid #d5deeb;
+  background: #fff;
+  border-radius: 8px;
+  padding: 10px 11px;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.charter-request-item:hover {
+  border-color: #93a9d4;
+}
+
+.charter-request-item.is-active {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.charter-request-item strong {
+  font-size: 13px;
+}
+
+.charter-request-item small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.charter-request-item .charter-status {
+  display: inline-flex;
+  align-self: start;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #e8eefc;
+  color: #1d4ed8;
+}
+
+.charter-active-banner {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #eef4ff;
+  border: 1px solid #c7d7f5;
+}
+
+.charter-active-banner.is-empty {
+  display: none;
+}
+
+.charter-active-text strong {
+  display: block;
+  font-size: 13px;
+}
+
+.charter-active-text p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.charter-active-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.charter-stop-pin {
+  background: transparent;
+  border: none;
+}
+
+.charter-stop-pin span {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: #1d4ed8;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  border: 2px solid #fff;
+  box-shadow: 0 6px 16px rgba(29, 78, 216, 0.35);
 }
 
 .capture-section {
