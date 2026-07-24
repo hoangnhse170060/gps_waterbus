@@ -5716,9 +5716,14 @@ function extractAccessToken(data) {
     || data.Token
     || data.access_token
     || data.jwt
+    || data.tokens?.accessToken
+    || data.Tokens?.accessToken
+    || data.tokens?.AccessToken
     || data.data?.accessToken
     || data.data?.token
-    || data.result?.accessToken,
+    || data.data?.tokens?.accessToken
+    || data.result?.accessToken
+    || data.auth?.accessToken,
   );
 }
 
@@ -5727,6 +5732,7 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
     email
     || env.AZURE_ADMIN_EMAIL
     || env.AZURE_ADMIN_USERNAME
+    || env.AZURE_ADMIN_PHONE
     || env.TARGET_AUTH_EMAIL
     || env.TARGET_AUTH_USERNAME,
   );
@@ -5748,10 +5754,9 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
       error: 'Thiếu AZURE_ADMIN_EMAIL + AZURE_ADMIN_PASSWORD (hoặc TARGET_BEARER_TOKEN) để login BE',
     };
   }
+  // Contract BE: { emailOrPhone, password } → { tokens: { accessToken } }
   const payload = {
-    email: user,
-    username: user,
-    userName: user,
+    emailOrPhone: user,
     password: pass,
   };
   const result = await requestTargetApi({
@@ -5773,7 +5778,7 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
     return {
       ok: false,
       status: 502,
-      error: 'Login OK nhưng không thấy accessToken trong response',
+      error: 'Login OK nhưng không thấy tokens.accessToken trong response',
       data: result.data,
     };
   }
