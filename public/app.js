@@ -84,7 +84,6 @@ const charterRefreshBtnEl = document.querySelector('#charterRefreshBtn');
 const charterActiveBannerEl = document.querySelector('#charterActiveBanner');
 const charterActiveTitleEl = document.querySelector('#charterActiveTitle');
 const charterActiveMetaEl = document.querySelector('#charterActiveMeta');
-const charterUseCandidateBtnEl = document.querySelector('#charterUseCandidateBtn');
 const charterClearBtnEl = document.querySelector('#charterClearBtn');
 
 function toast(message, type = 'info', ms = 3200) {
@@ -2771,12 +2770,9 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
-    if (body.charterComplete?.ok) {
-      notifyOk(`Đã gắn route vào booking charter · request Done`);
+    if (activeCharterRequest?.requestId) {
+      notifyInfo('Đã lưu route charter — BE tự gắn booking / cập nhật status');
       clearActiveCharterRequest({ refresh: true });
-    } else if (activeCharterRequest?.requestId && body.routeId) {
-      const done = await completeCharterRequest(activeCharterRequest.requestId, body.routeId);
-      if (done) clearActiveCharterRequest({ refresh: true });
     }
     hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear) {
@@ -3980,27 +3976,23 @@ function updateCharterActiveBanner() {
   if (!activeCharterRequest?.requestId) {
     charterActiveBannerEl.hidden = true;
     charterActiveBannerEl.classList.add('is-empty');
-    if (charterUseCandidateBtnEl) charterUseCandidateBtnEl.hidden = true;
     return;
   }
   charterActiveBannerEl.hidden = false;
   charterActiveBannerEl.classList.remove('is-empty');
   const code = activeCharterRequest.bookingCode || activeCharterRequest.bookingId || activeCharterRequest.requestId;
   if (charterActiveTitleEl) {
-    charterActiveTitleEl.textContent = `Đang xử lý · ${code}`;
+    charterActiveTitleEl.textContent = `Đang vẽ · ${code}`;
   }
   const stopNames = charterStopsAsOrdered(activeCharterRequest.stops)
     .map((s) => s.stationCode || s.stationName)
     .filter(Boolean)
     .join(' → ');
-  const hasCandidate = Boolean(candidateRouteId(activeCharterRequest) || candidateRouteCoordinates(activeCharterRequest).length >= 2);
+  const hasCandidate = candidateRouteCoordinates(activeCharterRequest).length >= 2;
   if (charterActiveMetaEl) {
     charterActiveMetaEl.textContent = hasCandidate
-      ? `${stopNames || '—'} · có candidate route sẵn`
+      ? `${stopNames || '—'} · đã nạp candidate (GPS chỉ vẽ, không đổi status)`
       : `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
-  }
-  if (charterUseCandidateBtnEl) {
-    charterUseCandidateBtnEl.hidden = !candidateRouteId(activeCharterRequest);
   }
   charterRequestListEl?.querySelectorAll('.charter-request-item').forEach((btn) => {
     btn.classList.toggle('is-active', btn.dataset.requestId === activeCharterRequest.requestId);
@@ -4015,38 +4007,12 @@ function clearActiveCharterRequest({ refresh = false } = {}) {
   if (refresh) loadCharterRequests();
 }
 
-async function completeCharterRequest(requestId, routeId) {
-  if (!requestId || !routeId) return false;
-  try {
-    const response = await fetch(
-      `/api/charter/route-draw-requests/${encodeURIComponent(requestId)}/complete`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ routeId }),
-      },
-    );
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || `Complete HTTP ${response.status}`);
-    notifyOk('Charter request Done — đã gắn route vào booking');
-    return true;
-  } catch (error) {
-    notifyErr(`Complete charter thất bại: ${error.message}`);
-    return false;
-  }
-}
-
 async function openCharterRequest(requestId) {
   if (!requestId) return;
   try {
     const detailRes = await fetch(`/api/charter/route-draw-requests/${encodeURIComponent(requestId)}`);
     const detail = await detailRes.json();
     if (!detailRes.ok) throw new Error(detail.error || `HTTP ${detailRes.status}`);
-
-    // Đánh dấu đang xử lý (không chặn nếu lỗi).
-    fetch(`/api/charter/route-draw-requests/${encodeURIComponent(requestId)}/in-progress`, {
-      method: 'PATCH',
-    }).catch(() => {});
 
     activeCharterRequest = detail;
     if (recordingActive || lockedSurveyPath) {
@@ -4066,10 +4032,9 @@ async function openCharterRequest(requestId) {
     if (coords.length >= 2) {
       renderCharterCandidatePreview(coords);
       loadCandidateIntoCapture(coords, detail.stops || []);
-      captureStatusEl.textContent = 'Charter: đã nạp candidate route — chỉnh nếu cần rồi ghi GPS & lưu.';
+      captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu (không đổi status request).';
       notifyOk('Đã nổi bến + path sẵn từ candidate');
     } else {
-      // Chỉ hiện bến — admin tự vẽ.
       setDrawTool('draw');
       captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
       notifyInfo('Chưa có path sẵn — hãy vẽ tuyến giữa các bến');
@@ -4079,17 +4044,6 @@ async function openCharterRequest(requestId) {
   } catch (error) {
     notifyErr(`Mở yêu cầu charter thất bại: ${error.message}`);
   }
-}
-
-async function useCandidateRouteAsComplete() {
-  const routeId = candidateRouteId(activeCharterRequest);
-  const requestId = activeCharterRequest?.requestId;
-  if (!routeId || !requestId) {
-    notifyWarn('Không có candidateRoute.routeId để dùng sẵn');
-    return;
-  }
-  const ok = await completeCharterRequest(requestId, routeId);
-  if (ok) clearActiveCharterRequest({ refresh: true });
 }
 
 function renderCharterRequestList(items) {
@@ -4140,7 +4094,6 @@ async function loadCharterRequests() {
 charterRefreshBtnEl?.addEventListener('click', () => loadCharterRequests());
 charterStatusFilterEl?.addEventListener('change', () => loadCharterRequests());
 charterClearBtnEl?.addEventListener('click', () => clearActiveCharterRequest());
-charterUseCandidateBtnEl?.addEventListener('click', () => useCandidateRouteAsComplete());
 
 loadCharterRequests();
 

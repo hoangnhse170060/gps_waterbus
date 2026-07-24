@@ -426,7 +426,7 @@ const server = createServer(async (req, res) => {
         return sendJson(res, detail);
       }
     }
-    // Charter → GPS: list / detail / in-progress / complete (auth hook như trip due, không JWT).
+    // Charter → GPS: chỉ đọc list/detail. Không PATCH status / complete (GPS chỉ vẽ).
     if (url.pathname === '/api/charter/route-draw-requests' && req.method === 'GET') {
       const status = cleanOptionalText(url.searchParams.get('status')) || 'Pending';
       const result = await requestTargetApi({
@@ -449,56 +449,20 @@ const server = createServer(async (req, res) => {
       });
     }
     {
-      const charterMatch = url.pathname.match(
-        /^\/api\/charter\/route-draw-requests\/([^/]+)(?:\/(in-progress|complete))?$/,
-      );
-      if (charterMatch) {
-        const requestId = decodeURIComponent(charterMatch[1]);
-        const action = charterMatch[2] || null;
-        const basePath = `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(requestId)}`;
-        if (!action && req.method === 'GET') {
-          const result = await requestTargetApi({
-            method: 'GET',
-            pathname: basePath,
-            auth: 'hook',
-          });
-          if (!result.ok) {
-            return sendJson(res, {
-              error: result.error || 'Không lấy được chi tiết yêu cầu charter',
-            }, result.status || 502);
-          }
-          return sendJson(res, normalizeCharterRequestDetail(result.data));
-        }
-        if (action === 'in-progress' && req.method === 'PATCH') {
-          const result = await requestTargetApi({
-            method: 'PATCH',
-            pathname: `${basePath}/in-progress`,
-            auth: 'hook',
-          });
-          if (!result.ok) {
-            return sendJson(res, {
-              error: result.error || 'Không đánh dấu InProgress',
-            }, result.status || 502);
-          }
+      const charterDetailMatch = url.pathname.match(/^\/api\/charter\/route-draw-requests\/([^/]+)$/);
+      if (charterDetailMatch && req.method === 'GET') {
+        const requestId = decodeURIComponent(charterDetailMatch[1]);
+        const result = await requestTargetApi({
+          method: 'GET',
+          pathname: `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(requestId)}`,
+          auth: 'hook',
+        });
+        if (!result.ok) {
           return sendJson(res, {
-            ok: true,
-            requestId,
-            data: result.data,
-          });
+            error: result.error || 'Không lấy được chi tiết yêu cầu charter',
+          }, result.status || 502);
         }
-        if (action === 'complete' && req.method === 'POST') {
-          const body = await readJson(req);
-          const routeId = cleanOptionalText(body.routeId);
-          if (!routeId) return sendJson(res, { error: 'Thiếu routeId' }, 400);
-          const result = await completeCharterRouteDrawRequest(requestId, routeId);
-          if (!result.ok) {
-            return sendJson(res, {
-              error: result.error || 'Complete charter request thất bại',
-              status: result.status,
-            }, result.status || 502);
-          }
-          return sendJson(res, { ok: true, requestId, routeId, data: result.data });
-        }
+        return sendJson(res, normalizeCharterRequestDetail(result.data));
       }
     }
     if (url.pathname === '/api/recording/save-route' && req.method === 'POST') {
@@ -5014,32 +4978,14 @@ async function persistRecordingSession(body, sessionInput = null) {
   }
 
   const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
-  let charterComplete = null;
-  const savedRouteId = cleanOptionalText(route?.routeId || route?.id || route?.RouteId);
-  if (charterRequestId && savedRouteId) {
-    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, savedRouteId);
-    if (!charterComplete.ok) {
-      warning = [
-        warning,
-        `Charter complete lỗi: ${charterComplete.error || charterComplete.status}`,
-      ].filter(Boolean).join(' · ');
-      console.warn(
-        `[save-route] charter complete ${charterRequestId} → ${savedRouteId}: ${charterComplete.error}`,
-      );
-    } else {
-      console.log(`[save-route] charter request ${charterRequestId} completed with route ${savedRouteId}`);
-    }
-  }
 
   return {
     ...route,
     savedTo,
     warning,
     ok: true,
+    // GPS chỉ vẽ/lưu route; BE tự gắn booking / đổi status từ charterRequestId trên from-gps.
     charterRequestId: charterRequestId || null,
-    charterComplete: charterComplete
-      ? { ok: charterComplete.ok, status: charterComplete.status, error: charterComplete.error || null }
-      : null,
   };
 }
 
@@ -5583,20 +5529,6 @@ function normalizeCharterRequestDetail(raw) {
     candidateLegs: data.candidateLegs || data.CandidateLegs || null,
     resultRoute: data.resultRoute || data.ResultRoute || null,
   };
-}
-
-async function completeCharterRouteDrawRequest(requestId, routeId) {
-  const id = cleanOptionalText(requestId);
-  const rid = cleanOptionalText(routeId);
-  if (!id || !rid) {
-    return { ok: false, status: 400, error: 'Thiếu requestId hoặc routeId', data: null };
-  }
-  return requestTargetApi({
-    method: 'POST',
-    pathname: `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(id)}/complete`,
-    payload: { routeId: rid },
-    auth: 'hook',
-  });
 }
 
 function haversineMetersSimple(a, b) {
