@@ -2769,9 +2769,15 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
-    if (activeCharterRequest?.requestId) {
-      notifyInfo('Đã lưu route charter — BE tự gắn booking / cập nhật status');
+    if (body.charterComplete?.ok) {
+      notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest({ refresh: true });
+    } else if (activeCharterRequest?.requestId && (body.routeId || body.id)) {
+      const done = await completeCharterRequest(
+        activeCharterRequest.requestId,
+        body.routeId || body.id,
+      );
+      if (done) clearActiveCharterRequest({ refresh: true });
     }
     hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear) {
@@ -3988,9 +3994,9 @@ function updateCharterActiveBanner() {
     .filter(Boolean)
     .join(' → ');
   const hasCandidate = candidateRouteCoordinates(activeCharterRequest).length >= 2;
-  if (charterActiveMetaEl) {
+    if (charterActiveMetaEl) {
     charterActiveMetaEl.textContent = hasCandidate
-      ? `${stopNames || '—'} · đã nạp candidate (GPS chỉ vẽ, không đổi status)`
+      ? `${stopNames || '—'} · đã nạp candidate`
       : `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
   }
   charterRequestListEl?.querySelectorAll('.charter-request-item').forEach((btn) => {
@@ -4006,12 +4012,38 @@ function clearActiveCharterRequest({ refresh = false } = {}) {
   if (refresh) loadCharterRequests();
 }
 
+async function completeCharterRequest(requestId, routeId) {
+  if (!requestId || !routeId) return false;
+  try {
+    const response = await fetch(
+      `/api/charter/route-draw-requests/${encodeURIComponent(requestId)}/complete`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ routeId }),
+      },
+    );
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `Complete HTTP ${response.status}`);
+    notifyOk('Complete charter OK');
+    return true;
+  } catch (error) {
+    notifyErr(`Complete charter thất bại: ${error.message}`);
+    return false;
+  }
+}
+
 async function openCharterRequest(requestId) {
   if (!requestId) return;
   try {
     const detailRes = await fetch(`/api/charter/route-draw-requests/${encodeURIComponent(requestId)}`);
     const detail = await detailRes.json();
     if (!detailRes.ok) throw new Error(detail.error || `HTTP ${detailRes.status}`);
+
+    // BE spec: mở request → in-progress
+    fetch(`/api/charter/route-draw-requests/${encodeURIComponent(requestId)}/in-progress`, {
+      method: 'PATCH',
+    }).catch(() => {});
 
     activeCharterRequest = detail;
     if (recordingActive || lockedSurveyPath) {
@@ -4031,7 +4063,7 @@ async function openCharterRequest(requestId) {
     if (coords.length >= 2) {
       renderCharterCandidatePreview(coords);
       loadCandidateIntoCapture(coords, detail.stops || []);
-      captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu (không đổi status request).';
+      captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu.';
       notifyOk('Đã nổi bến + path sẵn từ candidate');
     } else {
       setDrawTool('draw');
@@ -4050,7 +4082,7 @@ function renderCharterRequestList(items) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) {
     charterRequestListEl.classList.add('is-empty');
-    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Chưa có yêu cầu Pending — chờ BE push hook.</li>';
+    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không có yêu cầu Pending.</li>';
     return;
   }
   charterRequestListEl.classList.remove('is-empty');

@@ -428,8 +428,8 @@ const server = createServer(async (req, res) => {
         return sendJson(res, detail);
       }
     }
-    // Charter draw requests: BE PUSH vào GPS bằng LIVE_HOOK_SECRET (giống incidents).
-    // Không poll /api/charter-bookings/admin/* — path admin chỉ JWT, hook sẽ 401.
+    // Charter (BE spec): JWT admin — login + list/detail/in-progress/complete.
+    // Hook push vẫn nhận (tuỳ chọn), nhưng list ưu tiên poll admin API.
     if (url.pathname === '/api/charter/route-draw-requests/hook' && req.method === 'POST') {
       const body = await readJson(req);
       const result = ingestCharterDrawRequestHook(body, req);
@@ -437,18 +437,90 @@ const server = createServer(async (req, res) => {
       broadcast();
       return sendJson(res, result, result.created ? 201 : 200);
     }
+    if (url.pathname === '/api/charter/auth/login' && req.method === 'POST') {
+      const body = await readJson(req);
+      const result = await loginAzureAdmin({
+        email: body.email || body.username,
+        password: body.password,
+        force: true,
+      });
+      return sendJson(res, {
+        ok: result.ok,
+        error: result.error || null,
+        hasToken: Boolean(state.targetBearerToken),
+      }, result.ok ? 200 : (result.status || 401));
+    }
     if (url.pathname === '/api/charter/route-draw-requests' && req.method === 'GET') {
       const status = cleanOptionalText(url.searchParams.get('status')) || 'Pending';
-      const items = listCharterDrawRequests(status);
-      return sendJson(res, { ok: true, status, items, source: 'hook' });
+      const result = await fetchCharterDrawRequestsFromBe(status);
+      if (!result.ok) {
+        return sendJson(res, {
+          error: result.error || 'Không lấy được danh sách yêu cầu charter',
+          status: result.status,
+          items: listCharterDrawRequests(status),
+          source: 'local-fallback',
+        }, result.status || 502);
+      }
+      return sendJson(res, {
+        ok: true,
+        status,
+        items: result.items,
+        source: 'azure-admin',
+      });
     }
     {
-      const charterDetailMatch = url.pathname.match(/^\/api\/charter\/route-draw-requests\/([^/]+)$/);
-      if (charterDetailMatch && req.method === 'GET') {
-        const requestId = decodeURIComponent(charterDetailMatch[1]);
-        const detail = state.charterDrawRequests.get(requestId);
-        if (!detail) return sendJson(res, { error: 'Không tìm thấy yêu cầu charter' }, 404);
-        return sendJson(res, normalizeCharterRequestDetail(detail));
+      const charterMatch = url.pathname.match(
+        /^\/api\/charter\/route-draw-requests\/([^/]+)(?:\/(in-progress|complete|cancel))?$/,
+      );
+      if (charterMatch) {
+        const requestId = decodeURIComponent(charterMatch[1]);
+        const action = charterMatch[2] || null;
+        const basePath = `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(requestId)}`;
+        if (!action && req.method === 'GET') {
+          const authed = await ensureAzureAdminToken();
+          if (!authed.ok) {
+            const local = state.charterDrawRequests.get(requestId);
+            if (local) return sendJson(res, normalizeCharterRequestDetail(local));
+            return sendJson(res, { error: authed.error || 'Chưa login admin JWT' }, authed.status || 401);
+          }
+          const result = await requestTargetApi({
+            method: 'GET',
+            pathname: basePath,
+            auth: 'bearer',
+          });
+          if (!result.ok) {
+            return sendJson(res, {
+              error: result.error || 'Không lấy được chi tiết yêu cầu charter',
+            }, result.status || 502);
+          }
+          const detail = normalizeCharterRequestDetail(result.data);
+          if (detail.requestId) state.charterDrawRequests.set(detail.requestId, detail);
+          return sendJson(res, detail);
+        }
+        if (action === 'in-progress' && req.method === 'PATCH') {
+          const result = await charterAdminRequest('PATCH', `${basePath}/in-progress`);
+          if (!result.ok) {
+            return sendJson(res, { error: result.error || 'in-progress thất bại' }, result.status || 502);
+          }
+          return sendJson(res, { ok: true, requestId, data: result.data });
+        }
+        if (action === 'complete' && req.method === 'POST') {
+          const body = await readJson(req);
+          const routeId = cleanOptionalText(body.routeId);
+          if (!routeId) return sendJson(res, { error: 'Thiếu routeId' }, 400);
+          const result = await completeCharterRouteDrawRequest(requestId, routeId);
+          if (!result.ok) {
+            return sendJson(res, { error: result.error || 'complete thất bại' }, result.status || 502);
+          }
+          return sendJson(res, { ok: true, requestId, routeId, data: result.data });
+        }
+        if (action === 'cancel' && req.method === 'POST') {
+          const result = await charterAdminRequest('POST', `${basePath}/cancel`);
+          if (!result.ok) {
+            return sendJson(res, { error: result.error || 'cancel thất bại' }, result.status || 502);
+          }
+          return sendJson(res, { ok: true, requestId, data: result.data });
+        }
       }
     }
     if (url.pathname === '/api/recording/save-route' && req.method === 'POST') {
@@ -2501,6 +2573,13 @@ async function requestTargetApi({
     let headers;
     if (auth === 'bearer') headers = buildBearerHeaders();
     else if (auth === 'hook') headers = buildHookHeaders();
+    else if (auth === 'none') {
+      headers = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      };
+      if (state.targetApiKey) headers['X-Api-Key'] = state.targetApiKey;
+    }
     else headers = buildGpsHeaders({ deviceId });
     const init = { method, headers };
     if (payload != null && method !== 'GET' && method !== 'HEAD') {
@@ -4831,22 +4910,132 @@ async function saveRouteFromGpsOnTarget(session, body) {
   return targetResult;
 }
 
+/** BE charter spec: POST /api/routes/from-stations · routeType=CharterReference */
+async function saveCharterRouteFromStations(session, body) {
+  const boatCode = cleanOptionalText(body.boatCode || session.boatCode);
+  const averageSpeedKmh = resolveSurveySpeedKmh(body, session, boatCode);
+  const azureMaxSpeed = Math.max(1, Number(env.AZURE_MAX_SPEED_KMH || 80));
+  const azureSpeedKmh = Math.min(averageSpeedKmh, azureMaxSpeed);
+  const coordinates = resolveSurveyPathCoordinates(session, body, averageSpeedKmh);
+  if (coordinates.length < 2) {
+    return { ok: false, status: 400, error: 'Charter cần ≥2 điểm geometry' };
+  }
+  const startStationId = cleanOptionalText(body.startStationId || session.startStationId);
+  const endStationId = cleanOptionalText(body.endStationId || session.endStationId);
+  const berthBufferMin = resolveBerthBufferMin(body, session);
+  let stops = enrichStopsAlongPath(
+    coordinates,
+    body.stops || session.stops,
+    startStationId,
+    endStationId,
+    Number(env.STOP_DETECT_RADIUS_M || 200),
+  );
+  const snapped = snapCoordinatesToStops(coordinates, stops, Number(env.STOP_DETECT_RADIUS_M || 200));
+  const stopsExact = attachSegmentTravelMinutes(snapped, stops, averageSpeedKmh, berthBufferMin);
+  const preferExactTravel = parseBool(env.AZURE_EXACT_TRAVEL_MIN ?? 'true');
+  const stopsForAzure = stopsExact.map((stop, index) => ({
+    stationId: stop.stationId,
+    stationCode: stop.stationCode || null,
+    stationName: stop.stationName || null,
+    stopOrder: Number(stop.stopOrder) || index + 1,
+    lat: Number.isFinite(Number(stop.lat)) ? Number(stop.lat) : null,
+    lng: Number.isFinite(Number(stop.lng)) ? Number(stop.lng) : null,
+    isPickupAllowed: stop.isPickupAllowed !== false,
+    isDropoffAllowed: stop.isDropoffAllowed !== false,
+    standardTravelMin: preferExactTravel
+      ? exactDurationMinutes(stop.standardTravelMin)
+      : azureTravelMinutes(stop.standardTravelMin),
+  }));
+  const pathKm = routeLength(snapped) / 1000;
+  const estimatedDurationMin = preferExactTravel
+    ? (sumTravelMinutes(stopsExact) || exactDurationMinutes((pathKm / averageSpeedKmh) * 60))
+    : Math.max(1, Math.round(sumTravelMinutes(stopsExact) || (pathKm / averageSpeedKmh) * 60));
+
+  const payload = {
+    routeCode: cleanRouteText(body.routeCode || session.routeCode, 'Route code'),
+    routeName: cleanRouteText(body.routeName || session.routeName || body.routeCode || session.routeCode, 'Route name'),
+    description: cleanOptionalText(body.description) || 'Charter route from GPS survey',
+    status: 'Active',
+    routeType: 'CharterReference',
+    isBookable: false,
+    averageSpeedKmh: azureSpeedKmh,
+    estimatedDurationMin,
+    startStationId: startStationId || null,
+    endStationId: endStationId || null,
+    coordinates: snapped.map((point, index) => ({
+      lat: round(Number(point.lat), 7),
+      lng: round(Number(point.lng), 7),
+      sequence: index + 1,
+    })),
+    stops: stopsForAzure,
+  };
+  if (cleanOptionalText(body.charterRequestId || session?.charterRequestId)) {
+    payload.charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
+  }
+  if (cleanOptionalText(body.bookingId || session?.bookingId)) {
+    payload.bookingId = cleanOptionalText(body.bookingId || session?.bookingId);
+  }
+
+  await ensureAzureAdminToken();
+  let result = await requestTargetApi({
+    method: 'POST',
+    pathname: String(env.CHARTER_FROM_STATIONS_PATH || '/api/routes/from-stations').trim()
+      || '/api/routes/from-stations',
+    payload,
+    auth: 'bearer',
+  });
+  if (result.status === 401) {
+    await loginAzureAdmin({ force: true });
+    result = await requestTargetApi({
+      method: 'POST',
+      pathname: String(env.CHARTER_FROM_STATIONS_PATH || '/api/routes/from-stations').trim()
+        || '/api/routes/from-stations',
+      payload,
+      auth: 'bearer',
+    });
+  }
+  if (result && typeof result === 'object') {
+    result.outboundStops = stopsExact;
+    result.outboundEstimatedDurationMin = estimatedDurationMin;
+    result.outboundAverageSpeedKmh = averageSpeedKmh;
+  }
+  return result;
+}
+
 async function persistRecordingSession(body, sessionInput = null) {
   const session = sessionInput || state.lastRecordingSession;
   let route = null;
   let savedTo = 'local';
   let warning = null;
+  let charterComplete = null;
   const hasCoordinates = (session?.recordedPoints?.length || 0) >= 2
     || (session?.plannedCoordinates?.length || 0) >= 2
     || (Array.isArray(body?.coordinates) && body.coordinates.length >= 2);
-  // Chỉ gọi Azure from-gps khi session đã start thật trên BE.
-  // sessionId local luôn có → nếu cứ gửi sẽ bị "GPS session khong ton tai".
-  const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && session?.targetSessionStarted);
+  const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
+  const isCharter = Boolean(charterRequestId)
+    || resolveRouteType(body, session, body.startStationId || session?.startStationId, body.endStationId || session?.endStationId) === 'CharterReference';
+  // Charter dùng JWT + from-stations (không cần GPS tracking session).
+  // Survey thường: from-gps cần session Azure đã start.
+  const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && (
+    isCharter || session?.targetSessionStarted
+  ));
 
   if (canTryAzure) {
-    let targetSave = await saveRouteFromGpsOnTarget(session, body);
+    let targetSave = isCharter
+      ? await saveCharterRouteFromStations(session, body)
+      : await saveRouteFromGpsOnTarget(session, body);
+    if (
+      isCharter
+      && !targetSave.ok
+      && targetSave.status !== 409
+      && session?.targetSessionStarted
+    ) {
+      warning = `from-stations: ${targetSave.error || targetSave.status}; fallback from-gps`;
+      console.warn(`[save-route] ${warning}`);
+      targetSave = await saveRouteFromGpsOnTarget(session, body);
+    }
     let reverseError = null;
-    const wantedReverse = Boolean(body.createReverseRoute || session?.createReverseRoute);
+    const wantedReverse = !isCharter && Boolean(body.createReverseRoute || session?.createReverseRoute);
     if (
       !targetSave.ok
       && targetSave.status !== 409
@@ -4963,11 +5152,19 @@ async function persistRecordingSession(body, sessionInput = null) {
     state.lastRecordingSession = null;
   }
 
-  const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
-  if (charterRequestId && state.charterDrawRequests.has(charterRequestId)) {
+  const savedRouteId = cleanOptionalText(route?.routeId || route?.id || route?.RouteId);
+  if (charterRequestId && savedRouteId && savedTo === 'target') {
+    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, savedRouteId);
+    if (!charterComplete.ok) {
+      warning = [
+        warning,
+        `complete charter lỗi: ${charterComplete.error || charterComplete.status}`,
+      ].filter(Boolean).join(' · ');
+    }
+  } else if (charterRequestId && state.charterDrawRequests.has(charterRequestId)) {
     const row = state.charterDrawRequests.get(charterRequestId);
-    row.status = 'Done';
-    row.resultRouteId = cleanOptionalText(route?.routeId || route?.id) || null;
+    row.status = savedRouteId ? 'Done' : row.status;
+    row.resultRouteId = savedRouteId || null;
     row.updatedAt = new Date().toISOString();
     state.charterDrawRequests.set(charterRequestId, row);
   }
@@ -4977,8 +5174,10 @@ async function persistRecordingSession(body, sessionInput = null) {
     savedTo,
     warning,
     ok: true,
-    // GPS chỉ vẽ/lưu route; BE tự gắn booking / đổi status từ charterRequestId trên from-gps.
     charterRequestId: charterRequestId || null,
+    charterComplete: charterComplete
+      ? { ok: charterComplete.ok, status: charterComplete.status, error: charterComplete.error || null }
+      : null,
   };
 }
 
@@ -5506,6 +5705,132 @@ function listCharterDrawRequests(statusFilter = 'Pending') {
     })
     .sort((a, b) => String(b.receivedAt || '').localeCompare(String(a.receivedAt || '')))
     .map((row) => normalizeCharterRequestDetail(row));
+}
+
+function extractAccessToken(data) {
+  if (!data || typeof data !== 'object') return null;
+  return cleanOptionalText(
+    data.accessToken
+    || data.AccessToken
+    || data.token
+    || data.Token
+    || data.access_token
+    || data.jwt
+    || data.data?.accessToken
+    || data.data?.token
+    || data.result?.accessToken,
+  );
+}
+
+async function loginAzureAdmin({ email, password, force = false } = {}) {
+  const user = cleanOptionalText(
+    email
+    || env.AZURE_ADMIN_EMAIL
+    || env.AZURE_ADMIN_USERNAME
+    || env.TARGET_AUTH_EMAIL
+    || env.TARGET_AUTH_USERNAME,
+  );
+  const pass = cleanOptionalText(
+    password
+    || env.AZURE_ADMIN_PASSWORD
+    || env.TARGET_AUTH_PASSWORD,
+  );
+  if (!force && state.targetBearerToken) {
+    return { ok: true, token: state.targetBearerToken, cached: true };
+  }
+  if (!user || !pass) {
+    if (state.targetBearerToken) {
+      return { ok: true, token: state.targetBearerToken, cached: true };
+    }
+    return {
+      ok: false,
+      status: 401,
+      error: 'Thiếu AZURE_ADMIN_EMAIL + AZURE_ADMIN_PASSWORD (hoặc TARGET_BEARER_TOKEN) để login BE',
+    };
+  }
+  const payload = {
+    email: user,
+    username: user,
+    userName: user,
+    password: pass,
+  };
+  const result = await requestTargetApi({
+    method: 'POST',
+    pathname: String(env.AZURE_AUTH_LOGIN_PATH || '/api/auth/login').trim() || '/api/auth/login',
+    payload,
+    auth: 'none',
+  });
+  if (!result.ok) {
+    return {
+      ok: false,
+      status: result.status || 401,
+      error: result.error || 'Login BE thất bại',
+      data: result.data,
+    };
+  }
+  const token = extractAccessToken(result.data);
+  if (!token) {
+    return {
+      ok: false,
+      status: 502,
+      error: 'Login OK nhưng không thấy accessToken trong response',
+      data: result.data,
+    };
+  }
+  state.targetBearerToken = token;
+  console.log('[charter-auth] Azure admin JWT sẵn sàng');
+  return { ok: true, token, cached: false };
+}
+
+async function ensureAzureAdminToken({ force = false } = {}) {
+  if (!force && state.targetBearerToken) {
+    return { ok: true, token: state.targetBearerToken };
+  }
+  return loginAzureAdmin({ force });
+}
+
+async function charterAdminRequest(method, pathname, payload = null) {
+  let authed = await ensureAzureAdminToken();
+  if (!authed.ok) return authed;
+  let result = await requestTargetApi({ method, pathname, payload, auth: 'bearer' });
+  if (result.status === 401) {
+    authed = await loginAzureAdmin({ force: true });
+    if (!authed.ok) return authed;
+    result = await requestTargetApi({ method, pathname, payload, auth: 'bearer' });
+  }
+  return result;
+}
+
+async function fetchCharterDrawRequestsFromBe(status = 'Pending') {
+  const path = `/api/charter-bookings/admin/route-draw-requests?status=${encodeURIComponent(status)}`;
+  const result = await charterAdminRequest('GET', path);
+  if (!result.ok) return result;
+  const items = unwrapCharterRequestList(result.data).map((row) => normalizeCharterRequestDetail(row));
+  for (const item of items) {
+    if (item.requestId) state.charterDrawRequests.set(item.requestId, item);
+  }
+  return { ok: true, items, status: result.status, data: result.data };
+}
+
+async function completeCharterRouteDrawRequest(requestId, routeId) {
+  const id = cleanOptionalText(requestId);
+  const rid = cleanOptionalText(routeId);
+  if (!id || !rid) {
+    return { ok: false, status: 400, error: 'Thiếu requestId hoặc routeId', data: null };
+  }
+  const result = await charterAdminRequest(
+    'POST',
+    `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(id)}/complete`,
+    { routeId: rid },
+  );
+  if (result.ok && state.charterDrawRequests.has(id)) {
+    const row = state.charterDrawRequests.get(id);
+    row.status = 'Done';
+    row.resultRouteId = rid;
+    row.updatedAt = new Date().toISOString();
+    state.charterDrawRequests.set(id, row);
+  }
+  return result;
 }
 
 function verifyLiveHookSecret(body = {}, req = null) {
