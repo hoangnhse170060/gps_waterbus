@@ -80,6 +80,8 @@ const state = {
   },
   targetBearerToken: String(env.TARGET_BEARER_TOKEN || env.AZURE_BEARER_TOKEN || '').trim(),
   liveHookSecret: String(env.LIVE_HOOK_SECRET || '').trim(),
+  /** Yêu cầu vẽ charter BE push vào GPS (không poll /admin — admin path cần JWT). */
+  charterDrawRequests: new Map(),
   dbStatus: { ok: false, message: 'Not loaded yet', loadedAt: null },
 };
 
@@ -426,43 +428,27 @@ const server = createServer(async (req, res) => {
         return sendJson(res, detail);
       }
     }
-    // Charter → GPS: chỉ đọc list/detail. Không PATCH status / complete (GPS chỉ vẽ).
+    // Charter draw requests: BE PUSH vào GPS bằng LIVE_HOOK_SECRET (giống incidents).
+    // Không poll /api/charter-bookings/admin/* — path admin chỉ JWT, hook sẽ 401.
+    if (url.pathname === '/api/charter/route-draw-requests/hook' && req.method === 'POST') {
+      const body = await readJson(req);
+      const result = ingestCharterDrawRequestHook(body, req);
+      if (!result.ok) return sendJson(res, result, result.status || 400);
+      broadcast();
+      return sendJson(res, result, result.created ? 201 : 200);
+    }
     if (url.pathname === '/api/charter/route-draw-requests' && req.method === 'GET') {
       const status = cleanOptionalText(url.searchParams.get('status')) || 'Pending';
-      const result = await requestTargetApi({
-        method: 'GET',
-        pathname: `/api/charter-bookings/admin/route-draw-requests?status=${encodeURIComponent(status)}`,
-        auth: 'hook',
-      });
-      if (!result.ok) {
-        return sendJson(res, {
-          error: result.error || 'Không lấy được danh sách yêu cầu charter',
-          status: result.status,
-          items: [],
-        }, result.status || 502);
-      }
-      return sendJson(res, {
-        ok: true,
-        status,
-        items: unwrapCharterRequestList(result.data),
-        raw: result.data,
-      });
+      const items = listCharterDrawRequests(status);
+      return sendJson(res, { ok: true, status, items, source: 'hook' });
     }
     {
       const charterDetailMatch = url.pathname.match(/^\/api\/charter\/route-draw-requests\/([^/]+)$/);
       if (charterDetailMatch && req.method === 'GET') {
         const requestId = decodeURIComponent(charterDetailMatch[1]);
-        const result = await requestTargetApi({
-          method: 'GET',
-          pathname: `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(requestId)}`,
-          auth: 'hook',
-        });
-        if (!result.ok) {
-          return sendJson(res, {
-            error: result.error || 'Không lấy được chi tiết yêu cầu charter',
-          }, result.status || 502);
-        }
-        return sendJson(res, normalizeCharterRequestDetail(result.data));
+        const detail = state.charterDrawRequests.get(requestId);
+        if (!detail) return sendJson(res, { error: 'Không tìm thấy yêu cầu charter' }, 404);
+        return sendJson(res, normalizeCharterRequestDetail(detail));
       }
     }
     if (url.pathname === '/api/recording/save-route' && req.method === 'POST') {
@@ -4978,6 +4964,13 @@ async function persistRecordingSession(body, sessionInput = null) {
   }
 
   const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
+  if (charterRequestId && state.charterDrawRequests.has(charterRequestId)) {
+    const row = state.charterDrawRequests.get(charterRequestId);
+    row.status = 'Done';
+    row.resultRouteId = cleanOptionalText(route?.routeId || route?.id) || null;
+    row.updatedAt = new Date().toISOString();
+    state.charterDrawRequests.set(charterRequestId, row);
+  }
 
   return {
     ...route,
@@ -5501,6 +5494,114 @@ function unwrapCharterRequestList(data) {
   return [];
 }
 
+function listCharterDrawRequests(statusFilter = 'Pending') {
+  const want = String(statusFilter || 'Pending').toLowerCase();
+  return [...state.charterDrawRequests.values()]
+    .filter((row) => {
+      const st = String(row.status || 'Pending').toLowerCase();
+      if (want === 'pending') {
+        return st === 'pending' || st === 'inprogress' || st === 'in_progress';
+      }
+      return st === want;
+    })
+    .sort((a, b) => String(b.receivedAt || '').localeCompare(String(a.receivedAt || '')))
+    .map((row) => normalizeCharterRequestDetail(row));
+}
+
+function verifyLiveHookSecret(body = {}, req = null) {
+  const expected = String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim();
+  if (!expected) {
+    return {
+      ok: false,
+      status: 503,
+      error: 'Chưa cấu hình LIVE_HOOK_SECRET — đặt secret trong .env / Railway rồi restart',
+    };
+  }
+  const provided = String(
+    req?.headers?.['x-live-hook-secret']
+    || body.secret
+    || body.hookSecret
+    || '',
+  ).trim();
+  if (provided !== expected) {
+    return { ok: false, status: 401, error: 'Hook secret sai — gửi header X-Live-Hook-Secret' };
+  }
+  return { ok: true };
+}
+
+/**
+ * BE push yêu cầu vẽ charter → GPS (không JWT, không poll admin API).
+ * POST /api/charter/route-draw-requests/hook
+ * Header: X-Live-Hook-Secret
+ *
+ * { "event": "CharterRouteDrawRequested", "requestId", "bookingId", "bookingCode", "stops": [...] }
+ * { "event": "CharterRouteDrawCancelled", "requestId" }
+ */
+function ingestCharterDrawRequestHook(body = {}, req = null) {
+  const auth = verifyLiveHookSecret(body, req);
+  if (!auth.ok) return auth;
+
+  const event = String(body.event || body.type || body.action || 'CharterRouteDrawRequested').trim();
+  const eventLower = event.toLowerCase();
+  const requestId = cleanOptionalText(
+    body.requestId || body.id || body.RequestId || body.data?.requestId,
+  );
+  if (!requestId) {
+    return { ok: false, status: 400, error: 'Thiếu requestId' };
+  }
+
+  if (
+    eventLower.includes('cancel')
+    || eventLower.includes('done')
+    || eventLower.includes('complete')
+    || eventLower.includes('resolve')
+  ) {
+    const prev = state.charterDrawRequests.get(requestId);
+    if (prev) {
+      prev.status = eventLower.includes('cancel') ? 'Cancelled' : 'Done';
+      prev.updatedAt = new Date().toISOString();
+      state.charterDrawRequests.set(requestId, prev);
+    } else {
+      state.charterDrawRequests.delete(requestId);
+    }
+    return {
+      ok: true,
+      event,
+      requestId,
+      removed: !state.charterDrawRequests.has(requestId)
+        || ['Cancelled', 'Done'].includes(state.charterDrawRequests.get(requestId)?.status),
+      pendingCount: listCharterDrawRequests('Pending').length,
+    };
+  }
+
+  const payload = body.data && typeof body.data === 'object' && !body.stops
+    ? { ...body, ...body.data }
+    : body;
+  const detail = normalizeCharterRequestDetail({
+    ...payload,
+    requestId,
+    status: cleanOptionalText(payload.status) || 'Pending',
+    receivedAt: new Date().toISOString(),
+  });
+  if (!detail.stops?.length) {
+    return { ok: false, status: 400, error: 'Thiếu stops[] trong yêu cầu vẽ charter' };
+  }
+  const created = !state.charterDrawRequests.has(requestId);
+  state.charterDrawRequests.set(requestId, detail);
+  console.log(
+    `[charter-hook] ${created ? 'new' : 'update'} ${requestId}`
+    + ` booking=${detail.bookingCode || detail.bookingId || '-'} stops=${detail.stops.length}`,
+  );
+  return {
+    ok: true,
+    created,
+    event,
+    requestId,
+    item: detail,
+    pendingCount: listCharterDrawRequests('Pending').length,
+  };
+}
+
 function normalizeCharterRequestDetail(raw) {
   const data = (raw && typeof raw === 'object' && raw.data && !raw.requestId)
     ? raw.data
@@ -5512,7 +5613,8 @@ function normalizeCharterRequestDetail(raw) {
     requestId: cleanOptionalText(data.requestId || data.id) || null,
     bookingId: cleanOptionalText(data.bookingId) || null,
     bookingCode: cleanOptionalText(data.bookingCode) || null,
-    status: cleanOptionalText(data.status) || null,
+    status: cleanOptionalText(data.status) || 'Pending',
+    receivedAt: data.receivedAt || null,
     stops: stops.map((stop, index) => ({
       stationId: cleanOptionalText(stop.stationId || stop.StationId) || null,
       stationCode: cleanOptionalText(stop.stationCode || stop.StationCode) || null,

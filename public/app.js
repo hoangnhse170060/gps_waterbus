@@ -4050,7 +4050,7 @@ function renderCharterRequestList(items) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) {
     charterRequestListEl.classList.add('is-empty');
-    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không có yêu cầu ở trạng thái này.</li>';
+    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Chưa có yêu cầu Pending — chờ BE push hook.</li>';
     return;
   }
   charterRequestListEl.classList.remove('is-empty');
