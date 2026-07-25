@@ -2676,7 +2676,7 @@ function buildBearerHeaders() {
   };
   const token = String(state.targetBearerToken || '').trim();
   if (token) headers.Authorization = `Bearer ${token}`;
-  if (state.targetApiKey) headers['X-Api-Key'] = state.targetApiKey;
+  // Không gắn X-Api-Key cùng JWT — BE admin charter dễ 401 (empty body).
   return headers;
 }
 
@@ -5851,14 +5851,15 @@ async function charterAdminRequest(method, pathname, payload = null) {
   if (!authed.ok) return authed;
   let result = await requestTargetApi({ method, pathname, payload, auth: 'bearer' });
   if (result.status === 401) {
-    console.warn(`[charter-auth] ${method} ${pathname} 401 → login lại`);
+    console.warn(`[charter-auth] ${method} ${pathname} 401 → login lại (tokenLen=${String(state.targetBearerToken || '').length})`);
     authed = await loginAzureAdmin({ force: true });
     if (!authed.ok) return authed;
     result = await requestTargetApi({ method, pathname, payload, auth: 'bearer' });
   }
   if (!result.ok && result.status === 401) {
     result.error = `${result.error || 'BE 401'}`
-      + ' · JWT login được nhưng API charter từ chối (kiểm tra role Admin / redeploy sau khi set biến)';
+      + ` · JWT login OK (tokenLen=${String(state.targetBearerToken || '').length}) nhưng ${pathname} từ chối`
+      + ' · thử xóa TARGET_GPS_API_KEY khỏi request admin / kiểm tra role Admin';
   }
   return result;
 }
