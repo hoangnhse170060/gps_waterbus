@@ -6366,33 +6366,59 @@ async function ensureGpsDevicesForBoats(boats) {
   if (!dbPool || !parseBool(env.AUTO_REGISTER_GPS_DEVICES ?? 'true')) return 0;
   const list = Array.isArray(boats) ? boats : [];
   if (!list.length) return 0;
-  let inserted = 0;
+  let changed = 0;
   for (const boat of list) {
     const boatId = boat.boatId || boat.boat_id;
     const boatCode = String(boat.boatCode || boat.boat_code || '').trim();
     if (!boatId || !boatCode) continue;
     const deviceId = `gps-${boatCode.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
     try {
-      const result = await dbPool.query(
-        `
-        insert into gps_devices (gps_device_id, device_id, boat_id, is_active, created_at, updated_at)
-        select $1::uuid, $2, $3::uuid, true, now(), now()
-        where not exists (
-          select 1 from gps_devices where boat_id = $3::uuid
-        )
-        returning device_id
-        `,
-        [randomUUID(), deviceId, boatId],
+      const existing = await dbPool.query(
+        'select gps_device_id, device_id, is_active from gps_devices where boat_id = $1::uuid',
+        [boatId],
       );
-      if (result.rowCount > 0) {
-        inserted += 1;
-        console.log(`[gps-device] Auto-registered ${boatCode} → ${deviceId}`);
+      if (!existing.rowCount) {
+        const result = await dbPool.query(
+          `
+          insert into gps_devices (gps_device_id, device_id, boat_id, is_active, created_at, updated_at)
+          values ($1::uuid, $2, $3::uuid, true, now(), now())
+          returning device_id
+          `,
+          [randomUUID(), deviceId, boatId],
+        );
+        if (result.rowCount > 0) {
+          changed += 1;
+          console.log(`[gps-device] Auto-registered ${boatCode} → ${deviceId}`);
+        }
+        continue;
       }
+      const row = existing.rows[0];
+      if (row.device_id === deviceId && row.is_active) continue;
+      // Free device_id if another boat holds it, then normalize this boat.
+      await dbPool.query(
+        `
+        update gps_devices
+        set device_id = device_id || '-old-' || substr(gps_device_id::text, 1, 8),
+            updated_at = now()
+        where device_id = $1 and gps_device_id <> $2::uuid
+        `,
+        [deviceId, row.gps_device_id],
+      );
+      await dbPool.query(
+        `
+        update gps_devices
+        set device_id = $1, is_active = true, updated_at = now()
+        where gps_device_id = $2::uuid
+        `,
+        [deviceId, row.gps_device_id],
+      );
+      changed += 1;
+      console.log(`[gps-device] Normalized ${boatCode}: ${row.device_id} → ${deviceId}`);
     } catch (error) {
       console.warn(`[gps-device] Auto-register ${boatCode} failed: ${error.message}`);
     }
   }
-  return inserted;
+  return changed;
 }
 
 function cleanRouteText(value, label) {
@@ -7101,10 +7127,9 @@ function deviceIdForBoat(boat) {
   const registered = code ? state.gpsDevicesByBoatCode.get(code) : null;
   if (registered) return registered;
   const synthetic = `gps-${String(boat?.boatCode || boat?.boatId || 'WB_001').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
-  // Nếu chưa đăng ký riêng: fallback device chung (tránh 404), log cảnh báo.
+  // Không fallback gps-wb-001 chung — BE sẽ 400 "boatCode không khớp thiết bị".
   if (code && !String(code).startsWith('SURVEY-')) {
-    console.warn(`[gps-device] ${code} chưa có trong gps_devices — dùng fallback ${surveyDeviceId()} (synthetic ${synthetic})`);
-    return surveyDeviceId();
+    console.warn(`[gps-device] ${code} chưa có trong gps_devices — dùng synthetic ${synthetic}`);
   }
   return synthetic;
 }
