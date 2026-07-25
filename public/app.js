@@ -132,6 +132,8 @@ let showSavedRoutes = false;
 let activeCharterRequest = null;
 let charterCandidateLayer = null;
 let charterStopLayer = null;
+/** stationId → stopOrder của yêu cầu charter đang mở (đổi màu cờ bến sẵn có). */
+const charterStopOrders = new Map();
 let latest = null;
 let hasFitInitialRoutes = false;
 let lastStationsFingerprint = '';
@@ -3633,9 +3635,13 @@ function renderStations(stations) {
   const endId = endStationEl.value;
   for (const station of uniqueStations(stations)) {
     seen.add(station.stationId);
-    const role = station.stationId === startId ? 'start'
-      : station.stationId === endId ? 'end' : '';
-    const icon = stationFlagIcon(station, role);
+    // Bến thuộc yêu cầu charter → đổi màu chính lá cờ đó (không chèn cờ thứ 2).
+    const charterOrder = charterStopOrders.get(String(station.stationId)) || null;
+    let role = '';
+    if (charterOrder) role = 'charter';
+    else if (station.stationId === startId) role = 'start';
+    else if (station.stationId === endId) role = 'end';
+    const icon = stationFlagIcon(station, role, charterOrder);
     let layer = stationLayers.get(station.stationId);
     if (!layer) {
       layer = L.marker([station.lat, station.lng], { icon, zIndexOffset: 400 }).addTo(map);
@@ -3668,11 +3674,13 @@ function renderStations(stations) {
   }
 }
 
-function stationFlagIcon(station, role = '') {
-  const label = String(station.stationCode || '')
+function stationFlagIcon(station, role = '', order = null) {
+  const code = String(station.stationCode || '')
     .replace(/^ST-/i, '')
     .slice(0, 3)
     .toUpperCase() || '•';
+  const label = order ? `${order}·${code}` : code;
+  const width = order ? 40 : 28;
   return L.divIcon({
     className: '',
     html: `
@@ -3681,7 +3689,7 @@ function stationFlagIcon(station, role = '') {
         <div class="station-flag-cloth">${escapeHtml(label)}</div>
       </div>
     `,
-    iconSize: [28, 36],
+    iconSize: [width, 36],
     iconAnchor: [5, 36],
   });
 }
@@ -3922,7 +3930,7 @@ function candidateRouteId(detail) {
   return route.routeId || route.id || route.RouteId || null;
 }
 
-function clearCharterMapLayers() {
+function clearCharterMapLayers({ resetFlags = false } = {}) {
   if (charterCandidateLayer) {
     charterCandidateLayer.remove();
     charterCandidateLayer = null;
@@ -3931,41 +3939,57 @@ function clearCharterMapLayers() {
     charterStopLayer.remove();
     charterStopLayer = null;
   }
+  if (resetFlags && charterStopOrders.size) {
+    charterStopOrders.clear();
+    if (latest?.stations) renderStations(latest.stations);
+  }
 }
 
 function renderCharterStopPins(stops) {
   clearCharterMapLayers();
+  charterStopOrders.clear();
   const ordered = charterStopsAsOrdered(stops);
-  if (!ordered.length) return;
-  charterStopLayer = L.layerGroup().addTo(map);
+  if (!ordered.length) {
+    if (latest?.stations) renderStations(latest.stations);
+    return;
+  }
+
   const bounds = [];
+  const knownIds = new Set(
+    (latest?.stations || []).map((s) => String(s.stationId)),
+  );
+  const extras = [];
   ordered.forEach((stop) => {
     if (!Number.isFinite(stop.lat) || !Number.isFinite(stop.lng)) return;
     bounds.push([stop.lat, stop.lng]);
-    const code = String(stop.stationCode || '').replace(/^ST-/i, '').slice(0, 4).toUpperCase();
-    const label = `${stop.stopOrder}·${code || '•'}`;
-    // Cờ cam cao hơn cờ bến thường → nhìn là biết bến thuộc yêu cầu charter.
-    const marker = L.marker([stop.lat, stop.lng], {
-      icon: L.divIcon({
-        className: '',
-        html: `
-          <div class="station-flag is-charter">
-            <div class="station-flag-pole"></div>
-            <div class="station-flag-cloth">${escapeHtml(label)}</div>
-          </div>
-        `,
-        iconSize: [46, 48],
-        iconAnchor: [5, 48],
-      }),
-      zIndexOffset: 900,
-    });
-    const stay = stop.stayDurationMinutes != null ? ` · dừng ${stop.stayDurationMinutes}p` : '';
-    marker.bindTooltip(
-      `#${stop.stopOrder} ${stop.stationName || stop.stationCode || stop.stationId}${stay}`,
-      { direction: 'top', offset: [0, -44] },
-    );
-    charterStopLayer.addLayer(marker);
+    charterStopOrders.set(String(stop.stationId), stop.stopOrder);
+    if (!knownIds.has(String(stop.stationId))) extras.push(stop);
   });
+
+  // Đổi màu cờ bến sẵn có (không chèn cờ thứ 2 chồng lên).
+  if (latest?.stations) renderStations(latest.stations);
+
+  // Bến charter không có trong catalog map → mới cần vẽ cờ riêng.
+  if (extras.length) {
+    charterStopLayer = L.layerGroup().addTo(map);
+    extras.forEach((stop) => {
+      const marker = L.marker([stop.lat, stop.lng], {
+        icon: stationFlagIcon(
+          { stationCode: stop.stationCode || stop.stationName },
+          'charter',
+          stop.stopOrder,
+        ),
+        zIndexOffset: 900,
+      });
+      const stay = stop.stayDurationMinutes != null ? ` · dừng ${stop.stayDurationMinutes}p` : '';
+      marker.bindTooltip(
+        `#${stop.stopOrder} ${stop.stationName || stop.stationCode || stop.stationId}${stay}`,
+        { direction: 'top', offset: [0, -32] },
+      );
+      charterStopLayer.addLayer(marker);
+    });
+  }
+
   if (bounds.length) {
     map.fitBounds(bounds, { padding: [56, 56], maxZoom: 15 });
   }
@@ -4227,7 +4251,7 @@ function updateCharterActiveBanner() {
 
 function clearActiveCharterRequest({ refresh = false } = {}) {
   activeCharterRequest = null;
-  clearCharterMapLayers();
+  clearCharterMapLayers({ resetFlags: true });
   updateCharterActiveBanner();
   updateRouteTypeHint();
   if (refresh) loadCharterRequests();

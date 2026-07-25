@@ -923,23 +923,17 @@ input.is-invalid {
 .station-flag.is-start .station-flag-cloth { background: #2563eb; }
 .station-flag.is-end .station-flag-cloth { background: #dc2626; }
 
-/* Bến thuộc yêu cầu charter: cờ cam, cao hơn, kèm số thứ tự. */
+/* Bến thuộc yêu cầu charter: cùng lá cờ, chỉ đổi màu + thêm số thứ tự. */
 .station-flag.is-charter {
-  width: 46px;
-  height: 48px;
+  width: 40px;
 }
 
 .station-flag.is-charter .station-flag-pole {
-  height: 48px;
   background: #9a3412;
 }
 
 .station-flag.is-charter .station-flag-cloth {
   background: #ea580c;
-  height: 17px;
-  min-width: 28px;
-  font-size: 10px;
-  line-height: 17px;
   box-shadow: 0 1px 4px rgba(154, 52, 18, 0.45);
 }
 
