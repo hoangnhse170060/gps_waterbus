@@ -3950,12 +3950,138 @@ function applyCharterStationsToForm(stops) {
   checkRouteCodeDuplicate();
 }
 
+function sameStationRef(a, b) {
+  if (!a || !b) return false;
+  const idA = String(a.stationId || '').trim();
+  const idB = String(b.stationId || '').trim();
+  if (idA && idB && idA === idB) return true;
+  const norm = (c) => String(c || '').trim().replace(/^ST-/i, '').toUpperCase();
+  const codeA = norm(a.stationCode);
+  const codeB = norm(b.stationCode);
+  return Boolean(codeA && codeB && codeA === codeB);
+}
+
+function nearestCoordIndex(coords, point) {
+  let bestIdx = -1;
+  let bestDist = Infinity;
+  (coords || []).forEach((c, idx) => {
+    const d = haversineMeters(c, point);
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = idx;
+    }
+  });
+  return { index: bestIdx, dist: bestDist };
+}
+
+/** Cắt geometry tuyến đã lưu giữa 2 bến (theo điểm gần nhất trên path). */
+function extractRouteCoordsBetween(route, fromStop, toStop) {
+  const coords = Array.isArray(route?.coordinates) ? route.coordinates : [];
+  if (coords.length < 2) return [];
+  const fromPt = {
+    lat: Number(fromStop.lat ?? fromStop.latitude),
+    lng: Number(fromStop.lng ?? fromStop.longitude),
+  };
+  const toPt = {
+    lat: Number(toStop.lat ?? toStop.latitude),
+    lng: Number(toStop.lng ?? toStop.longitude),
+  };
+  if (![fromPt.lat, fromPt.lng, toPt.lat, toPt.lng].every(Number.isFinite)) return [];
+  const a = nearestCoordIndex(coords, fromPt);
+  const b = nearestCoordIndex(coords, toPt);
+  if (a.index < 0 || b.index < 0) return [];
+  // Chỉ nhận nếu bến thật sự nằm gần path (tránh nhầm tuyến xa).
+  if (a.dist > 350 || b.dist > 350) return [];
+  const lo = Math.min(a.index, b.index);
+  const hi = Math.max(a.index, b.index);
+  if (hi - lo < 1) return [];
+  const slice = coords.slice(lo, hi + 1).map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }));
+  // Đảm bảo hướng from → to.
+  if (a.index > b.index) slice.reverse();
+  return slice;
+}
+
+/** Tìm tuyến DB chứa cả from→to (stopOrder tăng). */
+function findSavedSegmentBetween(fromStop, toStop) {
+  const routes = Array.isArray(latest?.routes) ? latest.routes : [];
+  let best = null;
+  for (const route of routes) {
+    const stops = [...(route.stops || [])].sort((a, b) => Number(a.stopOrder) - Number(b.stopOrder));
+    const fromIdx = stops.findIndex((s) => sameStationRef(s, fromStop));
+    const toIdx = stops.findIndex((s) => sameStationRef(s, toStop));
+    if (fromIdx < 0 || toIdx < 0 || fromIdx >= toIdx) continue;
+    const coords = extractRouteCoordsBetween(route, fromStop, toStop);
+    if (coords.length < 2) continue;
+    const span = toIdx - fromIdx;
+    const score = span * 10000 + coords.length;
+    if (!best || score < best.score) {
+      best = {
+        routeId: route.routeId,
+        routeCode: route.routeCode || route.routeName || route.routeId,
+        coords,
+        score,
+        span,
+      };
+    }
+  }
+  return best;
+}
+
+/**
+ * Ghép các đoạn tuyến đã có giữa các cặp bến charter liên tiếp.
+ * prefixStitched = các đoạn khớp liên tục từ bến đầu (để nạp vào bản vẽ).
+ * Đoạn thiếu / đoạn khớp sau khoảng trống → missingLegs / laterMatched.
+ */
+function buildCharterPathFromSavedRoutes(stops) {
+  const ordered = charterStopsAsOrdered(stops);
+  const matchedLegs = [];
+  const missingLegs = [];
+  const laterMatched = [];
+  const prefixStitched = [];
+  let gapHit = false;
+
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    const from = ordered[i];
+    const to = ordered[i + 1];
+    const label = `${from.stationCode || from.stationName} → ${to.stationCode || to.stationName}`;
+    const seg = findSavedSegmentBetween(from, to);
+    if (!seg) {
+      gapHit = true;
+      missingLegs.push({ from, to, label });
+      continue;
+    }
+    const leg = {
+      from,
+      to,
+      label,
+      routeCode: seg.routeCode,
+      routeId: seg.routeId,
+      coords: seg.coords,
+    };
+    matchedLegs.push(leg);
+    if (!gapHit) {
+      if (!prefixStitched.length) prefixStitched.push(...seg.coords);
+      else prefixStitched.push(...seg.coords.slice(1));
+    } else {
+      laterMatched.push(leg);
+    }
+  }
+
+  return {
+    ordered,
+    stitched: prefixStitched,
+    matchedLegs,
+    missingLegs,
+    laterMatched,
+  };
+}
+
 function loadCandidateIntoCapture(coords, stops) {
   if (!coords || coords.length < 2) return false;
   clearCapturePoints();
-  coords.forEach((point, index) => {
+  coords.forEach((point) => {
     addCapturePoint({ lat: point.lat, lng: point.lng }, {
-      source: index === 0 ? 'manual' : 'manual',
+      source: 'manual',
     });
   });
   // Gắn nhãn bến gần điểm path.
@@ -4000,11 +4126,21 @@ function updateCharterActiveBanner() {
     .map((s) => s.stationCode || s.stationName)
     .filter(Boolean)
     .join(' → ');
-  const hasCandidate = candidateRouteCoordinates(activeCharterRequest).length >= 2;
-    if (charterActiveMetaEl) {
-    charterActiveMetaEl.textContent = hasCandidate
-      ? `${stopNames || '—'} · đã nạp candidate`
-      : `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
+  const match = activeCharterRequest._savedMatch;
+  const hasCandidate = candidateRouteCoordinates(activeCharterRequest).length >= 2
+    || (match?.stitched?.length >= 2);
+  if (charterActiveMetaEl) {
+    if (match?.matchedLegs?.length && match?.missingLegs?.length) {
+      const ok = match.matchedLegs.map((l) => l.label).join(', ');
+      const miss = match.missingLegs.map((l) => l.label).join(', ');
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã gắn: ${ok} · còn vẽ: ${miss}`;
+    } else if (match?.matchedLegs?.length) {
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã gắn đủ đoạn từ tuyến có sẵn`;
+    } else if (hasCandidate) {
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã nạp candidate`;
+    } else {
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
+    }
   }
   charterRequestListEl?.querySelectorAll('.charter-request-item').forEach((btn) => {
     btn.classList.toggle('is-active', btn.dataset.requestId === activeCharterRequest.requestId);
@@ -4066,16 +4202,58 @@ async function openCharterRequest(requestId) {
     applyCharterStationsToForm(detail.stops || []);
     renderCharterStopPins(detail.stops || []);
 
-    const coords = candidateRouteCoordinates(detail);
+    let coords = candidateRouteCoordinates(detail);
+    let fromSaved = false;
+    let savedMatch = null;
+    if (coords.length < 2) {
+      savedMatch = buildCharterPathFromSavedRoutes(detail.stops || []);
+      detail._savedMatch = savedMatch;
+      activeCharterRequest._savedMatch = savedMatch;
+      if (savedMatch.stitched.length >= 2) {
+        coords = savedMatch.stitched;
+        fromSaved = true;
+      }
+    }
+
     if (coords.length >= 2) {
       renderCharterCandidatePreview(coords);
+      // Preview thêm các đoạn khớp sau khoảng trống (nếu có).
+      (savedMatch?.laterMatched || []).forEach((leg) => {
+        if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
+      });
       loadCandidateIntoCapture(coords, detail.stops || []);
-      captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu.';
-      notifyOk('Đã nổi bến + path sẵn từ candidate');
+      if (fromSaved && savedMatch?.missingLegs?.length) {
+        const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
+        const ok = savedMatch.matchedLegs
+          .filter((l) => !savedMatch.laterMatched?.some((x) => x.label === l.label))
+          .map((l) => `${l.label} (${l.routeCode})`)
+          .join(', ');
+        setDrawTool('draw');
+        captureStatusEl.textContent = ok
+          ? `Charter: đã gắn ${ok}. Còn vẽ: ${miss}`
+          : `Charter: còn vẽ ${miss} (đoạn sau đã có sẵn trên map)`;
+        notifyOk(ok ? `Đã gắn đoạn có sẵn — còn vẽ: ${miss}` : `Còn vẽ: ${miss}`);
+      } else if (fromSaved) {
+        captureStatusEl.textContent = 'Charter: đã gắn đủ path từ tuyến có sẵn — kiểm tra rồi lưu.';
+        notifyOk('Đã gắn path từ tuyến có sẵn trên map');
+      } else {
+        captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu.';
+        notifyOk('Đã nổi bến + path sẵn từ candidate');
+      }
     } else {
+      // Không có prefix, nhưng có đoạn sau — chỉ preview để biết.
+      (savedMatch?.matchedLegs || []).forEach((leg) => {
+        if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
+      });
       setDrawTool('draw');
-      captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
-      notifyInfo('Chưa có path sẵn — hãy vẽ tuyến giữa các bến');
+      if (savedMatch?.matchedLegs?.length && savedMatch?.missingLegs?.length) {
+        const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
+        captureStatusEl.textContent = `Charter: vẽ trước ${miss} (đoạn sau đã có tuyến sẵn).`;
+        notifyInfo(`Còn phải vẽ: ${miss}`);
+      } else {
+        captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
+        notifyInfo('Chưa có path sẵn — hãy vẽ tuyến giữa các bến');
+      }
     }
     updateCharterActiveBanner();
     updateWorkflow('draw');
