@@ -5726,22 +5726,25 @@ function listCharterDrawRequests(statusFilter = 'Pending') {
 
 function extractAccessToken(data) {
   if (!data || typeof data !== 'object') return null;
-  return cleanOptionalText(
-    data.accessToken
-    || data.AccessToken
-    || data.token
-    || data.Token
-    || data.access_token
-    || data.jwt
-    || data.tokens?.accessToken
+  // Không dùng cleanOptionalText — hàm đó slice(0, 240) làm cụt JWT (~700+) → BE 401.
+  const raw = (
+    data.tokens?.accessToken
     || data.Tokens?.accessToken
     || data.tokens?.AccessToken
+    || data.accessToken
+    || data.AccessToken
+    || data.access_token
+    || data.token
+    || data.Token
+    || data.jwt
+    || data.data?.tokens?.accessToken
     || data.data?.accessToken
     || data.data?.token
-    || data.data?.tokens?.accessToken
     || data.result?.accessToken
-    || data.auth?.accessToken,
+    || data.auth?.accessToken
   );
+  const token = String(raw ?? '').trim();
+  return token || null;
 }
 
 function readAzureAdminCredentials() {
