@@ -3633,7 +3633,12 @@ function renderStations(stations) {
   const seen = new Set();
   const startId = startStationEl.value;
   const endId = endStationEl.value;
+  const charterOnly = charterStopOrders.size > 0;
   for (const station of uniqueStations(stations)) {
+    // Đang mở yêu cầu charter → chỉ hiện bến thuộc request, ẩn bến không liên quan.
+    if (charterOnly && !charterStopOrders.has(String(station.stationId))) {
+      continue;
+    }
     seen.add(station.stationId);
     // Bến thuộc yêu cầu charter → đổi màu chính lá cờ đó (không chèn cờ thứ 2).
     const charterOrder = charterStopOrders.get(String(station.stationId)) || null;
@@ -3664,6 +3669,7 @@ function renderStations(stations) {
     } else {
       layer.setIcon(icon);
       layer.setLatLng([station.lat, station.lng]);
+      if (!map.hasLayer(layer)) layer.addTo(map);
     }
   }
   for (const [id, layer] of stationLayers) {
@@ -3695,6 +3701,10 @@ function stationFlagIcon(station, role = '', order = null) {
 }
 
 function handleStationClick(station) {
+  if (charterStopOrders.size && !charterStopOrders.has(String(station.stationId))) {
+    notifyWarn('Đang mở yêu cầu charter — chỉ dùng các bến của request.');
+    return;
+  }
   if (!captureState.points.length || captureState.points[0]?.source !== 'station') {
     setStationComboValue('start', station.stationId);
     return;
@@ -3786,6 +3796,10 @@ function insertViaBeforeEnd(station) {
 }
 
 function handleStationDoubleClick(station) {
+  if (charterStopOrders.size && !charterStopOrders.has(String(station.stationId))) {
+    notifyWarn('Đang mở yêu cầu charter — chỉ dùng các bến của request.');
+    return;
+  }
   if (!captureState.points.length || captureState.points[0]?.source !== 'station') {
     setStationComboValue('start', station.stationId);
     return;
