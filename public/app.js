@@ -3879,20 +3879,27 @@ function renderCharterStopPins(stops) {
   ordered.forEach((stop) => {
     if (!Number.isFinite(stop.lat) || !Number.isFinite(stop.lng)) return;
     bounds.push([stop.lat, stop.lng]);
-    const label = stop.stationCode || String(stop.stopOrder);
+    const code = String(stop.stationCode || '').replace(/^ST-/i, '').slice(0, 4).toUpperCase();
+    const label = `${stop.stopOrder}·${code || '•'}`;
+    // Cờ cam cao hơn cờ bến thường → nhìn là biết bến thuộc yêu cầu charter.
     const marker = L.marker([stop.lat, stop.lng], {
       icon: L.divIcon({
-        className: 'charter-stop-pin',
-        html: `<span>${escapeHtml(label)}</span>`,
-        iconSize: [34, 34],
-        iconAnchor: [17, 17],
+        className: '',
+        html: `
+          <div class="station-flag is-charter">
+            <div class="station-flag-pole"></div>
+            <div class="station-flag-cloth">${escapeHtml(label)}</div>
+          </div>
+        `,
+        iconSize: [46, 48],
+        iconAnchor: [5, 48],
       }),
-      zIndexOffset: 800,
+      zIndexOffset: 900,
     });
     const stay = stop.stayDurationMinutes != null ? ` · dừng ${stop.stayDurationMinutes}p` : '';
     marker.bindTooltip(
       `#${stop.stopOrder} ${stop.stationName || stop.stationCode || stop.stationId}${stay}`,
-      { direction: 'top', offset: [0, -12] },
+      { direction: 'top', offset: [0, -44] },
     );
     charterStopLayer.addLayer(marker);
   });
