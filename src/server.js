@@ -78,7 +78,7 @@ const state = {
     lastEventAt: null,
     transport: null,
   },
-  targetBearerToken: String(env.TARGET_BEARER_TOKEN || env.AZURE_BEARER_TOKEN || '').trim(),
+  targetBearerToken: '',
   azureAdminTokenAt: null,
   liveHookSecret: String(env.LIVE_HOOK_SECRET || '').trim(),
   /** Yêu cầu vẽ charter BE push vào GPS (không poll /admin — admin path cần JWT). */
@@ -5782,13 +5782,14 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
     return { ok: true, token: state.targetBearerToken, cached: true };
   }
   if (!user || !pass) {
-    if (state.targetBearerToken) {
+    // force=true mà thiếu creds: KHÔNG trả JWT env cũ (hay hết hạn → 401 giả).
+    if (!force && state.targetBearerToken) {
       return { ok: true, token: state.targetBearerToken, cached: true };
     }
     return {
       ok: false,
       status: 401,
-      error: 'Thiếu AZURE_ADMIN_EMAIL + AZURE_ADMIN_PASSWORD trên Railway (hoặc TARGET_BEARER_TOKEN)',
+      error: 'Thiếu AZURE_ADMIN_EMAIL + AZURE_ADMIN_PASSWORD trên Railway. Xóa TARGET_BEARER_TOKEN cũ nếu đang set.',
     };
   }
   // Contract BE: { emailOrPhone, password } → { tokens: { accessToken } }
