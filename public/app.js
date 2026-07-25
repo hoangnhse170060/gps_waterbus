@@ -4252,9 +4252,63 @@ function updateCharterActiveBanner() {
 function clearActiveCharterRequest({ refresh = false } = {}) {
   activeCharterRequest = null;
   clearCharterMapLayers({ resetFlags: true });
+  // Bỏ chọn → cờ về màu thường, xóa path gắn tạm, reset bến form.
+  if (!recordingActive && !lockedSurveyPath) {
+    clearCapturePoints();
+    setStationComboValue('start', '', { emitChange: false });
+    setStationComboValue('end', '', { emitChange: false });
+    selectedStartStationId = '';
+    selectedEndStationId = '';
+    syncEndStationDisplay?.();
+    if (captureRouteCodeEl) captureRouteCodeEl.value = '';
+    if (captureRouteNameEl) captureRouteNameEl.value = '';
+    if (latest?.stations) renderStations(latest.stations);
+  }
+  clearCharterMatchedRouteHighlight();
   updateCharterActiveBanner();
   updateRouteTypeHint();
+  checkRouteCodeDuplicate();
   if (refresh) loadCharterRequests();
+}
+
+/** Nổi các tuyến DB đã khớp với charter (chứng minh đoạn đã có sẵn / đủ). */
+function highlightCharterMatchedRoutes(savedMatch) {
+  const ids = [...new Set(
+    (savedMatch?.matchedLegs || [])
+      .map((leg) => String(leg.routeId || ''))
+      .filter(Boolean),
+  )];
+  if (!ids.length) return;
+  if (!showSavedRoutes) {
+    showSavedRoutes = true;
+    applySavedRoutesVisibility();
+  }
+  const idSet = new Set(ids);
+  for (const [id, layer] of routeLayers) {
+    if (idSet.has(String(id))) {
+      if (!map.hasLayer(layer)) layer.addTo(map);
+      layer.setStyle({
+        color: '#dc2626',
+        weight: 5,
+        opacity: 0.55,
+        dashArray: null,
+        smoothFactor: 0,
+      });
+      layer.bringToFront();
+    } else if (showSavedRoutes) {
+      layer.setStyle({ ...DIMMED_ROUTE_STYLE, smoothFactor: 0 });
+    }
+  }
+  if (mapLegendSelectEl && ids[0]) {
+    mapLegendSelectEl.value = ids[0];
+    selectedRouteId = ids[0];
+    updateLegendSwatch();
+  }
+}
+
+function clearCharterMatchedRouteHighlight() {
+  applySelectedRouteHighlight(selectedRouteId || '');
+  applySavedRoutesVisibility();
 }
 
 async function completeCharterRequest(requestId, routeId) {
@@ -4315,6 +4369,8 @@ async function openCharterRequest(requestId) {
         coords = savedMatch.stitched;
         fromSaved = true;
       }
+      // Hiện route DB đã khớp → nhìn thấy đoạn nào đã đủ.
+      highlightCharterMatchedRoutes(savedMatch);
     }
 
     if (coords.length >= 2) {
