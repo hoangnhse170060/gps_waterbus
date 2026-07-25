@@ -4094,7 +4094,7 @@ function renderCharterRequestList(items) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) {
     charterRequestListEl.classList.add('is-empty');
-    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không có yêu cầu Pending.</li>';
+    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không có yêu cầu cần vẽ (Pending / InProgress).</li>';
     return;
   }
   charterRequestListEl.classList.remove('is-empty');
@@ -4104,12 +4104,13 @@ function renderCharterRequestList(items) {
     const stopCount = Array.isArray(item.stops) ? item.stops.length : (item.stopCount || '');
     const stopsHint = stopCount ? `${stopCount} bến` : 'mở để xem bến';
     const route = charterRouteState(item);
+    const st = String(item.status || 'Pending');
     return `
       <li>
         <button type="button" class="charter-request-item${activeCharterRequest?.requestId === id ? ' is-active' : ''}" data-request-id="${escapeHtml(id)}">
           <strong>${escapeHtml(code)}</strong>
           <span class="charter-status ${route.cls}">${escapeHtml(route.label)}</span>
-          <small>${escapeHtml(stopsHint)} · ${escapeHtml(id)}</small>
+          <small>${escapeHtml(st)} · ${escapeHtml(stopsHint)} · ${escapeHtml(id)}</small>
         </button>
       </li>
     `;
@@ -4119,17 +4120,32 @@ function renderCharterRequestList(items) {
   });
 }
 
+async function fetchCharterListByStatus(status) {
+  const response = await fetch(`/api/charter/route-draw-requests?status=${encodeURIComponent(status)}`);
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return Array.isArray(body.items) ? body.items : [];
+}
+
 async function loadCharterRequests() {
   if (!charterRequestListEl) return;
-  // GPS chỉ vẽ — luôn lấy Pending, không UI đổi/lọc status.
-  const status = 'Pending';
+  // Mở request → BE chuyển InProgress; nếu chỉ poll Pending thì reload sẽ trống.
   charterRequestListEl.classList.add('is-empty');
   charterRequestListEl.innerHTML = '<li class="charter-request-empty">Đang tải yêu cầu…</li>';
   try {
-    const response = await fetch(`/api/charter/route-draw-requests?status=${encodeURIComponent(status)}`);
-    const body = await response.json();
-    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
-    renderCharterRequestList(body.items || []);
+    const [pending, inProgress] = await Promise.all([
+      fetchCharterListByStatus('Pending'),
+      fetchCharterListByStatus('InProgress'),
+    ]);
+    const byId = new Map();
+    for (const item of [...pending, ...inProgress]) {
+      const id = item.requestId || item.id;
+      if (id) byId.set(id, item);
+    }
+    const merged = [...byId.values()].sort((a, b) => (
+      String(b.createdAt || b.inProgressAt || '').localeCompare(String(a.createdAt || a.inProgressAt || ''))
+    ));
+    renderCharterRequestList(merged);
   } catch (error) {
     charterRequestListEl.innerHTML = `<li class="charter-request-empty">Lỗi: ${escapeHtml(error.message)}</li>`;
   }
