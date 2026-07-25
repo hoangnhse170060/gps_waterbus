@@ -441,7 +441,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/charter/auth/login' && req.method === 'POST') {
       const body = await readJson(req);
       const result = await loginAzureAdmin({
-        email: body.email || body.username || body.emailOrPhone,
+        email: body.email || body.username || body.emailOrPhone || body.phone,
         password: body.password,
         force: true,
       });
@@ -6838,8 +6838,10 @@ function publicConfig() {
       ...state.incidentsHubStatus,
     },
     hasBearerToken: Boolean(state.targetBearerToken),
-    hasLiveHookSecret: Boolean(state.liveHookSecret || env.LIVE_HOOK_SECRET),
-    incidentReceiveMode: (state.liveHookSecret || env.LIVE_HOOK_SECRET)
+    hasAzureAdminEmail: Boolean(readAzureAdminCredentials().user),
+    hasAzureAdminPassword: Boolean(readAzureAdminCredentials().pass),
+    hasLiveHookSecret: Boolean(state.liveHookSecret || env.LIVE_HOOK_SECRET || process.env.LIVE_HOOK_SECRET),
+    incidentReceiveMode: (state.liveHookSecret || env.LIVE_HOOK_SECRET || process.env.LIVE_HOOK_SECRET)
       ? 'hook'
       : (state.targetBearerToken ? 'jwt' : 'local'),
     openIncidentCount: state.openIncidents.size,
