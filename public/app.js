@@ -114,6 +114,7 @@ const stationLayers = new Map();
 const captureMarkers = [];
 const controlMarkers = [];
 let captureLine = null;
+let captureAttachedLine = null;
 let helperCurveLine = null;
 let plannedRouteLine = null;
 let completedRouteLine = null; // sau khi chạy xong: chỉ còn đường liền (bỏ điểm số)
@@ -165,6 +166,8 @@ const captureState = {
   selectedSegmentIndex: null,
   selectedWaypointIndex: null,
   points: [],
+  /** Số điểm đầu là đoạn đã gắn từ tuyến có sẵn (đỏ mờ, ẩn marker). */
+  attachedCount: 0,
 };
 
 const SAVED_ROUTE_STYLE = {
@@ -190,6 +193,13 @@ const DRAFT_ROUTE_STYLE = {
   weight: 5,
   opacity: 0.95,
   dashArray: '10 8',
+};
+/** Đoạn charter đã gắn từ tuyến có sẵn — đỏ mờ, không hiện điểm số. */
+const ATTACHED_ROUTE_STYLE = {
+  color: '#dc2626',
+  weight: 4,
+  opacity: 0.38,
+  dashArray: null,
 };
 /** Đang chạy / đã xong: đường liền (không còn nét đứt + điểm số). */
 const SURVEY_ROUTE_STYLE = {
@@ -1767,6 +1777,7 @@ function addCapturePoint(latlng, meta = {}) {
     label: meta.label || null,
     stationId: meta.stationId || null,
     accuracy: meta.accuracy || null,
+    attached: Boolean(meta.attached),
     segmentType: null,
     controlLat: null,
     controlLng: null,
@@ -1986,6 +1997,10 @@ function renderCaptureLine() {
     captureLine.remove();
     captureLine = null;
   }
+  if (captureAttachedLine) {
+    captureAttachedLine.remove();
+    captureAttachedLine = null;
+  }
   if (helperCurveLine) {
     helperCurveLine.remove();
     helperCurveLine = null;
@@ -2001,22 +2016,60 @@ function renderCaptureLine() {
     path = expandPath(captureState.points);
   }
   if (!path || path.length < 2) return;
-  const isDone = captureState.finished || running;
-  const style = isDone
-    ? { ...SURVEY_ROUTE_STYLE }
-    : { ...DRAFT_ROUTE_STYLE };
-  captureLine = L.polyline(
-    path.map((p) => [p.lat, p.lng]),
-    {
-      ...style,
-      weight: isDone ? 6 : 4.5,
-      interactive: false,
-      smoothFactor: 0,
-    },
-  );
-  // Vẽ xong (đã hoàn tất/đang chạy): theo đúng toggle ẩn/hiện tuyến.
-  // Đang vẽ dở (chưa xong): luôn hiện để còn thấy điểm vừa chấm.
-  if (!isDone || showSavedRoutes) captureLine.addTo(map);
+
+  const attachedN = Math.max(0, Math.min(
+    Number(captureState.attachedCount) || 0,
+    captureState.points.length,
+  ));
+  const showAttachedSplit = !running && !riverPathOverride && attachedN >= 2;
+
+  if (showAttachedSplit) {
+    const attachedPts = captureState.points.slice(0, attachedN);
+    const attachedPath = expandPath(attachedPts);
+    if (attachedPath.length >= 2) {
+      captureAttachedLine = L.polyline(
+        attachedPath.map((p) => [p.lat, p.lng]),
+        {
+          ...ATTACHED_ROUTE_STYLE,
+          interactive: false,
+          smoothFactor: 0,
+        },
+      ).addTo(map);
+    }
+    // Phần đang vẽ tiếp (có chồng 1 điểm nối).
+    if (captureState.points.length > attachedN) {
+      const restPts = captureState.points.slice(Math.max(0, attachedN - 1));
+      const restPath = expandPath(restPts);
+      if (restPath.length >= 2) {
+        const isDone = captureState.finished;
+        captureLine = L.polyline(
+          restPath.map((p) => [p.lat, p.lng]),
+          {
+            ...(isDone ? SURVEY_ROUTE_STYLE : DRAFT_ROUTE_STYLE),
+            weight: isDone ? 6 : 4.5,
+            interactive: false,
+            smoothFactor: 0,
+          },
+        );
+        if (!isDone || showSavedRoutes) captureLine.addTo(map);
+      }
+    }
+  } else {
+    const isDone = captureState.finished || running;
+    const style = isDone
+      ? { ...SURVEY_ROUTE_STYLE }
+      : { ...DRAFT_ROUTE_STYLE };
+    captureLine = L.polyline(
+      path.map((p) => [p.lat, p.lng]),
+      {
+        ...style,
+        weight: isDone ? 6 : 4.5,
+        interactive: false,
+        smoothFactor: 0,
+      },
+    );
+    if (!isDone || showSavedRoutes) captureLine.addTo(map);
+  }
 
   const idx = captureState.selectedSegmentIndex;
   if (!running && !riverPathOverride && idx > 0 && captureState.points[idx]?.segmentType === 'curve') {
@@ -2125,11 +2178,16 @@ function rebuildCaptureMarkers() {
   }
 
   const last = captureState.points.length - 1;
+  const attachedN = Math.max(0, Number(captureState.attachedCount) || 0);
   captureState.points.forEach((point, index) => {
     // Đã hoàn thành vẽ: chỉ giữ bến đầu/cuối dạng cờ, ẩn điểm trung gian.
     const isStation = point.source === 'station'
       || point.source === 'station-via'
       || point.source === 'station-end';
+    // Đoạn đã gắn từ tuyến có sẵn: không hiện chấm số đen (trông như lỗi).
+    if (point.attached || point.source === 'attached' || (attachedN > 0 && index < attachedN && !isStation)) {
+      return;
+    }
     if (captureState.finished && !isStation && index !== 0 && index !== last) return;
 
     const selected = captureState.selectedWaypointIndex === index;
@@ -2167,6 +2225,11 @@ function clearCapturePoints() {
   clearControlMarkers();
   captureState.points = [];
   captureState.finished = false;
+  captureState.attachedCount = 0;
+  if (captureAttachedLine) {
+    captureAttachedLine.remove();
+    captureAttachedLine = null;
+  }
   captureState.selectedSegmentIndex = null;
   captureState.selectedWaypointIndex = null;
   riverPathOverride = null;
@@ -4076,15 +4139,19 @@ function buildCharterPathFromSavedRoutes(stops) {
   };
 }
 
-function loadCandidateIntoCapture(coords, stops) {
+function loadCandidateIntoCapture(coords, stops, { markAttached = false } = {}) {
   if (!coords || coords.length < 2) return false;
   clearCapturePoints();
   coords.forEach((point) => {
     addCapturePoint({ lat: point.lat, lng: point.lng }, {
-      source: 'manual',
+      source: markAttached ? 'attached' : 'manual',
+      attached: markAttached,
     });
   });
-  // Gắn nhãn bến gần điểm path.
+  if (markAttached) {
+    captureState.attachedCount = captureState.points.length;
+  }
+  // Gắn nhãn bến gần điểm path (giữ attached để ẩn chấm số).
   const ordered = charterStopsAsOrdered(stops);
   ordered.forEach((stop) => {
     if (!Number.isFinite(stop.lat) || !Number.isFinite(stop.lng)) return;
@@ -4102,9 +4169,20 @@ function loadCandidateIntoCapture(coords, stops) {
     point.stationId = stop.stationId;
     point.label = stop.stationName;
     point.source = stop.isFirst ? 'station' : (stop.isLast ? 'station-end' : 'station-via');
+    if (markAttached) point.attached = true;
   });
   applyCharterStationsToForm(stops);
-  finishDraw();
+  if (markAttached) {
+    // Giữ chế độ vẽ tiếp — không finishDraw (tránh rồi setDraw lại hiện hết điểm).
+    captureState.finished = false;
+    captureState.selectedWaypointIndex = captureState.points.length - 1;
+    captureState.selectedSegmentIndex = captureState.points.length > 1
+      ? captureState.points.length - 1
+      : null;
+    rebuildCaptureMarkers();
+  } else {
+    finishDraw();
+  }
   renderCaptureState();
   return true;
 }
@@ -4221,7 +4299,7 @@ async function openCharterRequest(requestId) {
       (savedMatch?.laterMatched || []).forEach((leg) => {
         if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
       });
-      loadCandidateIntoCapture(coords, detail.stops || []);
+      loadCandidateIntoCapture(coords, detail.stops || [], { markAttached: fromSaved });
       if (fromSaved && savedMatch?.missingLegs?.length) {
         const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
         const ok = savedMatch.matchedLegs
@@ -4229,12 +4307,13 @@ async function openCharterRequest(requestId) {
           .map((l) => `${l.label} (${l.routeCode})`)
           .join(', ');
         setDrawTool('draw');
+        // Giữ attachedCount sau setDrawTool (tool chỉ bật chế độ vẽ, không xóa points).
         captureStatusEl.textContent = ok
-          ? `Charter: đã gắn ${ok}. Còn vẽ: ${miss}`
+          ? `Charter: đã gắn ${ok} (đỏ mờ). Còn vẽ: ${miss}`
           : `Charter: còn vẽ ${miss} (đoạn sau đã có sẵn trên map)`;
-        notifyOk(ok ? `Đã gắn đoạn có sẵn — còn vẽ: ${miss}` : `Còn vẽ: ${miss}`);
+        notifyOk(ok ? `Đã gắn đoạn có sẵn (đỏ mờ) — còn vẽ: ${miss}` : `Còn vẽ: ${miss}`);
       } else if (fromSaved) {
-        captureStatusEl.textContent = 'Charter: đã gắn đủ path từ tuyến có sẵn — kiểm tra rồi lưu.';
+        captureStatusEl.textContent = 'Charter: đã gắn đủ path từ tuyến có sẵn (đỏ mờ) — kiểm tra rồi lưu.';
         notifyOk('Đã gắn path từ tuyến có sẵn trên map');
       } else {
         captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu.';
