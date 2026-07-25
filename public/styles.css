@@ -1361,6 +1361,21 @@ input.is-invalid {
   color: #1d4ed8;
 }
 
+.charter-request-item .charter-status.is-done {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.charter-request-item .charter-status.is-candidate {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.charter-request-item .charter-status.is-empty-route {
+  background: #fef3c7;
+  color: #b45309;
+}
+
 .charter-active-banner {
   display: grid;
   gap: 8px;

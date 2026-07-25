@@ -4077,6 +4077,18 @@ async function openCharterRequest(requestId) {
   }
 }
 
+/** Trạng thái tuyến của 1 yêu cầu charter (dựa field list/detail của BE). */
+function charterRouteState(item) {
+  const has = (v) => v != null && v !== '' && v !== false;
+  const hasResult = has(item?.resultRouteId) || has(item?.resultRoute);
+  const hasCandidate = has(item?.candidateRouteId) || has(item?.candidateRoute)
+    || (Array.isArray(item?.candidateLegs)
+      && item.candidateLegs.some((leg) => Array.isArray(leg?.candidates) && leg.candidates.length));
+  if (hasResult) return { label: '✓ Đã vẽ xong', cls: 'is-done' };
+  if (hasCandidate) return { label: 'Có tuyến gợi ý', cls: 'is-candidate' };
+  return { label: 'Chưa có tuyến', cls: 'is-empty-route' };
+}
+
 function renderCharterRequestList(items) {
   if (!charterRequestListEl) return;
   const list = Array.isArray(items) ? items : [];
@@ -4091,10 +4103,12 @@ function renderCharterRequestList(items) {
     const code = item.bookingCode || item.bookingId || id;
     const stopCount = Array.isArray(item.stops) ? item.stops.length : (item.stopCount || '');
     const stopsHint = stopCount ? `${stopCount} bến` : 'mở để xem bến';
+    const route = charterRouteState(item);
     return `
       <li>
         <button type="button" class="charter-request-item${activeCharterRequest?.requestId === id ? ' is-active' : ''}" data-request-id="${escapeHtml(id)}">
           <strong>${escapeHtml(code)}</strong>
+          <span class="charter-status ${route.cls}">${escapeHtml(route.label)}</span>
           <small>${escapeHtml(stopsHint)} · ${escapeHtml(id)}</small>
         </button>
       </li>
