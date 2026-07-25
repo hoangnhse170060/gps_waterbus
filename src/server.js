@@ -79,6 +79,7 @@ const state = {
     transport: null,
   },
   targetBearerToken: String(env.TARGET_BEARER_TOKEN || env.AZURE_BEARER_TOKEN || '').trim(),
+  azureAdminTokenAt: null,
   liveHookSecret: String(env.LIVE_HOOK_SECRET || '').trim(),
   /** Yêu cầu vẽ charter BE push vào GPS (không poll /admin — admin path cần JWT). */
   charterDrawRequests: new Map(),
@@ -440,7 +441,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/charter/auth/login' && req.method === 'POST') {
       const body = await readJson(req);
       const result = await loginAzureAdmin({
-        email: body.email || body.username,
+        email: body.email || body.username || body.emailOrPhone,
         password: body.password,
         force: true,
       });
@@ -449,6 +450,22 @@ const server = createServer(async (req, res) => {
         error: result.error || null,
         hasToken: Boolean(state.targetBearerToken),
       }, result.ok ? 200 : (result.status || 401));
+    }
+    if (url.pathname === '/api/charter/auth/status' && req.method === 'GET') {
+      const creds = readAzureAdminCredentials();
+      return sendJson(res, {
+        ok: true,
+        hasAdminEmail: Boolean(creds.user),
+        adminEmailHint: creds.user
+          ? `${String(creds.user).slice(0, 3)}…${String(creds.user).slice(-2)}`
+          : null,
+        hasAdminPassword: Boolean(creds.pass),
+        hasBearerToken: Boolean(state.targetBearerToken),
+        tokenAgeSec: state.azureAdminTokenAt
+          ? Math.round((Date.now() - state.azureAdminTokenAt) / 1000)
+          : null,
+        targetApiRoot: getTargetApiRoot() || null,
+      });
     }
     if (url.pathname === '/api/charter/route-draw-requests' && req.method === 'GET') {
       const status = cleanOptionalText(url.searchParams.get('status')) || 'Pending';
@@ -2574,11 +2591,11 @@ async function requestTargetApi({
     if (auth === 'bearer') headers = buildBearerHeaders();
     else if (auth === 'hook') headers = buildHookHeaders();
     else if (auth === 'none') {
+      // Login: chỉ JSON — không gắn X-Api-Key (tránh BE reject / 401 lạ).
       headers = {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       };
-      if (state.targetApiKey) headers['X-Api-Key'] = state.targetApiKey;
     }
     else headers = buildGpsHeaders({ deviceId });
     const init = { method, headers };
@@ -5727,21 +5744,41 @@ function extractAccessToken(data) {
   );
 }
 
-async function loginAzureAdmin({ email, password, force = false } = {}) {
-  const user = cleanOptionalText(
-    email
+function readAzureAdminCredentials() {
+  // Đọc process.env lúc gọi (Railway inject) — không chỉ snapshot env lúc boot.
+  const rawUser = cleanOptionalText(
+    process.env.AZURE_ADMIN_EMAIL
+    || process.env.AZURE_ADMIN_USERNAME
+    || process.env.AZURE_ADMIN_PHONE
+    || process.env.TARGET_AUTH_EMAIL
+    || process.env.TARGET_AUTH_USERNAME
     || env.AZURE_ADMIN_EMAIL
     || env.AZURE_ADMIN_USERNAME
     || env.AZURE_ADMIN_PHONE
     || env.TARGET_AUTH_EMAIL
     || env.TARGET_AUTH_USERNAME,
   );
-  const pass = cleanOptionalText(
-    password
+  const rawPass = cleanOptionalText(
+    process.env.AZURE_ADMIN_PASSWORD
+    || process.env.TARGET_AUTH_PASSWORD
     || env.AZURE_ADMIN_PASSWORD
     || env.TARGET_AUTH_PASSWORD,
   );
-  if (!force && state.targetBearerToken) {
+  // Railway/UI đôi khi bọc "..." quanh value.
+  const strip = (v) => String(v || '').trim().replace(/^['"]|['"]$/g, '');
+  return { user: strip(rawUser), pass: strip(rawPass) };
+}
+
+async function loginAzureAdmin({ email, password, force = false } = {}) {
+  const fromEnv = readAzureAdminCredentials();
+  const user = cleanOptionalText(email) || fromEnv.user;
+  const pass = cleanOptionalText(password) || fromEnv.pass;
+  // Có admin creds → luôn login mới khi force; không giữ JWT env hết hạn.
+  if (!force && state.targetBearerToken && !fromEnv.user) {
+    return { ok: true, token: state.targetBearerToken, cached: true };
+  }
+  if (!force && state.targetBearerToken && state.azureAdminTokenAt
+    && (Date.now() - state.azureAdminTokenAt) < 10 * 60_000) {
     return { ok: true, token: state.targetBearerToken, cached: true };
   }
   if (!user || !pass) {
@@ -5751,7 +5788,7 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
     return {
       ok: false,
       status: 401,
-      error: 'Thiếu AZURE_ADMIN_EMAIL + AZURE_ADMIN_PASSWORD (hoặc TARGET_BEARER_TOKEN) để login BE',
+      error: 'Thiếu AZURE_ADMIN_EMAIL + AZURE_ADMIN_PASSWORD trên Railway (hoặc TARGET_BEARER_TOKEN)',
     };
   }
   // Contract BE: { emailOrPhone, password } → { tokens: { accessToken } }
@@ -5759,22 +5796,30 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
     emailOrPhone: user,
     password: pass,
   };
+  const loginPath = String(
+    process.env.AZURE_AUTH_LOGIN_PATH
+    || env.AZURE_AUTH_LOGIN_PATH
+    || '/api/auth/login',
+  ).trim() || '/api/auth/login';
   const result = await requestTargetApi({
     method: 'POST',
-    pathname: String(env.AZURE_AUTH_LOGIN_PATH || '/api/auth/login').trim() || '/api/auth/login',
+    pathname: loginPath,
     payload,
     auth: 'none',
   });
   if (!result.ok) {
+    const detail = result.error || `Login BE HTTP ${result.status}`;
+    console.warn(`[charter-auth] login fail user=${user}: ${detail}`);
     return {
       ok: false,
       status: result.status || 401,
-      error: result.error || 'Login BE thất bại',
+      error: `Login BE thất bại: ${detail}`,
       data: result.data,
     };
   }
   const token = extractAccessToken(result.data);
   if (!token) {
+    console.warn('[charter-auth] login 200 nhưng thiếu tokens.accessToken', Object.keys(result.data || {}));
     return {
       ok: false,
       status: 502,
@@ -5783,11 +5828,17 @@ async function loginAzureAdmin({ email, password, force = false } = {}) {
     };
   }
   state.targetBearerToken = token;
-  console.log('[charter-auth] Azure admin JWT sẵn sàng');
+  state.azureAdminTokenAt = Date.now();
+  console.log(`[charter-auth] JWT OK · user=${user} · len=${token.length}`);
   return { ok: true, token, cached: false };
 }
 
 async function ensureAzureAdminToken({ force = false } = {}) {
+  const { user, pass } = readAzureAdminCredentials();
+  // Có creds admin → ưu tiên login (đừng dùng TARGET_BEARER_TOKEN cũ/hết hạn).
+  if (user && pass) {
+    return loginAzureAdmin({ force: force || !state.targetBearerToken });
+  }
   if (!force && state.targetBearerToken) {
     return { ok: true, token: state.targetBearerToken };
   }
@@ -5795,13 +5846,18 @@ async function ensureAzureAdminToken({ force = false } = {}) {
 }
 
 async function charterAdminRequest(method, pathname, payload = null) {
-  let authed = await ensureAzureAdminToken();
+  let authed = await ensureAzureAdminToken({ force: true });
   if (!authed.ok) return authed;
   let result = await requestTargetApi({ method, pathname, payload, auth: 'bearer' });
   if (result.status === 401) {
+    console.warn(`[charter-auth] ${method} ${pathname} 401 → login lại`);
     authed = await loginAzureAdmin({ force: true });
     if (!authed.ok) return authed;
     result = await requestTargetApi({ method, pathname, payload, auth: 'bearer' });
+  }
+  if (!result.ok && result.status === 401) {
+    result.error = `${result.error || 'BE 401'}`
+      + ' · JWT login được nhưng API charter từ chối (kiểm tra role Admin / redeploy sau khi set biến)';
   }
   return result;
 }
