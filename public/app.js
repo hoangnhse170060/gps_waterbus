@@ -4235,25 +4235,26 @@ function updateCharterActiveBanner() {
   charterActiveBannerEl.hidden = false;
   charterActiveBannerEl.classList.remove('is-empty');
   const code = activeCharterRequest.bookingCode || activeCharterRequest.bookingId || activeCharterRequest.requestId;
+  const match = activeCharterRequest._savedMatch;
+  const fullyCovered = Boolean(match?.matchedLegs?.length && !match?.missingLegs?.length);
   if (charterActiveTitleEl) {
-    charterActiveTitleEl.textContent = `Đang vẽ · ${code}`;
+    charterActiveTitleEl.textContent = fullyCovered ? `Đang xem · ${code}` : `Đang vẽ · ${code}`;
   }
   const stopNames = charterStopsAsOrdered(activeCharterRequest.stops)
     .map((s) => s.stationCode || s.stationName)
     .filter(Boolean)
     .join(' → ');
-  const match = activeCharterRequest._savedMatch;
-  const hasCandidate = candidateRouteCoordinates(activeCharterRequest).length >= 2
-    || (match?.stitched?.length >= 2);
+  const hasCandidate = candidateRouteCoordinates(activeCharterRequest).length >= 2;
   if (charterActiveMetaEl) {
-    if (match?.matchedLegs?.length && match?.missingLegs?.length) {
-      const ok = match.matchedLegs.map((l) => l.label).join(', ');
+    if (fullyCovered) {
+      const ok = match.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã có sẵn: ${ok} — chỉ hiện, không chỉnh`;
+    } else if (match?.matchedLegs?.length && match?.missingLegs?.length) {
+      const ok = match.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
       const miss = match.missingLegs.map((l) => l.label).join(', ');
-      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã gắn: ${ok} · còn vẽ: ${miss}`;
-    } else if (match?.matchedLegs?.length) {
-      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã gắn đủ đoạn từ tuyến có sẵn`;
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · có sẵn: ${ok} · còn thiếu (mới vẽ): ${miss}`;
     } else if (hasCandidate) {
-      charterActiveMetaEl.textContent = `${stopNames || '—'} · đã nạp candidate`;
+      charterActiveMetaEl.textContent = `${stopNames || '—'} · có candidate từ BE — chỉ hiện`;
     } else {
       charterActiveMetaEl.textContent = `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
     }
@@ -4372,61 +4373,46 @@ async function openCharterRequest(requestId) {
     applyCharterStationsToForm(detail.stops || []);
     renderCharterStopPins(detail.stops || []);
 
-    let coords = candidateRouteCoordinates(detail);
-    let fromSaved = false;
+    // Route đã có → CHỈ HIỆN trên map. Không nạp vào bản vẽ / không chỉnh lại.
+    const beCoords = candidateRouteCoordinates(detail);
     let savedMatch = null;
-    if (coords.length < 2) {
-      savedMatch = buildCharterPathFromSavedRoutes(detail.stops || []);
-      detail._savedMatch = savedMatch;
-      activeCharterRequest._savedMatch = savedMatch;
-      if (savedMatch.stitched.length >= 2) {
-        coords = savedMatch.stitched;
-        fromSaved = true;
-      }
-      // Hiện route DB đã khớp → nhìn thấy đoạn nào đã đủ.
-      highlightCharterMatchedRoutes(savedMatch);
+    if (beCoords.length >= 2) {
+      renderCharterCandidatePreview(beCoords);
+      captureStatusEl.textContent = 'Charter: đã có candidate — chỉ hiện, không chỉnh route có sẵn.';
+      notifyOk('Đã hiện route có sẵn (không chỉnh)');
+      updateCharterActiveBanner();
+      updateWorkflow('draw');
+      return;
     }
 
-    if (coords.length >= 2) {
-      renderCharterCandidatePreview(coords);
-      // Preview thêm các đoạn khớp sau khoảng trống (nếu có).
-      (savedMatch?.laterMatched || []).forEach((leg) => {
-        if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
-      });
-      loadCandidateIntoCapture(coords, detail.stops || [], { markAttached: fromSaved });
-      if (fromSaved && savedMatch?.missingLegs?.length) {
-        const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
-        const ok = savedMatch.matchedLegs
-          .filter((l) => !savedMatch.laterMatched?.some((x) => x.label === l.label))
-          .map((l) => `${l.label} (${l.routeCode})`)
-          .join(', ');
-        setDrawTool('draw');
-        // Giữ attachedCount sau setDrawTool (tool chỉ bật chế độ vẽ, không xóa points).
-        captureStatusEl.textContent = ok
-          ? `Charter: đã gắn ${ok} (đỏ mờ). Còn vẽ: ${miss}`
-          : `Charter: còn vẽ ${miss} (đoạn sau đã có sẵn trên map)`;
-        notifyOk(ok ? `Đã gắn đoạn có sẵn (đỏ mờ) — còn vẽ: ${miss}` : `Còn vẽ: ${miss}`);
-      } else if (fromSaved) {
-        captureStatusEl.textContent = 'Charter: đã gắn đủ path từ tuyến có sẵn (đỏ mờ) — kiểm tra rồi lưu.';
-        notifyOk('Đã gắn path từ tuyến có sẵn trên map');
-      } else {
-        captureStatusEl.textContent = 'Charter: đã nạp candidate — chỉnh nếu cần rồi ghi GPS & lưu.';
-        notifyOk('Đã nổi bến + path sẵn từ candidate');
-      }
-    } else {
-      // Không có prefix, nhưng có đoạn sau — chỉ preview để biết.
-      (savedMatch?.matchedLegs || []).forEach((leg) => {
-        if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
-      });
+    savedMatch = buildCharterPathFromSavedRoutes(detail.stops || []);
+    detail._savedMatch = savedMatch;
+    activeCharterRequest._savedMatch = savedMatch;
+    highlightCharterMatchedRoutes(savedMatch);
+    (savedMatch.matchedLegs || []).forEach((leg) => {
+      if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
+    });
+    (savedMatch.laterMatched || []).forEach((leg) => {
+      if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
+    });
+
+    if (savedMatch.matchedLegs?.length && !savedMatch.missingLegs?.length) {
+      const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
+      captureStatusEl.textContent = `Charter: đủ route có sẵn — ${ok}. Chỉ hiện, không vẽ lại.`;
+      notifyOk('Route đã có đủ — chỉ hiện, không chỉnh');
+      setDrawTool('pan');
+    } else if (savedMatch.missingLegs?.length) {
+      const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
+      const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
       setDrawTool('draw');
-      if (savedMatch?.matchedLegs?.length && savedMatch?.missingLegs?.length) {
-        const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
-        captureStatusEl.textContent = `Charter: vẽ trước ${miss} (đoạn sau đã có tuyến sẵn).`;
-        notifyInfo(`Còn phải vẽ: ${miss}`);
-      } else {
-        captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
-        notifyInfo('Chưa có path sẵn — hãy vẽ tuyến giữa các bến');
-      }
+      captureStatusEl.textContent = ok
+        ? `Charter: có sẵn ${ok} (chỉ hiện). Còn thiếu — chỉ vẽ: ${miss}`
+        : `Charter: chưa có path — vẽ ${miss}`;
+      notifyInfo(ok ? `Chỉ vẽ đoạn thiếu: ${miss}` : `Vẽ: ${miss}`);
+    } else {
+      setDrawTool('draw');
+      captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
+      notifyInfo('Chưa có path sẵn — hãy vẽ tuyến giữa các bến');
     }
     updateCharterActiveBanner();
     updateWorkflow('draw');
