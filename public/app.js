@@ -4185,14 +4185,23 @@ function advanceCharterLeg() {
   return true;
 }
 
+/** Chuẩn hóa mã bến để so khớp (ST-BD ≈ BD). */
+function stationCodeKey(stop) {
+  const raw = stop?.stationCode
+    || findStationInCatalog(stop?.stationId)?.stationCode
+    || '';
+  const code = String(raw || '').trim().replace(/^ST-/i, '').toUpperCase();
+  if (code) return code;
+  return String(stop?.stationId || '').trim().toUpperCase();
+}
+
 function sameStationRef(a, b) {
   if (!a || !b) return false;
   const idA = String(a.stationId || '').trim();
   const idB = String(b.stationId || '').trim();
   if (idA && idB && idA === idB) return true;
-  const norm = (c) => String(c || '').trim().replace(/^ST-/i, '').toUpperCase();
-  const codeA = norm(a.stationCode);
-  const codeB = norm(b.stationCode);
+  const codeA = stationCodeKey(a);
+  const codeB = stationCodeKey(b);
   return Boolean(codeA && codeB && codeA === codeB);
 }
 
@@ -4236,8 +4245,59 @@ function extractRouteCoordsBetween(route, fromStop, toStop) {
   return slice;
 }
 
-/** Tìm tuyến DB chứa cả from→to (stopOrder tăng). */
+function routeCoordinateList(route) {
+  return (Array.isArray(route?.coordinates) ? route.coordinates : [])
+    .map((p) => ({ lat: Number(p.lat), lng: Number(p.lng) }))
+    .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+}
+
+/**
+ * Tìm route theo đúng 2 mã bến của 1 chặng (1 route = 2 bến).
+ * Ưu tiên: stops đúng 2 bến from→to, hoặc startStationId/endStationId khớp.
+ */
+function findExactRouteForStationPair(fromStop, toStop) {
+  const routes = Array.isArray(latest?.routes) ? latest.routes : [];
+  let best = null;
+  for (const route of routes) {
+    const stops = [...(route.stops || [])].sort((a, b) => Number(a.stopOrder) - Number(b.stopOrder));
+    const startId = String(route.startStationId || route.start_station_id || stops[0]?.stationId || '').trim();
+    const endId = String(route.endStationId || route.end_station_id || stops[stops.length - 1]?.stationId || '').trim();
+    const startOk = sameStationRef({ stationId: startId, stationCode: stops[0]?.stationCode }, fromStop)
+      || (stops.length >= 1 && sameStationRef(stops[0], fromStop));
+    const endOk = sameStationRef({ stationId: endId, stationCode: stops[stops.length - 1]?.stationCode }, toStop)
+      || (stops.length >= 1 && sameStationRef(stops[stops.length - 1], toStop));
+
+    // Chỉ nhận route đúng 2 bến, hoặc start/end khớp và không có bến giữa.
+    const exactTwoStops = stops.length === 2
+      && sameStationRef(stops[0], fromStop)
+      && sameStationRef(stops[1], toStop);
+    const exactStartEnd = startOk && endOk && (stops.length <= 2 || stops.length === 0);
+    if (!exactTwoStops && !exactStartEnd) continue;
+
+    let coords = extractRouteCoordsBetween(route, fromStop, toStop);
+    if (coords.length < 2) coords = routeCoordinateList(route);
+    if (coords.length < 2) continue;
+
+    const score = (exactTwoStops ? 0 : 100) + coords.length;
+    if (!best || score < best.score) {
+      best = {
+        routeId: route.routeId,
+        routeCode: route.routeCode || route.routeName || route.routeId,
+        coords,
+        score,
+        span: 1,
+        exactPair: true,
+      };
+    }
+  }
+  return best;
+}
+
+/** Tìm tuyến DB cho chặng from→to — ưu tiên đúng 2 mã bến, fallback cắt từ tuyến dài hơn. */
 function findSavedSegmentBetween(fromStop, toStop) {
+  const exact = findExactRouteForStationPair(fromStop, toStop);
+  if (exact) return exact;
+
   const routes = Array.isArray(latest?.routes) ? latest.routes : [];
   let best = null;
   for (const route of routes) {
@@ -4256,6 +4316,7 @@ function findSavedSegmentBetween(fromStop, toStop) {
         coords,
         score,
         span,
+        exactPair: false,
       };
     }
   }
@@ -4293,6 +4354,7 @@ function buildCharterPathFromSavedRoutes(stops) {
       routeCode: seg.routeCode,
       routeId: seg.routeId,
       coords: seg.coords,
+      exactPair: Boolean(seg.exactPair),
     };
     matchedLegs.push(leg);
     if (!gapHit) {
@@ -4427,13 +4489,29 @@ function clearActiveCharterRequest({ refresh = false } = {}) {
   if (refresh) loadCharterRequests();
 }
 
-/** Chỉ lấy route thuộc đúng CB (booking / result / candidate) — không lấy tuyến survey khác. */
-function collectCharterOwnedRouteIds(detail) {
+/**
+ * Lấy routeId để hiện khi chọn CB: tìm theo từng cặp 2 mã bến của chặng.
+ * Ví dụ BD→TNC, TNC→BS → chỉ hiện route đúng 2 bến đó.
+ */
+function collectCharterOwnedRouteIds(detail, savedMatch = null) {
   const ids = new Set();
   const add = (value) => {
     const id = String(value || '').trim();
     if (id) ids.add(id);
   };
+
+  const ordered = charterStopsAsOrdered(detail?.stops);
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    const exact = findExactRouteForStationPair(ordered[i], ordered[i + 1]);
+    if (exact?.routeId) add(exact.routeId);
+  }
+
+  // Matched legs đã gắn exactPair từ findSavedSegmentBetween.
+  for (const leg of [...(savedMatch?.matchedLegs || []), ...(savedMatch?.laterMatched || [])]) {
+    if (leg?.exactPair && leg.routeId) add(leg.routeId);
+  }
+
+  // Candidate / result từ BE (nếu có).
   add(detail?.resultRouteId);
   add(detail?.resultRoute?.routeId || detail?.resultRoute?.id);
   add(detail?.candidateRouteId);
@@ -4444,27 +4522,12 @@ function collectCharterOwnedRouteIds(detail) {
       add(cand?.routeId || cand?.id);
     }
   }
-  const booking = String(detail?.bookingCode || detail?.bookingId || '').trim();
-  const bookingNorm = booking.replace(/\s+/g, '-').toUpperCase();
-  const requestId = String(detail?.requestId || detail?.id || '').trim();
-  for (const route of latest?.routes || []) {
-    if (requestId && String(route.charterRequestId || '') === requestId) {
-      add(route.routeId);
-      continue;
-    }
-    if (!bookingNorm) continue;
-    const code = String(route.routeCode || '').replace(/\s+/g, '-').toUpperCase();
-    if (!code) continue;
-    if (code === bookingNorm || code.startsWith(`${bookingNorm}-`) || code.includes(bookingNorm)) {
-      add(route.routeId);
-    }
-  }
   return [...ids];
 }
 
-/** Hiện map theo CB: chỉ layer route của CB; đoạn survey gợi ý chỉ vẽ preview mờ. */
-function highlightCharterMatchedRoutes(_savedMatch, detail = activeCharterRequest) {
-  const ownedIds = collectCharterOwnedRouteIds(detail);
+/** Hiện map theo CB: chỉ route khớp 2 mã bến từng chặng. */
+function highlightCharterMatchedRoutes(savedMatch, detail = activeCharterRequest) {
+  const ownedIds = collectCharterOwnedRouteIds(detail, savedMatch);
   setCharterRouteFilter(ownedIds);
   if (showSavedRoutesBeforeCharter == null) {
     showSavedRoutesBeforeCharter = showSavedRoutes;
@@ -4473,7 +4536,6 @@ function highlightCharterMatchedRoutes(_savedMatch, detail = activeCharterReques
   applySavedRoutesVisibility();
   applySelectedRouteHighlight(ownedIds[0] || selectedRouteId || '');
   if (mapLegendSelectEl) {
-    // Dropdown chỉ còn option CB (đã lọc trong renderRoutes); chọn cái đầu nếu có.
     if (ownedIds[0]) {
       mapLegendSelectEl.value = ownedIds[0];
       selectedRouteId = ownedIds[0];
