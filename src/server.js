@@ -543,7 +543,13 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/recording/save-route' && req.method === 'POST') {
       const body = await readJson(req);
       const session = state.lastRecordingSession;
-      if (!session?.recordedPoints?.length && !state.collector?.recordedPoints?.length) {
+      const hasDrawnPath = Array.isArray(body?.coordinates) && body.coordinates.length >= 2;
+      const hasGps = Boolean(session?.recordedPoints?.length || state.collector?.recordedPoints?.length);
+      const isCharterSave = Boolean(
+        cleanOptionalText(body?.charterRequestId)
+        || String(body?.routeType || '').toLowerCase() === 'charterreference',
+      );
+      if (!hasGps && !(isCharterSave && hasDrawnPath)) {
         return sendJson(res, { error: 'Chưa có điểm GPS để lưu.' }, 400);
       }
       try {
@@ -554,6 +560,7 @@ const server = createServer(async (req, res) => {
         return sendJson(res, {
           error: error.message,
           code: error.code || undefined,
+          partialRouteId: error.partialRouteId || undefined,
         }, error.status || 500);
       }
     }
@@ -5070,20 +5077,9 @@ async function persistRecordingSession(body, sessionInput = null) {
   ));
 
   if (canTryAzure) {
+    // Charter từng chặng: chỉ from-gps (tạo geometry). Không fallback from-stations
+    // (API đó chỉ ghép route đã có — dùng ở compose cuối).
     let targetSave = await saveRouteFromGpsOnTarget(session, body);
-    if (
-      isCharter
-      && !targetSave.ok
-      && targetSave.status !== 409
-    ) {
-      warning = `from-gps: ${targetSave.error || targetSave.status}; thử from-stations`;
-      console.warn(`[save-route] ${warning}`);
-      const fallback = await saveCharterRouteFromStations(session, body);
-      if (fallback.ok) {
-        targetSave = fallback;
-        warning = null;
-      }
-    }
     let reverseError = null;
     const wantedReverse = !isCharter && Boolean(body.createReverseRoute || session?.createReverseRoute);
     if (
@@ -5156,6 +5152,15 @@ async function persistRecordingSession(body, sessionInput = null) {
       err.status = 409;
       err.code = 'ROUTE_CODE_EXISTS';
       throw err;
+    } else if (isCharter) {
+      // Charter: không fallback local — báo lỗi rõ để admin sửa rồi lưu lại.
+      const err = userError(
+        `Charter không lưu lên BE: ${targetSave.error || `HTTP ${targetSave.status}`}`
+          + ' · Chưa lưu. Kiểm tra 2 bến / geometry rồi thử lại.',
+      );
+      err.status = Number(targetSave.status) || 502;
+      err.code = 'CHARTER_SAVE_FAILED';
+      throw err;
     } else {
       warning = targetSave.error || `BE from-gps trả ${targetSave.status}`;
       console.warn(`[save-route] Azure failed (${targetSave.status}): ${warning}. Falling back to local DB.`);
@@ -5196,6 +5201,15 @@ async function persistRecordingSession(body, sessionInput = null) {
         }
       }
     }
+  } else if (isCharter) {
+    const err = userError(
+      !getTargetApiRoot()
+        ? 'Charter cần TARGET_API — chưa cấu hình BE, không lưu.'
+        : 'Charter cần ≥2 điểm geometry. Vẽ đủ đường giữa 2 bến rồi lưu.',
+    );
+    err.status = 400;
+    err.code = 'CHARTER_SAVE_BLOCKED';
+    throw err;
   } else {
     route = await saveRecordedRoute(body);
     await refreshFromDatabase();
@@ -5220,19 +5234,26 @@ async function persistRecordingSession(body, sessionInput = null) {
           console.log(`[charter] Ghép route tổng OK → ${composedId} (${composed.data?.routeCode || ''})`);
         }
       } else {
-        warning = [
-          warning,
-          `ghép route tổng lỗi: ${composed.error || composed.status}`,
-        ].filter(Boolean).join(' · ');
-        console.warn(`[charter] compose from-stations lỗi: ${composed.error || composed.status}`);
+        const err = userError(
+          `Đã lưu chặng nhưng ghép route tổng thất bại: ${composed.error || composed.status}`
+            + ' · Charter CHƯA hoàn tất. Kiểm tra các chặng 2 bến đã Active có geometry rồi thử lại.',
+        );
+        err.status = 422;
+        err.code = 'CHARTER_COMPOSE_FAILED';
+        err.partialRouteId = savedRouteId;
+        throw err;
       }
     }
     charterComplete = await completeCharterRouteDrawRequest(charterRequestId, completeRouteId);
     if (!charterComplete.ok) {
-      warning = [
-        warning,
-        `complete charter lỗi: ${charterComplete.error || charterComplete.status}`,
-      ].filter(Boolean).join(' · ');
+      const err = userError(
+        `Đã lưu route nhưng complete charter thất bại: ${charterComplete.error || charterComplete.status}`
+          + ' · Charter CHƯA hoàn tất.',
+      );
+      err.status = Number(charterComplete.status) || 422;
+      err.code = 'CHARTER_COMPLETE_FAILED';
+      err.partialRouteId = completeRouteId;
+      throw err;
     }
   } else if (charterRequestId && state.charterDrawRequests.has(charterRequestId)) {
     const row = state.charterDrawRequests.get(charterRequestId);

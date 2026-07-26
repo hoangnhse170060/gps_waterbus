@@ -2824,16 +2824,42 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
   const routeName = captureRouteNameEl.value.trim() || routeCode;
   if (!routeCode) {
     captureStatusEl.textContent = 'Nhập mã tuyến trước khi lưu.';
+    notifyErr('Nhập mã tuyến trước khi lưu');
     return false;
   }
   if (!checkRouteCodeDuplicate()) {
     captureStatusEl.textContent = 'Mã tuyến bị trùng — đổi mã rồi lưu lại.';
+    notifyErr('Mã tuyến bị trùng — chưa lưu');
     return false;
   }
   if (!validateReverseRouteCode()) {
     captureStatusEl.textContent = 'Mã chiều về trùng mã tuyến chính — đổi trước khi lưu.';
     reverseRouteCodeEl?.focus();
+    notifyErr('Mã chiều về trùng — chưa lưu');
     return false;
+  }
+  // Charter: bắt buộc đúng 2 bến + có đường vẽ trước khi gửi BE.
+  if (activeCharterRequest?.requestId) {
+    const startId = activeCharterLeg?.from?.stationId || startStationEl?.value;
+    const endId = activeCharterLeg?.to?.stationId || endStationEl?.value;
+    const path = lockedSurveyPath?.length >= 2
+      ? lockedSurveyPath
+      : (captureState.points.length >= 2 ? getPathCoordinates() : []);
+    if (!startId || !endId) {
+      captureStatusEl.textContent = 'Charter: thiếu 2 bến chặng — chưa lưu.';
+      notifyErr('Charter: chọn đủ 2 bến của chặng trước khi lưu');
+      return false;
+    }
+    if (String(startId) === String(endId)) {
+      captureStatusEl.textContent = 'Charter: 2 bến trùng nhau — chưa lưu.';
+      notifyErr('Charter: 2 bến phải khác nhau');
+      return false;
+    }
+    if (path.length < 2) {
+      captureStatusEl.textContent = 'Charter: chưa có đường geometry — vẽ rồi lưu.';
+      notifyErr('Charter: vẽ đường giữa 2 bến trước khi lưu');
+      return false;
+    }
   }
   autoSaveInFlight = true;
   saveRouteGeometryEl.disabled = true;
@@ -2869,6 +2895,20 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       }
       throw new Error(body.error || 'Không lưu được route');
     }
+    // Charter: chỉ coi thành công khi lên BE — local + warning = thất bại.
+    if (activeCharterRequest?.requestId && body.savedTo !== 'target') {
+      throw new Error(
+        body.warning
+          || body.error
+          || 'Charter chưa lên BE — không chấp nhận lưu local. Thử lại.',
+      );
+    }
+    if (body.charterComplete && body.charterComplete.ok === false) {
+      throw new Error(
+        `Complete charter lỗi: ${body.charterComplete.error || body.charterComplete.status}`
+          + ' · Charter CHƯA hoàn tất.',
+      );
+    }
     const where = body.savedTo === 'target' ? 'BE Azure' : 'DB local';
     const warn = body.warning ? ` (Azure: ${body.warning})` : '';
     captureStatusEl.textContent = `Đã lưu ${body.routeCode || routeCode} lên ${where}.${warn}`;
@@ -2893,15 +2933,16 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     } else if (body.charterComplete?.ok) {
       notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest({ refresh: true });
-    } else if (body.charterComplete) {
-      // Server đã thử compose + complete và lỗi — không retry bằng route chặng (sẽ lỗi y hệt).
-      notifyErr(`Complete charter lỗi: ${body.charterComplete.error || body.charterComplete.status}`);
-    } else if (activeCharterRequest?.requestId && (body.routeId || body.id)) {
+    } else if (activeCharterRequest?.requestId && (body.routeId || body.id) && isFinalCharterLeg()) {
       const done = await completeCharterRequest(
         activeCharterRequest.requestId,
-        body.routeId || body.id,
+        body.composedRoute?.routeId || body.composedRoute?.id || body.routeId || body.id,
       );
       if (done) clearActiveCharterRequest({ refresh: true });
+      else {
+        notifyErr('Lưu route OK nhưng complete charter thất bại — chưa Done');
+        return false;
+      }
     }
     if (!hasMoreCharterLegs) hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear && !hasMoreCharterLegs) {
