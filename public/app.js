@@ -2940,16 +2940,12 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     } else if (body.charterComplete?.ok) {
       notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest({ refresh: true });
-    } else if (activeCharterRequest?.requestId && (body.routeId || body.id) && isFinalCharterLeg()) {
-      const done = await completeCharterRequest(
-        activeCharterRequest.requestId,
-        body.composedRoute?.routeId || body.composedRoute?.id || body.routeId || body.id,
-      );
-      if (done) clearActiveCharterRequest({ refresh: true });
-      else {
-        notifyErr('Lưu route OK nhưng complete charter thất bại — chưa Done');
-        return false;
-      }
+    } else if (activeCharterRequest?.requestId && isFinalCharterLeg()) {
+      // Đã vẽ hết chặng thiếu → CB đủ tuyến, thoát chế độ charter (không còn hiện ở panel).
+      const ids = [...(charterRouteFilterIds || [])];
+      if (savedId) ids.push(String(savedId));
+      notifyOk('CB đã đủ tuyến — đã bỏ khỏi danh sách');
+      exitCharterKeepRoutes(ids);
     }
     if (!hasMoreCharterLegs) hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear && !hasMoreCharterLegs) {
@@ -4555,6 +4551,22 @@ function updateCharterActiveBanner() {
   });
 }
 
+/** Đủ tuyến: bỏ chế độ charter (ẩn banner, cờ về thường) nhưng vẫn hiện tuyến của CB. */
+function exitCharterKeepRoutes(routeIds) {
+  const ids = [...new Set(Array.from(routeIds || [], String).filter(Boolean))];
+  clearActiveCharterRequest({ refresh: true });
+  if (!ids.length) return;
+  showSavedRoutes = true;
+  applySavedRoutesVisibility();
+  applySelectedRouteHighlight(ids[0]);
+  if (mapLegendSelectEl) {
+    mapLegendSelectEl.value = ids[0];
+    selectedRouteId = ids[0];
+    updateLegendSwatch();
+  }
+  showSelectedRouteStops(ids[0]);
+}
+
 function clearActiveCharterRequest({ refresh = false } = {}) {
   activeCharterRequest = null;
   activeCharterLeg = null;
@@ -4742,10 +4754,15 @@ async function openCharterRequest(requestId) {
     });
 
     if (savedMatch.matchedLegs?.length && !savedMatch.missingLegs?.length) {
+      // Đủ tuyến → thoát chế độ charter, chỉ để lại tuyến trên map.
       const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
-      captureStatusEl.textContent = `Charter: đủ route có sẵn — ${ok}. Chỉ hiện, không vẽ lại.`;
-      notifyOk('Route đã có đủ — chỉ hiện, không chỉnh');
+      const code = detail.bookingCode || detail.bookingId || requestId;
+      const ids = collectCharterOwnedRouteIds(detail, savedMatch);
       setDrawTool('pan');
+      exitCharterKeepRoutes(ids);
+      captureStatusEl.textContent = `Charter ${code}: đã đủ tuyến (${ok}) — không còn việc vẽ.`;
+      notifyOk(`${code} đã đủ tuyến — đã bỏ khỏi danh sách`);
+      return;
     } else if (savedMatch.missingLegs?.length) {
       const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
       const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
@@ -4773,6 +4790,16 @@ async function openCharterRequest(requestId) {
   }
 }
 
+/** Đủ tuyến = BE đã gắn resultRoute, hoặc mọi chặng 2 bến đều có route trong DB. */
+function isCharterFullyCovered(item) {
+  const has = (v) => v != null && v !== '' && v !== false;
+  if (has(item?.resultRouteId) || has(item?.resultRoute)) return true;
+  const ordered = charterStopsAsOrdered(item?.stops);
+  if (ordered.length < 2) return false;
+  const match = buildCharterPathFromSavedRoutes(item.stops);
+  return Boolean(match.matchedLegs?.length) && !match.missingLegs?.length;
+}
+
 /** Trạng thái tuyến của 1 yêu cầu charter (dựa field list/detail của BE). */
 function charterRouteState(item) {
   const has = (v) => v != null && v !== '' && v !== false;
@@ -4787,14 +4814,21 @@ function charterRouteState(item) {
 
 function renderCharterRequestList(items) {
   if (!charterRequestListEl) return;
-  const list = Array.isArray(items) ? items : [];
+  const all = Array.isArray(items) ? items : [];
+  // Đủ tuyến rồi thì không còn việc để vẽ — bỏ khỏi danh sách.
+  const covered = all.filter((item) => isCharterFullyCovered(item));
+  const list = all.filter((item) => !isCharterFullyCovered(item));
+  const coveredNote = covered.length
+    ? `<li class="charter-request-empty">${covered.length} yêu cầu đã đủ tuyến — đã ẩn.</li>`
+    : '';
   if (!list.length) {
     charterRequestListEl.classList.add('is-empty');
-    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không có yêu cầu cần vẽ (Pending / InProgress).</li>';
+    charterRequestListEl.innerHTML = coveredNote
+      || '<li class="charter-request-empty">Không có yêu cầu cần vẽ (Pending / InProgress).</li>';
     return;
   }
   charterRequestListEl.classList.remove('is-empty');
-  charterRequestListEl.innerHTML = list.map((item) => {
+  charterRequestListEl.innerHTML = coveredNote + list.map((item) => {
     const id = item.requestId || item.id || '';
     const code = item.bookingCode || item.bookingId || id;
     const stopCount = Array.isArray(item.stops) ? item.stops.length : (item.stopCount || '');
