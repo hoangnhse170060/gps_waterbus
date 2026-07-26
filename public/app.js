@@ -128,6 +128,13 @@ let selectedRouteStops = [];
 let selectedRouteId = '';
 // Mặc định ẩn tuyến DB trên map survey — tránh lẫn với đường đang vẽ (BD-TT…).
 let showSavedRoutes = false;
+/** Snapshot toggle trước khi mở CB — bỏ chọn thì trả lại. */
+let showSavedRoutesBeforeCharter = null;
+/**
+ * Khi đang mở CB: chỉ hiện các routeId này trên map (Set rỗng = ẩn hết DB routes).
+ * null = không lọc (chế độ survey thường).
+ */
+let charterRouteFilterIds = null;
 /** Yêu cầu charter đang mở trên Bảng vẽ (preload bến / candidate). */
 let activeCharterRequest = null;
 /** Chặng charter đang vẽ — BE contract: 1 route = 1 chặng = đúng 2 bến / 1 lần gửi. */
@@ -203,6 +210,13 @@ const ATTACHED_ROUTE_STYLE = {
   color: '#dc2626',
   weight: 4,
   opacity: 0.38,
+  dashArray: null,
+};
+/** Tuyến DB khớp chặng CB đang mở — đỏ mờ, chỉ hiện các route của CB. */
+const CHARTER_MATCHED_ROUTE_STYLE = {
+  color: '#dc2626',
+  weight: 5,
+  opacity: 0.55,
   dashArray: null,
 };
 /** Đang chạy / đã xong: đường liền (không còn nét đứt + điểm số). */
@@ -2847,6 +2861,12 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
     const hasMoreCharterLegs = Boolean(activeCharterRequest?.requestId) && !isFinalCharterLeg();
+    const savedId = body.routeId || body.id;
+    if (savedId && charterRouteFilterIds) {
+      charterRouteFilterIds.add(String(savedId));
+      applySavedRoutesVisibility();
+      applySelectedRouteHighlight(String(savedId));
+    }
     if (hasMoreCharterLegs) {
       const queue = charterLegQueue();
       const done = (Number(activeCharterRequest._legIndex) || 0) + 1;
@@ -3406,12 +3426,26 @@ function boatIcon(heading) {
   });
 }
 
+function isSavedRouteAllowed(routeId) {
+  if (!charterRouteFilterIds) return true;
+  return charterRouteFilterIds.has(String(routeId || ''));
+}
+
 function applySavedRoutesVisibility() {
-  for (const layer of routeLayers.values()) {
-    if (showSavedRoutes) {
+  for (const [id, layer] of routeLayers) {
+    const show = showSavedRoutes && isSavedRouteAllowed(id);
+    if (show) {
       if (!map.hasLayer(layer)) layer.addTo(map);
     } else if (map.hasLayer(layer)) {
       map.removeLayer(layer);
+    }
+  }
+  // Preview candidate/chặng CB theo cùng toggle Ẩn/Hiện.
+  if (charterCandidateLayer) {
+    if (showSavedRoutes && activeCharterRequest) {
+      if (!map.hasLayer(charterCandidateLayer)) charterCandidateLayer.addTo(map);
+    } else if (map.hasLayer(charterCandidateLayer)) {
+      map.removeLayer(charterCandidateLayer);
     }
   }
   // Đường đang vẽ mà đã xong (hoặc đang chạy) cũng theo toggle này.
@@ -3429,13 +3463,21 @@ function applySavedRoutesVisibility() {
       routeStopsListEl.classList.add('is-empty');
       routeStopsListEl.innerHTML = '<li>Đang ẩn tuyến có sẵn — bật lại để xem bến.</li>';
     }
-  } else if (mapLegendSelectEl?.value) {
+  } else if (mapLegendSelectEl?.value && isSavedRouteAllowed(mapLegendSelectEl.value)) {
     showSelectedRouteStops(mapLegendSelectEl.value);
+  } else {
+    clearRouteStopMarkers();
   }
   if (toggleSavedRoutesEl) {
     toggleSavedRoutesEl.classList.toggle('is-on', showSavedRoutes);
     toggleSavedRoutesEl.classList.toggle('is-off', !showSavedRoutes);
-    toggleSavedRoutesEl.textContent = showSavedRoutes ? 'Ẩn tuyến có sẵn' : 'Hiện tuyến có sẵn';
+    if (charterRouteFilterIds && activeCharterRequest) {
+      toggleSavedRoutesEl.textContent = showSavedRoutes
+        ? 'Ẩn tuyến CB'
+        : 'Hiện tuyến CB';
+    } else {
+      toggleSavedRoutesEl.textContent = showSavedRoutes ? 'Ẩn tuyến có sẵn' : 'Hiện tuyến có sẵn';
+    }
   }
 }
 
@@ -3449,6 +3491,11 @@ function applySelectedRouteHighlight(routeId = selectedRouteId) {
   const hasSelection = Boolean(selectedRouteId);
   for (const [id, layer] of routeLayers) {
     if (!layer) continue;
+    if (charterRouteFilterIds?.has(String(id))) {
+      layer.setStyle({ ...CHARTER_MATCHED_ROUTE_STYLE, smoothFactor: 0 });
+      if (typeof layer.bringToFront === 'function') layer.bringToFront();
+      continue;
+    }
     if (hasSelection && String(id) === selectedRouteId) {
       layer.setStyle({ ...SELECTED_ROUTE_STYLE, smoothFactor: 0 });
       if (typeof layer.bringToFront === 'function') layer.bringToFront();
@@ -3459,11 +3506,12 @@ function applySelectedRouteHighlight(routeId = selectedRouteId) {
     }
   }
   if (mapLegendSwatchEl) {
-    mapLegendSwatchEl.style.background = hasSelection
-      ? SELECTED_ROUTE_STYLE.color
-      : SAVED_ROUTE_STYLE.color;
+    const charterActive = Boolean(charterRouteFilterIds && activeCharterRequest);
+    mapLegendSwatchEl.style.background = charterActive
+      ? CHARTER_MATCHED_ROUTE_STYLE.color
+      : (hasSelection ? SELECTED_ROUTE_STYLE.color : SAVED_ROUTE_STYLE.color);
     mapLegendSwatchEl.style.borderTop = 'none';
-    mapLegendSwatchEl.style.height = hasSelection ? '6px' : '3px';
+    mapLegendSwatchEl.style.height = (hasSelection || charterActive) ? '6px' : '3px';
   }
 }
 
@@ -3482,7 +3530,7 @@ function renderRoutes(routes) {
     const latlngs = (route.coordinates || []).map((p) => [p.lat, p.lng]);
     if (!layer) {
       layer = L.polyline(latlngs, { ...SAVED_ROUTE_STYLE, smoothFactor: 0 });
-      if (showSavedRoutes) layer.addTo(map);
+      if (showSavedRoutes && isSavedRouteAllowed(route.routeId)) layer.addTo(map);
       layer.bindTooltip(`${route.routeCode} · ${route.routeName}`);
       layer.on('click', () => {
         if (mapLegendSelectEl) {
@@ -3499,12 +3547,13 @@ function renderRoutes(routes) {
       routeLayers.set(route.routeId, layer);
     } else {
       layer.setLatLngs(latlngs);
-      if (showSavedRoutes && !map.hasLayer(layer)) layer.addTo(map);
-      if (!showSavedRoutes && map.hasLayer(layer)) map.removeLayer(layer);
+      const show = showSavedRoutes && isSavedRouteAllowed(route.routeId);
+      if (show && !map.hasLayer(layer)) layer.addTo(map);
+      if (!show && map.hasLayer(layer)) map.removeLayer(layer);
     }
     for (const p of latlngs) bounds.push(p);
 
-    if (mapLegendSelectEl) {
+    if (mapLegendSelectEl && isSavedRouteAllowed(route.routeId)) {
       const option = document.createElement('option');
       option.value = route.routeId;
       option.textContent = route.routeCode || route.routeName || route.routeId;
@@ -4378,34 +4427,20 @@ function clearActiveCharterRequest({ refresh = false } = {}) {
   if (refresh) loadCharterRequests();
 }
 
-/** Nổi các tuyến DB đã khớp với charter (chứng minh đoạn đã có sẵn / đủ). */
+/** Nổi các tuyến DB đã khớp với charter — chỉ hiện route của CB, ẩn còn lại. */
 function highlightCharterMatchedRoutes(savedMatch) {
   const ids = [...new Set(
-    (savedMatch?.matchedLegs || [])
+    [...(savedMatch?.matchedLegs || []), ...(savedMatch?.laterMatched || [])]
       .map((leg) => String(leg.routeId || ''))
       .filter(Boolean),
   )];
-  if (!ids.length) return;
-  if (!showSavedRoutes) {
-    showSavedRoutes = true;
-    applySavedRoutesVisibility();
+  setCharterRouteFilter(ids);
+  if (showSavedRoutesBeforeCharter == null) {
+    showSavedRoutesBeforeCharter = showSavedRoutes;
   }
-  const idSet = new Set(ids);
-  for (const [id, layer] of routeLayers) {
-    if (idSet.has(String(id))) {
-      if (!map.hasLayer(layer)) layer.addTo(map);
-      layer.setStyle({
-        color: '#dc2626',
-        weight: 5,
-        opacity: 0.55,
-        dashArray: null,
-        smoothFactor: 0,
-      });
-      layer.bringToFront();
-    } else if (showSavedRoutes) {
-      layer.setStyle({ ...DIMMED_ROUTE_STYLE, smoothFactor: 0 });
-    }
-  }
+  showSavedRoutes = true;
+  applySavedRoutesVisibility();
+  applySelectedRouteHighlight(ids[0] || selectedRouteId || '');
   if (mapLegendSelectEl && ids[0]) {
     mapLegendSelectEl.value = ids[0];
     selectedRouteId = ids[0];
@@ -4413,7 +4448,20 @@ function highlightCharterMatchedRoutes(savedMatch) {
   }
 }
 
+function setCharterRouteFilter(ids) {
+  charterRouteFilterIds = new Set((ids || []).map(String).filter(Boolean));
+}
+
+function clearCharterRouteFilter({ restoreToggle = true } = {}) {
+  charterRouteFilterIds = null;
+  if (restoreToggle && showSavedRoutesBeforeCharter != null) {
+    showSavedRoutes = showSavedRoutesBeforeCharter;
+    showSavedRoutesBeforeCharter = null;
+  }
+}
+
 function clearCharterMatchedRouteHighlight() {
+  clearCharterRouteFilter({ restoreToggle: true });
   applySelectedRouteHighlight(selectedRouteId || '');
   applySavedRoutesVisibility();
 }
@@ -4455,10 +4503,16 @@ async function openCharterRequest(requestId) {
     activeCharterLeg = null;
     detail._legQueue = [];
     detail._legIndex = 0;
+    clearCharterMapLayers({ resetFlags: true });
+
     if (recordingActive || lockedSurveyPath) {
       notifyWarn('Đang ghi/khóa path — chỉ nổi bến charter, không đổi bản vẽ hiện tại.');
       renderCharterStopPins(detail.stops || []);
       const preview = candidateRouteCoordinates(detail);
+      // Vẫn ẩn route không thuộc CB.
+      const matchWhileLocked = buildCharterPathFromSavedRoutes(detail.stops || []);
+      detail._savedMatch = matchWhileLocked;
+      highlightCharterMatchedRoutes(matchWhileLocked);
       if (preview.length >= 2) renderCharterCandidatePreview(preview);
       updateCharterActiveBanner();
       return;
@@ -4468,13 +4522,20 @@ async function openCharterRequest(requestId) {
     applyCharterStationsToForm(detail.stops || []);
     renderCharterStopPins(detail.stops || []);
 
-    // Route đã có → CHỈ HIỆN trên map. Không nạp vào bản vẽ / không chỉnh lại.
+    // Route đã có → CHỈ HIỆN route của CB. Không nạp vào bản vẽ / không chỉnh lại.
     const beCoords = candidateRouteCoordinates(detail);
     let savedMatch = null;
     if (beCoords.length >= 2) {
+      // Ẩn toàn bộ tuyến DB khác — chỉ hiện candidate của CB.
+      setCharterRouteFilter([]);
+      if (showSavedRoutesBeforeCharter == null) {
+        showSavedRoutesBeforeCharter = showSavedRoutes;
+      }
+      showSavedRoutes = true;
+      applySavedRoutesVisibility();
       renderCharterCandidatePreview(beCoords);
       captureStatusEl.textContent = 'Charter: đã có candidate — chỉ hiện, không chỉnh route có sẵn.';
-      notifyOk('Đã hiện route có sẵn (không chỉnh)');
+      notifyOk('Đã hiện route CB (ẩn tuyến khác)');
       updateCharterActiveBanner();
       updateWorkflow('draw');
       return;
