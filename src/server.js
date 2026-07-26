@@ -742,6 +742,10 @@ const server = createServer(async (req, res) => {
           routeType: stopped.routeType || null,
           charterRequestId: stopped.charterRequestId || null,
           bookingId: stopped.bookingId || null,
+          charterFinalLeg: stopped.charterFinalLeg === true,
+          charterAllStops: Array.isArray(stopped.charterAllStops) ? stopped.charterAllStops : null,
+          charterComposeCode: stopped.charterComposeCode || null,
+          charterComposeName: stopped.charterComposeName || null,
           stops: Array.isArray(stopped.stops) ? stopped.stops : null,
           createReverseRoute: Boolean(stopped.createReverseRoute),
           reverseRouteCode: stopped.reverseRouteCode || null,
@@ -5217,21 +5221,37 @@ async function persistRecordingSession(body, sessionInput = null) {
   }
 
   const savedRouteId = cleanOptionalText(route?.routeId || route?.id || route?.RouteId);
-  // Charter nhiều chặng: chỉ complete khi đây là chặng cuối (FE gửi charterFinalLeg).
-  const charterFinalLeg = body.charterFinalLeg !== false;
+  // Chỉ complete khi FE/session gửi rõ charterFinalLeg=true (không mặc định true).
+  const charterFinalLeg = body.charterFinalLeg === true
+    || session?.charterFinalLeg === true;
   if (charterRequestId && savedRouteId && savedTo === 'target' && charterFinalLeg) {
     // Complete cần route stops khớp ĐỦ thứ tự bến của yêu cầu.
     // >2 bến → ghép route tổng từ các chặng qua from-stations trước.
     let completeRouteId = savedRouteId;
-    const allStops = Array.isArray(body.charterAllStops) ? body.charterAllStops : [];
+    const allStops = Array.isArray(body.charterAllStops) && body.charterAllStops.length
+      ? body.charterAllStops
+      : (Array.isArray(session?.charterAllStops) ? session.charterAllStops : []);
     if (allStops.length > 2) {
-      const composed = await composeCharterRouteFromLegs(session, body);
+      const composed = await composeCharterRouteFromLegs(session, {
+        ...body,
+        charterAllStops: allStops,
+        charterComposeCode: body.charterComposeCode || session?.charterComposeCode,
+        charterComposeName: body.charterComposeName || session?.charterComposeName,
+      });
       if (composed.ok) {
         const composedId = cleanOptionalText(composed.data?.routeId || composed.data?.id);
         if (composedId) {
           completeRouteId = composedId;
           route.composedRoute = composed.data || null;
           console.log(`[charter] Ghép route tổng OK → ${composedId} (${composed.data?.routeCode || ''})`);
+        } else {
+          const err = userError(
+            'Ghép route tổng OK nhưng BE không trả routeId · Charter CHƯA hoàn tất.',
+          );
+          err.status = 422;
+          err.code = 'CHARTER_COMPOSE_NO_ID';
+          err.partialRouteId = savedRouteId;
+          throw err;
         }
       } else {
         const err = userError(
@@ -5243,6 +5263,17 @@ async function persistRecordingSession(body, sessionInput = null) {
         err.partialRouteId = savedRouteId;
         throw err;
       }
+    } else if (allStops.length === 2) {
+      // 1 chặng duy nhất: route vừa lưu phải đúng 2 bến đó — OK dùng luôn.
+      completeRouteId = savedRouteId;
+    } else {
+      const err = userError(
+        'Thiếu danh sách bến charter (charterAllStops) — không complete bằng route chặng lệch thứ tự.',
+      );
+      err.status = 422;
+      err.code = 'CHARTER_STOPS_MISSING';
+      err.partialRouteId = savedRouteId;
+      throw err;
     }
     charterComplete = await completeCharterRouteDrawRequest(charterRequestId, completeRouteId);
     if (!charterComplete.ok) {
@@ -5255,7 +5286,9 @@ async function persistRecordingSession(body, sessionInput = null) {
       err.partialRouteId = completeRouteId;
       throw err;
     }
-  } else if (charterRequestId && state.charterDrawRequests.has(charterRequestId)) {
+  } else if (charterRequestId && savedRouteId && savedTo === 'target' && !charterFinalLeg) {
+    console.log(`[charter] Đã lưu chặng ${savedRouteId} — chưa complete (charterFinalLeg=false)`);
+  } else if (charterRequestId && state.charterDrawRequests.has(charterRequestId) && charterFinalLeg) {
     const row = state.charterDrawRequests.get(charterRequestId);
     row.status = savedRouteId ? 'Done' : row.status;
     row.resultRouteId = savedRouteId || null;
@@ -5269,6 +5302,7 @@ async function persistRecordingSession(body, sessionInput = null) {
     warning,
     ok: true,
     charterRequestId: charterRequestId || null,
+    charterFinalLeg,
     charterComplete: charterComplete
       ? { ok: charterComplete.ok, status: charterComplete.status, error: charterComplete.error || null }
       : null,
@@ -5331,6 +5365,10 @@ async function finalizeCollectorRecording() {
     routeType: stopped.routeType || null,
     charterRequestId: stopped.charterRequestId || null,
     bookingId: stopped.bookingId || null,
+    charterFinalLeg: stopped.charterFinalLeg === true,
+    charterAllStops: Array.isArray(stopped.charterAllStops) ? stopped.charterAllStops : null,
+    charterComposeCode: stopped.charterComposeCode || null,
+    charterComposeName: stopped.charterComposeName || null,
     stops: Array.isArray(stopped.stops) ? stopped.stops : null,
     createReverseRoute: Boolean(stopped.createReverseRoute),
     reverseRouteCode: stopped.reverseRouteCode || null,
@@ -5382,6 +5420,12 @@ async function finalizeCollectorRecording() {
       createReverseRoute: Boolean(stopped.createReverseRoute),
       reverseRouteCode: stopped.reverseRouteCode || null,
       reverseRouteName: stopped.reverseRouteName || null,
+      charterRequestId: stopped.charterRequestId || null,
+      bookingId: stopped.bookingId || null,
+      charterFinalLeg: stopped.charterFinalLeg === true,
+      charterAllStops: Array.isArray(stopped.charterAllStops) ? stopped.charterAllStops : null,
+      charterComposeCode: stopped.charterComposeCode || null,
+      charterComposeName: stopped.charterComposeName || null,
     }, state.lastRecordingSession);
     state.lastAutoSavedRoute = {
       ...result,
@@ -6374,6 +6418,10 @@ function startCollector(body) {
     routeType,
     charterRequestId: cleanOptionalText(body.charterRequestId) || null,
     bookingId: cleanOptionalText(body.bookingId) || null,
+    charterFinalLeg: body.charterFinalLeg === true,
+    charterAllStops: Array.isArray(body.charterAllStops) ? body.charterAllStops : null,
+    charterComposeCode: cleanOptionalText(body.charterComposeCode) || null,
+    charterComposeName: cleanOptionalText(body.charterComposeName) || null,
     stops,
     createReverseRoute: Boolean(body.createReverseRoute)
       && routeType !== 'SightseeingLoop'

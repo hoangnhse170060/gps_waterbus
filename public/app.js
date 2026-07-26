@@ -1137,11 +1137,15 @@ function getSelectedEndStation() {
 
 /** Charter đang mở → CharterReference; không thì suy từ bến đầu/cuối. */
 function getSurveyRouteType() {
-  if (activeCharterRequest?.requestId) return 'CharterReference';
   const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
   const endPoint = [...captureState.points].reverse().find((p) => p.source === 'station-end');
   const endId = endStationEl?.value || endPoint?.stationId || '';
+  // Loop cùng bến → không gắn charter (tránh auto-complete nhầm với LOOP-*).
   if (startId && endId && String(startId) === String(endId)) return 'SightseeingLoop';
+  // Chỉ coi là charter khi đang vẽ đúng 1 chặng CB (2 bến).
+  if (activeCharterRequest?.requestId && activeCharterLeg?.from && activeCharterLeg?.to) {
+    return 'CharterReference';
+  }
   return 'Regular';
 }
 
@@ -3150,6 +3154,21 @@ function handleAutoSavedRoute(autoSaved) {
     return;
   }
 
+  const warnText = String(autoSaved.warning || '');
+  const charterBroken = /complete charter|ghép route tổng|CHARTER_/i.test(warnText)
+    || (Boolean(autoSaved.charterRequestId) && autoSaved.savedTo !== 'target')
+    || (autoSaved.charterComplete && autoSaved.charterComplete.ok === false);
+  if (charterBroken) {
+    const msg = autoSaved.charterComplete?.error
+      || warnText
+      || 'Charter chưa hoàn tất';
+    captureStatusEl.textContent = `Lỗi charter: ${msg}`;
+    gpsStatusEl.textContent = 'Charter chưa Done';
+    notifyErr(`Charter chưa hoàn tất: ${msg}`);
+    updateWorkflow('run');
+    return;
+  }
+
   const where = autoSaved.savedTo === 'target' ? 'BE Azure' : 'DB local';
   const warn = autoSaved.warning ? ` (Azure: ${autoSaved.warning})` : '';
   captureStatusEl.textContent = `Đã tự lưu ${autoSaved.routeCode || ''} lên ${where}.${warn}`;
@@ -3157,6 +3176,10 @@ function handleAutoSavedRoute(autoSaved) {
   sendLogEl.textContent = `Tuyến ${autoSaved.routeCode || ''} đã đẩy lên ${where}.`;
   if (autoSaved.warning) notifyWarn(`Tự lưu ${autoSaved.routeCode || ''} lên ${where}${warn}`);
   else notifyOk(`Tự lưu thành công: ${autoSaved.routeCode || ''} → ${where}`);
+  if (autoSaved.charterComplete?.ok) {
+    notifyOk('Charter request Done — đã gắn route vào booking');
+    clearActiveCharterRequest({ refresh: true });
+  }
   renderRouteResult(autoSaved);
   updateWorkflow('done');
   hideDrawingKeepGps({ routeCode: autoSaved.routeCode || '' });
