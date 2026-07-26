@@ -2820,7 +2820,15 @@ async function pauseCollector() {
 async function saveRouteGeometry({ silentClear = false } = {}) {
   if (autoSaveInFlight) return false;
   const routeCode = captureRouteCodeEl.value.trim();
-  const routeName = captureRouteNameEl.value.trim() || routeCode;
+  let routeName = captureRouteNameEl.value.trim() || routeCode;
+  if (activeCharterLeg) {
+    const a = activeCharterLeg.from?.stationCode || activeCharterLeg.from?.stationName;
+    const b = activeCharterLeg.to?.stationCode || activeCharterLeg.to?.stationName;
+    if (a && b) {
+      routeName = `${a} - ${b}`;
+      if (captureRouteNameEl) captureRouteNameEl.value = routeName;
+    }
+  }
   if (!routeCode) {
     captureStatusEl.textContent = 'Nhập mã tuyến trước khi lưu.';
     notifyErr('Nhập mã tuyến trước khi lưu');
