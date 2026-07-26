@@ -1475,6 +1475,25 @@ function surveySaveFields() {
     }
     // Chỉ complete request khi đã lưu chặng thiếu cuối cùng.
     fields.charterFinalLeg = isFinalCharterLeg();
+    // Chặng cuối: server ghép route tổng (from-stations) từ các chặng 2 bến rồi complete.
+    const allOrdered = charterStopsAsOrdered(activeCharterRequest.stops || []);
+    fields.charterAllStops = allOrdered.map((stop) => ({
+      stationId: stop.stationId,
+      stationCode: stop.stationCode,
+      stationName: stop.stationName,
+      stopOrder: stop.stopOrder,
+      lat: stop.lat,
+      lng: stop.lng,
+    }));
+    fields.charterComposeCode = String(activeCharterRequest.bookingCode || '')
+      .replace(/\s+/g, '-')
+      .slice(0, 40) || null;
+    const composeNames = allOrdered
+      .map((s) => s.stationCode || s.stationName)
+      .filter(Boolean);
+    fields.charterComposeName = composeNames.length >= 2
+      ? `${composeNames[0]} - ${composeNames[composeNames.length - 1]}`
+      : null;
     return fields;
   }
   const wantReverse = Boolean(createReverseRouteEl?.checked)
@@ -2874,6 +2893,9 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     } else if (body.charterComplete?.ok) {
       notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest({ refresh: true });
+    } else if (body.charterComplete) {
+      // Server đã thử compose + complete và lỗi — không retry bằng route chặng (sẽ lỗi y hệt).
+      notifyErr(`Complete charter lỗi: ${body.charterComplete.error || body.charterComplete.status}`);
     } else if (activeCharterRequest?.requestId && (body.routeId || body.id)) {
       const done = await completeCharterRequest(
         activeCharterRequest.requestId,

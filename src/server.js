@@ -4968,15 +4968,6 @@ async function saveCharterRouteFromStations(session, body) {
     ? (sumTravelMinutes(stopsExact) || exactDurationMinutes((pathKm / averageSpeedKmh) * 60))
     : Math.max(1, Math.round(sumTravelMinutes(stopsExact) || (pathKm / averageSpeedKmh) * 60));
 
-  // Contract: 1 route charter = 1 chặng = đúng 2 bến (1 lần gửi).
-  if (stopsForAzure.length !== 2) {
-    return {
-      ok: false,
-      status: 400,
-      error: `Charter: 1 route chỉ được 2 bến (đang có ${stopsForAzure.length}). Vẽ và lưu từng chặng.`,
-    };
-  }
-
   const payload = {
     routeCode: cleanRouteText(body.routeCode || session.routeCode, 'Route code'),
     routeName: cleanRouteText(body.routeName || session.routeName || body.routeCode || session.routeCode, 'Route name'),
@@ -5028,6 +5019,38 @@ async function saveCharterRouteFromStations(session, body) {
   return result;
 }
 
+/**
+ * Chặng cuối: ghép route tổng qua BE from-stations từ các route chặng (2 bến) đã có,
+ * để complete có route stops khớp đúng thứ tự bến của yêu cầu.
+ */
+async function composeCharterRouteFromLegs(session, body) {
+  const allStops = Array.isArray(body.charterAllStops) ? body.charterAllStops : [];
+  if (allStops.length < 2) {
+    return { ok: false, status: 400, error: 'Thiếu charterAllStops để ghép route tổng.' };
+  }
+  const baseCode = cleanOptionalText(body.charterComposeCode)
+    || String(body.routeCode || '').replace(/-C\d+$/i, '')
+    || `CHARTER-${Date.now()}`;
+  const names = allStops
+    .map((s) => s.stationCode || s.stationName)
+    .filter(Boolean);
+  const composeBody = {
+    ...body,
+    routeCode: baseCode,
+    routeName: cleanOptionalText(body.charterComposeName)
+      || (names.length >= 2 ? `${names[0]} - ${names[names.length - 1]}` : baseCode),
+    stops: allStops,
+    startStationId: allStops[0]?.stationId || null,
+    endStationId: allStops[allStops.length - 1]?.stationId || null,
+  };
+  let result = await saveCharterRouteFromStations(session, composeBody);
+  if (!result.ok && result.status === 409) {
+    composeBody.routeCode = `${baseCode}-${Date.now() % 100000}`;
+    result = await saveCharterRouteFromStations(session, composeBody);
+  }
+  return result;
+}
+
 async function persistRecordingSession(body, sessionInput = null) {
   const session = sessionInput || state.lastRecordingSession;
   let route = null;
@@ -5040,25 +5063,26 @@ async function persistRecordingSession(body, sessionInput = null) {
   const charterRequestId = cleanOptionalText(body.charterRequestId || session?.charterRequestId);
   const isCharter = Boolean(charterRequestId)
     || resolveRouteType(body, session, body.startStationId || session?.startStationId, body.endStationId || session?.endStationId) === 'CharterReference';
-  // Charter dùng JWT + from-stations (không cần GPS tracking session).
-  // Survey thường: from-gps cần session Azure đã start.
+  // Charter: từng chặng lưu qua from-gps (tạo route 2 bến CÓ geometry).
+  // from-stations của BE chỉ GHÉP từ route đã có — gọi ở chặng cuối để compose + complete.
   const canTryAzure = Boolean(getTargetApiRoot() && hasCoordinates && (
     isCharter || session?.targetSessionStarted
   ));
 
   if (canTryAzure) {
-    let targetSave = isCharter
-      ? await saveCharterRouteFromStations(session, body)
-      : await saveRouteFromGpsOnTarget(session, body);
+    let targetSave = await saveRouteFromGpsOnTarget(session, body);
     if (
       isCharter
       && !targetSave.ok
       && targetSave.status !== 409
-      && session?.targetSessionStarted
     ) {
-      warning = `from-stations: ${targetSave.error || targetSave.status}; fallback from-gps`;
+      warning = `from-gps: ${targetSave.error || targetSave.status}; thử from-stations`;
       console.warn(`[save-route] ${warning}`);
-      targetSave = await saveRouteFromGpsOnTarget(session, body);
+      const fallback = await saveCharterRouteFromStations(session, body);
+      if (fallback.ok) {
+        targetSave = fallback;
+        warning = null;
+      }
     }
     let reverseError = null;
     const wantedReverse = !isCharter && Boolean(body.createReverseRoute || session?.createReverseRoute);
@@ -5182,7 +5206,28 @@ async function persistRecordingSession(body, sessionInput = null) {
   // Charter nhiều chặng: chỉ complete khi đây là chặng cuối (FE gửi charterFinalLeg).
   const charterFinalLeg = body.charterFinalLeg !== false;
   if (charterRequestId && savedRouteId && savedTo === 'target' && charterFinalLeg) {
-    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, savedRouteId);
+    // Complete cần route stops khớp ĐỦ thứ tự bến của yêu cầu.
+    // >2 bến → ghép route tổng từ các chặng qua from-stations trước.
+    let completeRouteId = savedRouteId;
+    const allStops = Array.isArray(body.charterAllStops) ? body.charterAllStops : [];
+    if (allStops.length > 2) {
+      const composed = await composeCharterRouteFromLegs(session, body);
+      if (composed.ok) {
+        const composedId = cleanOptionalText(composed.data?.routeId || composed.data?.id);
+        if (composedId) {
+          completeRouteId = composedId;
+          route.composedRoute = composed.data || null;
+          console.log(`[charter] Ghép route tổng OK → ${composedId} (${composed.data?.routeCode || ''})`);
+        }
+      } else {
+        warning = [
+          warning,
+          `ghép route tổng lỗi: ${composed.error || composed.status}`,
+        ].filter(Boolean).join(' · ');
+        console.warn(`[charter] compose from-stations lỗi: ${composed.error || composed.status}`);
+      }
+    }
+    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, completeRouteId);
     if (!charterComplete.ok) {
       warning = [
         warning,
