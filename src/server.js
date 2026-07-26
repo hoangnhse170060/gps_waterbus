@@ -4968,6 +4968,15 @@ async function saveCharterRouteFromStations(session, body) {
     ? (sumTravelMinutes(stopsExact) || exactDurationMinutes((pathKm / averageSpeedKmh) * 60))
     : Math.max(1, Math.round(sumTravelMinutes(stopsExact) || (pathKm / averageSpeedKmh) * 60));
 
+  // Contract: 1 route charter = 1 chặng = đúng 2 bến (1 lần gửi).
+  if (stopsForAzure.length !== 2) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Charter: 1 route chỉ được 2 bến (đang có ${stopsForAzure.length}). Vẽ và lưu từng chặng.`,
+    };
+  }
+
   const payload = {
     routeCode: cleanRouteText(body.routeCode || session.routeCode, 'Route code'),
     routeName: cleanRouteText(body.routeName || session.routeName || body.routeCode || session.routeCode, 'Route name'),
@@ -5170,7 +5179,9 @@ async function persistRecordingSession(body, sessionInput = null) {
   }
 
   const savedRouteId = cleanOptionalText(route?.routeId || route?.id || route?.RouteId);
-  if (charterRequestId && savedRouteId && savedTo === 'target') {
+  // Charter nhiều chặng: chỉ complete khi đây là chặng cuối (FE gửi charterFinalLeg).
+  const charterFinalLeg = body.charterFinalLeg !== false;
+  if (charterRequestId && savedRouteId && savedTo === 'target' && charterFinalLeg) {
     charterComplete = await completeCharterRouteDrawRequest(charterRequestId, savedRouteId);
     if (!charterComplete.ok) {
       warning = [

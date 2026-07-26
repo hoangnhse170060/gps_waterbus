@@ -130,6 +130,8 @@ let selectedRouteId = '';
 let showSavedRoutes = false;
 /** Yêu cầu charter đang mở trên Bảng vẽ (preload bến / candidate). */
 let activeCharterRequest = null;
+/** Chặng charter đang vẽ — BE contract: 1 route = 1 chặng = đúng 2 bến / 1 lần gửi. */
+let activeCharterLeg = null;
 let charterCandidateLayer = null;
 let charterStopLayer = null;
 /** stationId → stopOrder của yêu cầu charter đang mở (đổi màu cờ bến sẵn có). */
@@ -1234,7 +1236,10 @@ function collectOrderedStopsFromClicks() {
 function buildSurveyStops() {
   const routeType = getSurveyRouteType();
   let ordered = collectOrderedStopsFromClicks();
-  if (activeCharterRequest?.stops?.length) {
+  if (activeCharterLeg) {
+    // Charter: mỗi lần lưu chỉ gửi 1 route = 2 bến của chặng đang vẽ.
+    ordered = charterLegStops(activeCharterLeg);
+  } else if (activeCharterRequest?.stops?.length) {
     ordered = charterStopsAsOrdered(activeCharterRequest.stops);
   }
   const withTravel = attachSegmentTravelMinutesFe(getPathCoordinates(), ordered, getSurveySpeedKmh());
@@ -1449,6 +1454,13 @@ function surveySaveFields() {
     fields.charterRequestId = activeCharterRequest.requestId;
     fields.bookingId = activeCharterRequest.bookingId || null;
     fields.createReverseRoute = false;
+    if (activeCharterLeg) {
+      fields.startStationId = activeCharterLeg.from.stationId;
+      fields.endStationId = activeCharterLeg.to.stationId;
+      fields.charterLegLabel = activeCharterLeg.label || null;
+    }
+    // Chỉ complete request khi đã lưu chặng thiếu cuối cùng.
+    fields.charterFinalLeg = isFinalCharterLeg();
     return fields;
   }
   const wantReverse = Boolean(createReverseRouteEl?.checked)
@@ -2834,7 +2846,12 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
-    if (body.charterComplete?.ok) {
+    const hasMoreCharterLegs = Boolean(activeCharterRequest?.requestId) && !isFinalCharterLeg();
+    if (hasMoreCharterLegs) {
+      const queue = charterLegQueue();
+      const done = (Number(activeCharterRequest._legIndex) || 0) + 1;
+      notifyOk(`Đã lưu chặng ${done}/${queue.length} — còn ${queue.length - done} chặng`);
+    } else if (body.charterComplete?.ok) {
       notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest({ refresh: true });
     } else if (activeCharterRequest?.requestId && (body.routeId || body.id)) {
@@ -2844,8 +2861,8 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       );
       if (done) clearActiveCharterRequest({ refresh: true });
     }
-    hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
-    if (silentClear) {
+    if (!hasMoreCharterLegs) hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
+    if (silentClear && !hasMoreCharterLegs) {
       setDrawTool('pan');
       setLineMode('straight');
       captureRouteCodeEl.value = '';
@@ -2854,6 +2871,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       renderCaptureState();
     }
     await fetch('/api/refresh', { method: 'POST' });
+    if (hasMoreCharterLegs) advanceCharterLeg();
     return true;
   } catch (error) {
     captureStatusEl.textContent = `Lỗi: ${error.message}`;
@@ -4051,6 +4069,73 @@ function applyCharterStationsToForm(stops) {
   checkRouteCodeDuplicate();
 }
 
+/** 2 bến của 1 chặng charter — đúng payload 1 route được phép gửi. */
+function charterLegStops(leg) {
+  if (!leg?.from?.stationId || !leg?.to?.stationId) return [];
+  return charterStopsAsOrdered([
+    { ...leg.from, stopOrder: 1 },
+    { ...leg.to, stopOrder: 2 },
+  ]);
+}
+
+function charterLegQueue() {
+  return Array.isArray(activeCharterRequest?._legQueue) ? activeCharterRequest._legQueue : [];
+}
+
+function isFinalCharterLeg() {
+  const queue = charterLegQueue();
+  if (!queue.length) return true;
+  return (Number(activeCharterRequest?._legIndex) || 0) >= queue.length - 1;
+}
+
+/** Nạp 1 chặng vào form vẽ: start/end = 2 bến của chặng, mã tuyến riêng cho chặng. */
+function applyCharterLegToForm(leg, total) {
+  if (!leg?.from || !leg?.to) return;
+  activeCharterLeg = leg;
+  setStationComboValue('start', leg.from.stationId, { emitChange: false });
+  setStationComboValue('end', leg.to.stationId, { emitChange: false });
+  selectedStartStationId = leg.from.stationId;
+  selectedEndStationId = leg.to.stationId;
+  syncEndStationDisplay();
+  const booking = String(activeCharterRequest?.bookingCode || 'CHARTER').replace(/\s+/g, '-');
+  const suffix = total > 1 ? `-C${(Number(leg.index) || 0) + 1}` : '';
+  if (captureRouteCodeEl) captureRouteCodeEl.value = `${booking}${suffix}`.slice(0, 40);
+  if (captureRouteNameEl) {
+    const a = leg.from.stationName || leg.from.stationCode || leg.from.stationId;
+    const b = leg.to.stationName || leg.to.stationCode || leg.to.stationId;
+    captureRouteNameEl.value = `${a} - ${b}`;
+  }
+  if (createReverseRouteEl) {
+    createReverseRouteEl.checked = false;
+    createReverseRouteEl.disabled = true;
+  }
+  updateReverseRouteUi();
+  updateRouteTypeHint();
+  checkRouteCodeDuplicate();
+  updateCharterActiveBanner();
+}
+
+/** Lưu xong 1 chặng → mở chặng thiếu kế tiếp (không gộp, không tự nối). */
+function advanceCharterLeg() {
+  const queue = charterLegQueue();
+  const next = (Number(activeCharterRequest?._legIndex) || 0) + 1;
+  if (!activeCharterRequest || next >= queue.length) return false;
+  activeCharterRequest._legIndex = next;
+  const leg = queue[next];
+  unlockSurveyPath();
+  clearCapturePoints();
+  clearPlannedRoute();
+  clearCompletedRouteLine();
+  captureState.finished = false;
+  rebuildCaptureMarkers();
+  applyCharterLegToForm(leg, queue.length);
+  setDrawTool('draw');
+  updateWorkflow('draw');
+  captureStatusEl.textContent = `Charter: chặng ${next + 1}/${queue.length} — vẽ ${leg.label} (1 route = 2 bến).`;
+  notifyInfo(`Chặng kế tiếp: ${leg.label}`);
+  return true;
+}
+
 function sameStationRef(a, b) {
   if (!a || !b) return false;
   const idA = String(a.stationId || '').trim();
@@ -4148,13 +4233,14 @@ function buildCharterPathFromSavedRoutes(stops) {
     const seg = findSavedSegmentBetween(from, to);
     if (!seg) {
       gapHit = true;
-      missingLegs.push({ from, to, label });
+      missingLegs.push({ from, to, label, index: i });
       continue;
     }
     const leg = {
       from,
       to,
       label,
+      index: i,
       routeCode: seg.routeCode,
       routeId: seg.routeId,
       coords: seg.coords,
@@ -4249,10 +4335,15 @@ function updateCharterActiveBanner() {
     if (fullyCovered) {
       const ok = match.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
       charterActiveMetaEl.textContent = `${stopNames || '—'} · đã có sẵn: ${ok} — chỉ hiện, không chỉnh`;
-    } else if (match?.matchedLegs?.length && match?.missingLegs?.length) {
+    } else if (match?.missingLegs?.length) {
+      const queue = charterLegQueue();
+      const pos = (Number(activeCharterRequest?._legIndex) || 0) + 1;
       const ok = match.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
+      const now = activeCharterLeg ? ` · đang vẽ chặng ${pos}/${queue.length}: ${activeCharterLeg.label}` : '';
       const miss = match.missingLegs.map((l) => l.label).join(', ');
-      charterActiveMetaEl.textContent = `${stopNames || '—'} · có sẵn: ${ok} · còn thiếu (mới vẽ): ${miss}`;
+      charterActiveMetaEl.textContent = ok
+        ? `${stopNames || '—'} · có sẵn: ${ok} · còn thiếu: ${miss}${now}`
+        : `${stopNames || '—'} · còn thiếu: ${miss}${now}`;
     } else if (hasCandidate) {
       charterActiveMetaEl.textContent = `${stopNames || '—'} · có candidate từ BE — chỉ hiện`;
     } else {
@@ -4266,6 +4357,7 @@ function updateCharterActiveBanner() {
 
 function clearActiveCharterRequest({ refresh = false } = {}) {
   activeCharterRequest = null;
+  activeCharterLeg = null;
   clearCharterMapLayers({ resetFlags: true });
   // Bỏ chọn → cờ về màu thường, xóa path gắn tạm, reset bến form.
   if (!recordingActive && !lockedSurveyPath) {
@@ -4360,6 +4452,9 @@ async function openCharterRequest(requestId) {
     }).catch(() => {});
 
     activeCharterRequest = detail;
+    activeCharterLeg = null;
+    detail._legQueue = [];
+    detail._legIndex = 0;
     if (recordingActive || lockedSurveyPath) {
       notifyWarn('Đang ghi/khóa path — chỉ nổi bến charter, không đổi bản vẽ hiện tại.');
       renderCharterStopPins(detail.stops || []);
@@ -4404,11 +4499,18 @@ async function openCharterRequest(requestId) {
     } else if (savedMatch.missingLegs?.length) {
       const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
       const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
+      // Vẽ & gửi từng chặng: mỗi route chỉ 2 bến, hết chặng này mới sang chặng sau.
+      activeCharterRequest._legQueue = savedMatch.missingLegs;
+      activeCharterRequest._legIndex = 0;
+      applyCharterLegToForm(savedMatch.missingLegs[0], savedMatch.missingLegs.length);
       setDrawTool('draw');
+      const first = savedMatch.missingLegs[0].label;
       captureStatusEl.textContent = ok
-        ? `Charter: có sẵn ${ok} (chỉ hiện). Còn thiếu — chỉ vẽ: ${miss}`
-        : `Charter: chưa có path — vẽ ${miss}`;
-      notifyInfo(ok ? `Chỉ vẽ đoạn thiếu: ${miss}` : `Vẽ: ${miss}`);
+        ? `Charter: có sẵn ${ok} (chỉ hiện). Chặng 1/${savedMatch.missingLegs.length} cần vẽ: ${first}`
+        : `Charter: chặng 1/${savedMatch.missingLegs.length} — vẽ ${first} (1 route = 2 bến).`;
+      notifyInfo(savedMatch.missingLegs.length > 1
+        ? `Còn thiếu ${savedMatch.missingLegs.length} chặng (${miss}) — vẽ & lưu từng chặng`
+        : `Chỉ vẽ đoạn thiếu: ${miss}`);
     } else {
       setDrawTool('draw');
       captureStatusEl.textContent = 'Charter: chỉ có bến — vẽ đường giữa các bến rồi ghi GPS.';
