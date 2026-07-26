@@ -4843,6 +4843,19 @@ async function saveRouteFromGpsOnTarget(session, body) {
     isPickupAllowed: stop.isPickupAllowed !== false,
     isDropoffAllowed: stop.isDropoffAllowed !== false,
   }));
+  // Charter: 1 lần lưu = đúng 2 bến (chặng đang vẽ). Chuỗi CB chỉ để nhìn trên UI.
+  if (isCharter && startStationId && endStationId && startStationId !== endStationId) {
+    const byId = new Map(stops.map((s) => [String(s.stationId), s]));
+    const a = byId.get(String(startStationId)) || stops[0] || { stationId: startStationId };
+    const b = byId.get(String(endStationId)) || stops[stops.length - 1] || { stationId: endStationId };
+    if (stops.length !== 2) {
+      console.warn(`[charter] Cắt stops ${stops.length} → 2 bến chặng (${a.stationCode || startStationId} → ${b.stationCode || endStationId})`);
+    }
+    stops = [
+      { ...a, stationId: startStationId, stopOrder: 1, isPickupAllowed: true, isDropoffAllowed: true },
+      { ...b, stationId: endStationId, stopOrder: 2, isPickupAllowed: true, isDropoffAllowed: true },
+    ];
+  }
   if (stops.length) {
     const snapped = snapCoordinatesToStops(coordinates, stops, detectRadius);
     const berthBufferMin = resolveBerthBufferMin(body, session);
@@ -5346,61 +5359,15 @@ async function persistRecordingSession(body, sessionInput = null) {
   }
 
   const savedRouteId = cleanOptionalText(route?.routeId || route?.id || route?.RouteId);
-  // Chỉ complete khi FE/session gửi rõ charterFinalLeg=true (không mặc định true).
+  // Chỉ complete khi FE gửi charterFinalLeg=true VÀ route vừa lưu đúng 2 bến
+  // (charter 1 chặng). Nhiều chặng CB: chỉ lưu từng cặp 2 bến, không compose FULL 3+ bến.
   const charterFinalLeg = body.charterFinalLeg === true
     || session?.charterFinalLeg === true;
-  if (charterRequestId && savedRouteId && savedTo === 'target' && charterFinalLeg) {
-    // Complete cần route stops khớp ĐỦ thứ tự bến của yêu cầu.
-    // >2 bến → ghép route tổng từ các chặng qua from-stations trước.
-    let completeRouteId = savedRouteId;
-    const allStops = Array.isArray(body.charterAllStops) && body.charterAllStops.length
-      ? body.charterAllStops
-      : (Array.isArray(session?.charterAllStops) ? session.charterAllStops : []);
-    if (allStops.length > 2) {
-      const composed = await composeCharterRouteFromGps(session, {
-        ...body,
-        charterAllStops: allStops,
-        charterComposeCode: body.charterComposeCode || session?.charterComposeCode,
-        charterComposeName: body.charterComposeName || session?.charterComposeName,
-      });
-      if (composed.ok) {
-        const composedId = cleanOptionalText(composed.data?.routeId || composed.data?.id);
-        if (composedId) {
-          completeRouteId = composedId;
-          route.composedRoute = composed.data || null;
-          console.log(`[charter] Route tổng from-gps OK → ${composedId} (${composed.data?.routeCode || ''})`);
-        } else {
-          const err = userError(
-            'Tạo route tổng from-gps OK nhưng BE không trả routeId · Charter CHƯA hoàn tất.',
-          );
-          err.status = 422;
-          err.code = 'CHARTER_COMPOSE_NO_ID';
-          err.partialRouteId = savedRouteId;
-          throw err;
-        }
-      } else {
-        const err = userError(
-          `Đã lưu chặng (from-gps) nhưng tạo route tổng thất bại: ${composed.error || composed.status}`
-            + ' · Charter CHƯA hoàn tất.',
-        );
-        err.status = 422;
-        err.code = 'CHARTER_COMPOSE_FAILED';
-        err.partialRouteId = savedRouteId;
-        throw err;
-      }
-    } else if (allStops.length === 2) {
-      // 1 chặng duy nhất: route vừa lưu phải đúng 2 bến đó — OK dùng luôn.
-      completeRouteId = savedRouteId;
-    } else {
-      const err = userError(
-        'Thiếu danh sách bến charter (charterAllStops) — không complete bằng route chặng lệch thứ tự.',
-      );
-      err.status = 422;
-      err.code = 'CHARTER_STOPS_MISSING';
-      err.partialRouteId = savedRouteId;
-      throw err;
-    }
-    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, completeRouteId);
+  const savedStopCount = Array.isArray(route?.stops)
+    ? route.stops.length
+    : (Array.isArray(body.stops) ? body.stops.length : 0);
+  if (charterRequestId && savedRouteId && savedTo === 'target' && charterFinalLeg && savedStopCount === 2) {
+    charterComplete = await completeCharterRouteDrawRequest(charterRequestId, savedRouteId);
     if (!charterComplete.ok) {
       const err = userError(
         `Đã lưu route nhưng complete charter thất bại: ${charterComplete.error || charterComplete.status}`
@@ -5408,12 +5375,15 @@ async function persistRecordingSession(body, sessionInput = null) {
       );
       err.status = Number(charterComplete.status) || 422;
       err.code = 'CHARTER_COMPLETE_FAILED';
-      err.partialRouteId = completeRouteId;
+      err.partialRouteId = savedRouteId;
       throw err;
     }
-  } else if (charterRequestId && savedRouteId && savedTo === 'target' && !charterFinalLeg) {
-    console.log(`[charter] Đã lưu chặng ${savedRouteId} — chưa complete (charterFinalLeg=false)`);
-  } else if (charterRequestId && state.charterDrawRequests.has(charterRequestId) && charterFinalLeg) {
+  } else if (charterRequestId && savedRouteId && savedTo === 'target') {
+    console.log(
+      `[charter] Đã lưu chặng 2 bến ${savedRouteId}`
+        + (charterFinalLeg ? ' (không compose FULL nhiều bến)' : ' — chưa complete'),
+    );
+  } else if (charterRequestId && state.charterDrawRequests.has(charterRequestId) && charterFinalLeg && savedStopCount === 2) {
     const row = state.charterDrawRequests.get(charterRequestId);
     row.status = savedRouteId ? 'Done' : row.status;
     row.resultRouteId = savedRouteId || null;

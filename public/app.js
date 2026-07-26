@@ -1255,10 +1255,19 @@ function buildSurveyStops() {
   const routeType = getSurveyRouteType();
   let ordered = collectOrderedStopsFromClicks();
   if (activeCharterLeg) {
-    // Charter: mỗi lần lưu chỉ gửi 1 route = 2 bến của chặng đang vẽ.
+    // Charter: mỗi lần lưu chỉ gửi đúng 2 bến của chặng đang vẽ (1→2).
     ordered = charterLegStops(activeCharterLeg);
-  } else if (activeCharterRequest?.stops?.length) {
-    ordered = charterStopsAsOrdered(activeCharterRequest.stops);
+  } else if (activeCharterRequest?.requestId) {
+    // Có CB mở nhưng chưa gắn chặng → vẫn chỉ lấy 2 bến form, không lấy cả chuỗi CB.
+    const startId = startStationEl?.value || captureState.points[0]?.stationId || '';
+    const endId = endStationEl?.value
+      || [...captureState.points].reverse().find((p) => p.source === 'station-end')?.stationId
+      || '';
+    if (startId && endId && String(startId) !== String(endId)) {
+      const a = findStationInCatalog(startId) || { stationId: startId };
+      const b = findStationInCatalog(endId) || { stationId: endId };
+      ordered = charterLegStops({ from: a, to: b });
+    }
   }
   const withTravel = attachSegmentTravelMinutesFe(getPathCoordinates(), ordered, getSurveySpeedKmh());
   return withTravel.map((stop) => ({
@@ -1476,28 +1485,14 @@ function surveySaveFields() {
       fields.startStationId = activeCharterLeg.from.stationId;
       fields.endStationId = activeCharterLeg.to.stationId;
       fields.charterLegLabel = activeCharterLeg.label || null;
+      // Tên/mã theo đúng 2 bến chặng — không dùng cả CB (BD→BS).
+      const a = activeCharterLeg.from.stationCode || activeCharterLeg.from.stationName;
+      const b = activeCharterLeg.to.stationCode || activeCharterLeg.to.stationName;
+      if (a && b) fields.routeNameHint = `${a} - ${b}`;
     }
-    // Chỉ complete request khi đã lưu chặng thiếu cuối cùng.
-    fields.charterFinalLeg = isFinalCharterLeg();
-    // Chặng cuối: server ghép route tổng (from-stations) từ các chặng 2 bến rồi complete.
-    const allOrdered = charterStopsAsOrdered(activeCharterRequest.stops || []);
-    fields.charterAllStops = allOrdered.map((stop) => ({
-      stationId: stop.stationId,
-      stationCode: stop.stationCode,
-      stationName: stop.stationName,
-      stopOrder: stop.stopOrder,
-      lat: stop.lat,
-      lng: stop.lng,
-    }));
-    fields.charterComposeCode = String(activeCharterRequest.bookingCode || '')
-      .replace(/\s+/g, '-')
-      .slice(0, 40) || null;
-    const composeNames = allOrdered
-      .map((s) => s.stationCode || s.stationName)
-      .filter(Boolean);
-    fields.charterComposeName = composeNames.length >= 2
-      ? `${composeNames[0]} - ${composeNames[composeNames.length - 1]}`
-      : null;
+    // Chỉ complete khi charter đúng 2 bến. Nhiều chặng: lưu từng cặp, không compose FULL.
+    fields.charterFinalLeg = isFinalCharterLeg()
+      && charterStopsAsOrdered(activeCharterRequest.stops || []).length <= 2;
     return fields;
   }
   const wantReverse = Boolean(createReverseRouteEl?.checked)
