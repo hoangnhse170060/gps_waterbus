@@ -438,6 +438,30 @@ const server = createServer(async (req, res) => {
       broadcast();
       return sendJson(res, result, result.created ? 201 : 200);
     }
+    // BE hủy chuyến → GPS dừng mission (không còn chạy path + locations kèm tripId).
+    // POST /api/gps/trips/hook + X-Live-Hook-Secret
+    // { "event": "TripCancelled", "tripId": "..." }
+    if (url.pathname === '/api/gps/trips/hook' && req.method === 'POST') {
+      const body = await readJson(req);
+      const result = await ingestTripHook(body, req);
+      if (!result.ok) return sendJson(res, result, result.status || 400);
+      broadcast();
+      return sendJson(res, result);
+    }
+    {
+      const tripCancelMatch = url.pathname.match(/^\/api\/gps\/trips\/([^/]+)\/cancel$/);
+      if (tripCancelMatch && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        const result = await ingestTripHook({
+          ...(body && typeof body === 'object' ? body : {}),
+          event: 'TripCancelled',
+          tripId: decodeURIComponent(tripCancelMatch[1]),
+        }, req);
+        if (!result.ok) return sendJson(res, result, result.status || 400);
+        broadcast();
+        return sendJson(res, result);
+      }
+    }
     if (url.pathname === '/api/charter/auth/login' && req.method === 'POST') {
       const body = await readJson(req);
       const result = await loginAzureAdmin({
@@ -6134,6 +6158,50 @@ function verifyLiveHookSecret(body = {}, req = null) {
     return { ok: false, status: 401, error: 'Hook secret sai — gửi header X-Live-Hook-Secret' };
   }
   return { ok: true };
+}
+
+/**
+ * BE push hủy / cập nhật trip → GPS.
+ * POST /api/gps/trips/hook
+ * Header: X-Live-Hook-Secret
+ *
+ * { "event": "TripCancelled", "tripId": "...", "reason": "..." }
+ * Alias path: POST /api/gps/trips/{tripId}/cancel
+ */
+async function ingestTripHook(body = {}, req = null) {
+  const auth = verifyLiveHookSecret(body, req);
+  if (!auth.ok) return auth;
+
+  const event = String(body.event || body.type || body.action || 'TripCancelled').trim();
+  const eventLower = event.toLowerCase();
+  const tripId = cleanOptionalText(
+    body.tripId || body.id || body.TripId || body.data?.tripId || body.data?.id,
+  );
+  if (!tripId) {
+    return { ok: false, status: 400, error: 'Thiếu tripId' };
+  }
+
+  if (
+    eventLower.includes('cancel')
+    || body.cancelled === true
+    || body.isCancelled === true
+  ) {
+    const result = await tripAutorun.cancelTripMission(tripId, {
+      reason: cleanOptionalText(body.reason || body.message) || event || 'TripCancelled',
+      source: 'hook',
+    });
+    return {
+      ...result,
+      event: event || 'TripCancelled',
+    };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    error: `Event không hỗ trợ: ${event || '(empty)'} — dùng TripCancelled`,
+    tripId,
+  };
 }
 
 /**

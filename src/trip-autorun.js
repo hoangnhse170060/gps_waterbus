@@ -122,6 +122,9 @@ export function createTripAutorun(ctx) {
       routeCode: mission.routeCode,
       status: mission.status,
       handoffMissionType: mission.handoffMissionType || null,
+      cancelReason: mission.cancelReason || null,
+      cancelSource: mission.cancelSource || null,
+      cancelledAt: mission.cancelledAt || null,
       departureTime: mission.departureTime,
       arrivalTime: mission.arrivalTime,
       delayActive: Boolean(mission.delayActive),
@@ -1322,6 +1325,10 @@ export function createTripAutorun(ctx) {
     const tripId = cleanOptionalText(row.tripId || row.TripId);
     const boatCode = cleanOptionalText(row.boatCode || row.BoatCode);
     if (!tripId || !boatCode) return null;
+    if (isCancelledTripRow(row)) {
+      console.warn(`[trip-gps] skip ${tripId}: BE status Cancelled — không start`);
+      return null;
+    }
     if (state.tripMissions.has(tripId)) {
       const existing = state.tripMissions.get(tripId);
       if (ACTIVE_TRIP_STATUSES.has(String(existing.status || '')) || existing.status === 'Completed') {
@@ -1936,8 +1943,67 @@ export function createTripAutorun(ctx) {
     }
   }
 
+  function isCancelledTripRow(row = {}) {
+    if (row?.isCancelled === true || row?.cancelled === true || row?.IsCancelled === true) return true;
+    const st = String(
+      row?.status || row?.Status || row?.tripStatus || row?.TripStatus || '',
+    ).toLowerCase();
+    return st.includes('cancel');
+  }
+
+  /**
+   * Dừng GPS theo trip đã hủy trên BE.
+   * Không gọi complete — chuyến đã Cancelled, không đánh Completed.
+   * Publish idle không kèm tripId để gỡ liên kết chuyến.
+   */
+  async function cancelTripMission(tripId, { reason = 'cancelled', source = 'hook' } = {}) {
+    const id = cleanOptionalText(tripId);
+    if (!id) return { ok: false, status: 400, error: 'Thiếu tripId' };
+    const mission = state.tripMissions.get(id);
+    if (!mission) {
+      return { ok: true, skipped: true, tripId: id, reason: 'không có mission local' };
+    }
+    const st = String(mission.status || '');
+    if (st === 'Cancelled' || st === 'Completed') {
+      return { ok: true, skipped: true, tripId: id, status: st, boatCode: mission.boatCode };
+    }
+    mission.status = 'Cancelled';
+    mission.speedKmh = 0;
+    mission.movementStatus = 'Cancelled';
+    mission.cancelledAt = new Date().toISOString();
+    mission.updatedAt = mission.cancelledAt;
+    mission.cancelReason = cleanOptionalText(reason) || 'cancelled';
+    mission.cancelSource = cleanOptionalText(source) || 'hook';
+    try {
+      await publishLiveGpsPosition({
+        boatCode: mission.boatCode,
+        lat: mission.currentLat,
+        lng: mission.currentLng,
+        heading: mission.lastHeading,
+        speedKmh: 0,
+        status: 'idle',
+        sendToTarget: true,
+        fromTrip: false,
+      });
+    } catch (error) {
+      mission.lastError = error?.message || 'cancel publish failed';
+    }
+    console.log(
+      `[trip-gps] CANCELLED ${mission.boatCode} trip=${id}`
+        + ` · ${mission.cancelReason} (${mission.cancelSource})`,
+    );
+    return {
+      ok: true,
+      tripId: id,
+      boatCode: mission.boatCode,
+      status: 'Cancelled',
+      reason: mission.cancelReason,
+      source: mission.cancelSource,
+    };
+  }
+
   async function tickOneMission(mission, nowMs) {
-    if (!mission || mission.status === 'Completed') return;
+    if (!mission || mission.status === 'Completed' || mission.status === 'Cancelled') return;
 
     // Path cũ đâm V vào cầu tàu → ép lại đúng vạch sông.
     ensureMissionCorridorPath(mission);
@@ -2179,6 +2245,14 @@ export function createTripAutorun(ctx) {
           const tripBoat = cleanOptionalText(row.boatCode || row.BoatCode) || boatCode;
           if (tripBoat !== boatCode) continue;
           const tripId = cleanOptionalText(row.tripId || row.TripId);
+          // BE trả status Cancelled trong due → dừng ngay, không start / không tick tiếp.
+          if (tripId && isCancelledTripRow(row)) {
+            await cancelTripMission(tripId, {
+              reason: `BE due status=${row.status || row.Status || 'Cancelled'}`,
+              source: 'due-poll',
+            });
+            continue;
+          }
           const existing = tripId ? state.tripMissions.get(tripId) : null;
           if (existing && ACTIVE_TRIP_STATUSES.has(String(existing.status || ''))) {
             applyBeScheduleToMission(existing, row);
@@ -2204,7 +2278,7 @@ export function createTripAutorun(ctx) {
       const nowMs = Date.now();
       const list = [...state.tripMissions.values()];
       for (const mission of list) {
-        if (mission.status === 'Completed') continue;
+        if (mission.status === 'Completed' || mission.status === 'Cancelled') continue;
         try {
           await tickOneMission(mission, nowMs);
         } catch (error) {
@@ -2220,8 +2294,11 @@ export function createTripAutorun(ctx) {
   function pruneCompletedTrips() {
     const now = Date.now();
     for (const [id, mission] of state.tripMissions) {
-      if (String(mission.status) !== 'Completed') continue;
-      const at = parseTimeMs(mission.completedAt) || parseTimeMs(mission.updatedAt);
+      const st = String(mission.status);
+      if (st !== 'Completed' && st !== 'Cancelled') continue;
+      const at = parseTimeMs(mission.completedAt)
+        || parseTimeMs(mission.cancelledAt)
+        || parseTimeMs(mission.updatedAt);
       if (Number.isFinite(at) && now - at > COMPLETED_TTL_MS) {
         state.tripMissions.delete(id);
       }
@@ -2236,6 +2313,7 @@ export function createTripAutorun(ctx) {
     isBoatInActiveTripMission,
     tripMissionsPublic,
     startTripMission,
+    cancelTripMission,
     takeoverTripForReplacement,
     findActiveTripMission,
   };
