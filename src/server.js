@@ -437,6 +437,43 @@ setInterval(() => {
     console.warn(`[rescue-gps] ${error.message}`);
   });
 }, Math.max(1000, Number(env.RESCUE_GPS_INTERVAL_MS || env.SEND_INTERVAL_MS || 2000)));
+
+/** Neo lại tàu Incident/UnderMaintenance — đè nguồn Azure lạ vẫn POST locations. */
+setInterval(() => {
+  for (const boat of state.boats.values()) {
+    const code = String(boat?.boatCode || '').trim();
+    if (!code || !boatNeedsIncidentFreeze(code)) continue;
+    // Đang được SOS kéo (Towing) → để tickRescue sở hữu GPS.
+    let towing = false;
+    for (const mission of state.rescueMissions.values()) {
+      if (String(mission.incidentBoatCode || '').trim() !== code) continue;
+      if (['Towing', 'InTransit', 'Dispatched', 'Arrived'].includes(String(mission.status || ''))) {
+        towing = true;
+        break;
+      }
+    }
+    if (towing) continue;
+    const hub = state.hubBoats.get(code);
+    const lat = Number(hub?.lat ?? boat.lat);
+    const lng = Number(hub?.lng ?? boat.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    // Chỉ publish lại nếu hub đang bị echo tốc độ > 0 hoặc chưa suppress.
+    const spd = Number(hub?.speedKmh);
+    const suppressUntil = hubBoatSuppressUntil.get(code) || 0;
+    if (!(spd > 0.5) && suppressUntil > Date.now()) continue;
+    publishLiveGpsPosition({
+      boatCode: code,
+      lat,
+      lng,
+      heading: Number(hub?.heading ?? boat.heading ?? 0),
+      speedKmh: 0,
+      status: 'idle',
+      sendToTarget: true,
+      fromRescue: true,
+      holdAuthority: true,
+    }).catch(() => {});
+  }
+}, Math.max(2000, Number(env.INCIDENT_FREEZE_REPIN_MS || 4000)));
 // BE contract: load lần đầu + poll /boats/latest khi SignalR thiếu/lỗi.
 setInterval(pollLatestBoatLocations, Number(env.BOATS_LATEST_POLL_MS || 4000));
 
@@ -1303,6 +1340,29 @@ function upsertHubBoat(payload) {
   // Đang cứu hộ / trip lịch: chỉ nhận GPS từ publishLiveGpsPosition (forceAccept), bỏ echo Azure cũ.
   if (!forceAccept && isBoatInActiveRescueMission(code)) return;
   if (!forceAccept && tripAutorun.isBoatInActiveTripMission(code)) return;
+  // Sự cố / bảo trì: Neo hub — bỏ mọi echo Azure/SignalR (kể cả forceAccept).
+  // Case đang gặp: Neon=Incident nhưng nguồn khác vẫn POST locations → azure-signalr đẩy SC chạy.
+  const azureEcho = Boolean(payload.fromAzure)
+    || String(payload.source || '').startsWith('azure');
+  if (azureEcho && boatNeedsIncidentFreeze(code)) {
+    const prevHub = state.hubBoats.get(code);
+    if (prevHub) {
+      state.hubBoats.set(code, {
+        ...prevHub,
+        speedKmh: 0,
+        status: 'idle',
+        isOnline: true,
+        boatStatus: 'Incident',
+        beStatus: prevHub.beStatus || 'Incident',
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    hubBoatSuppressUntil.set(code, Date.now() + Math.max(
+      Number(env.HUB_LIVE_AUTHORITY_MS || 120_000),
+      60_000,
+    ));
+    return;
+  }
   // Vừa nhận GPS Live/trip: bỏ Azure echo cũ trong cửa sổ ngắn.
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (!forceAccept && liveAuthUntil > Date.now()) return;
@@ -2146,6 +2206,24 @@ async function publishLiveGpsPosition(body = {}) {
       mode: 'incident-freeze',
       error: `Tàu ${boatCode} không Active (sự cố/bảo trì) — chặn trip GPS đang chạy.`,
     };
+  }
+
+  // Heartbeat / kéo tay cũng không được đẩy tàu sự cố chạy (speed > 0).
+  if (!fromRescue && boatNeedsIncidentFreeze(boatCode) && Number(body.speedKmh) > 0.5) {
+    const hub = state.hubBoats.get(boatCode);
+    const freezeLat = Number.isFinite(Number(hub?.lat)) ? Number(hub.lat) : lat;
+    const freezeLng = Number.isFinite(Number(hub?.lng)) ? Number(hub.lng) : lng;
+    return publishLiveGpsPosition({
+      ...body,
+      lat: freezeLat,
+      lng: freezeLng,
+      speedKmh: 0,
+      status: 'idle',
+      fromTrip: false,
+      fromRescue: true,
+      holdAuthority: true,
+      sendToTarget: body.sendToTarget,
+    });
   }
 
   const matched = [...state.boats.values()].find((boat) => (
@@ -7548,6 +7626,8 @@ function shouldForceAcceptAzurePosition(payload) {
   const code = String(payload?.boatCode || payload?.BoatCode || '').trim();
   if (!code) return false;
   if (activeSurveyBoatCode() === code) return false;
+  // Sự cố / bảo trì: tuyệt đối không forceAccept Azure (tránh SC bị đẩy chạy).
+  if (boatNeedsIncidentFreeze(code)) return false;
   // Vừa kéo tay / trip / rescue — KHÔNG forceAccept Azure cũ (kể cả local follow-only).
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (liveAuthUntil > Date.now()) return false;
@@ -7565,6 +7645,7 @@ function shouldForceAcceptAzurePosition(payload) {
  */
 function shouldKeepHubOverAzure(boatCode, azureRow = {}) {
   const code = String(boatCode || '').trim();
+  if (code && boatNeedsIncidentFreeze(code)) return true;
   const hub = state.hubBoats.get(code);
   if (!hub || !Number.isFinite(Number(hub.lat)) || !Number.isFinite(Number(hub.lng))) return false;
 
