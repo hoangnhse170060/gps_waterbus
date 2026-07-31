@@ -462,6 +462,10 @@ body.survey-open {
   background: #7c3aed;
 }
 
+.leg-replacement {
+  background: #0284c7;
+}
+
 .leg-mute {
   background: #94a3b8;
 }
@@ -537,6 +541,10 @@ body.survey-open {
   background: #7c3aed;
 }
 
+.live-boat-tag.is-replacement {
+  background: #0284c7;
+}
+
 .live-boat-tag.is-incident {
   background: #dc2626;
 }
@@ -545,6 +553,12 @@ body.survey-open {
   width: 50px;
   height: 50px;
   filter: drop-shadow(0 0 8px rgba(124, 58, 237, 0.55));
+}
+
+.live-boat.is-replacement {
+  width: 50px;
+  height: 50px;
+  filter: drop-shadow(0 0 8px rgba(2, 132, 199, 0.5));
 }
 
 .live-boat-popup-wrap .leaflet-popup-content-wrapper {
@@ -597,6 +611,11 @@ body.survey-open {
 .live-dot.is-incident {
   background: #dc2626;
   box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.22);
+}
+
+.live-dot.is-replacement {
+  background: #0284c7;
+  box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.22);
 }
 
 .live-ctx-menu {

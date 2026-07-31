@@ -133,6 +133,7 @@ const stationLayers = new Map();
 const hubMarkers = new Map();
 const routeLayers = new Map();
 const rescueOverlays = new Map();
+const handoffOverlays = new Map(); // tàu thay → hiện trường (ToHandoff)
 
 function loadJsonMap(key) {
   try {
@@ -478,7 +479,12 @@ function renderRescueOverlays(data = latest) {
     const localMission = missionForIncident(row.incidentId);
     const autoMission = autoById.get(String(row.incidentId || '').trim());
     const rescueCode = String(
-      autoMission?.rescueBoatCode || localMission?.rescueBoatCode || row.rescueBoatCode || row.replacementBoatCode || '',
+      autoMission?.rescueBoatCode
+      || localMission?.rescueBoatCode
+      || row.rescueBoatCode
+      // Contract cũ: chỉ có replacementBoatCode = tàu cứu (không có SOS riêng).
+      || (!row.rescueBoatCode ? row.replacementBoatCode : '')
+      || '',
     ).trim();
     const incidentCode = String(autoMission?.incidentBoatCode || row.boatCode || '').trim();
     const rescuePin = rescueCode ? pinnedFor(rescueCode) : null;
@@ -581,6 +587,67 @@ function renderRescueOverlays(data = latest) {
       overlay.towLine?.remove();
       overlay.incidentDot?.remove();
       rescueOverlays.delete(id);
+    }
+  }
+}
+
+/** Đường xanh: tàu thay đang tới hiện trường / bến bàn giao (ToHandoff). */
+function renderHandoffOverlays(data = latest) {
+  const seen = new Set();
+  const trips = Array.isArray(data?.tripMissions) ? data.tripMissions : [];
+  for (const trip of trips) {
+    if (String(trip.status || '') !== 'ToHandoff') continue;
+    const boatCode = String(trip.boatCode || '').trim();
+    if (!boatCode) continue;
+    const key = String(trip.tripId || boatCode);
+    seen.add(key);
+
+    const pin = pinnedFor(boatCode);
+    const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === boatCode);
+    const fromLat = Number(pin?.lat ?? hub?.lat ?? trip.currentLat);
+    const fromLng = Number(pin?.lng ?? hub?.lng ?? trip.currentLng);
+    let toLat = Number(trip.handoffLat);
+    let toLng = Number(trip.handoffLng);
+    // Fallback: vị trí tàu sự cố đang bị takeover.
+    if (!Number.isFinite(toLat) || !Number.isFinite(toLng)) {
+      const fromBoat = String(trip.takenOverFrom || '').trim();
+      if (fromBoat) {
+        const scPin = pinnedFor(fromBoat);
+        const scHub = (data?.hubBoats || []).find((b) => String(b.boatCode) === fromBoat);
+        toLat = Number(scPin?.lat ?? scHub?.lat);
+        toLng = Number(scPin?.lng ?? scHub?.lng);
+      }
+    }
+    if (
+      !Number.isFinite(fromLat) || !Number.isFinite(fromLng)
+      || !Number.isFinite(toLat) || !Number.isFinite(toLng)
+    ) {
+      continue;
+    }
+
+    const pts = [[fromLat, fromLng], [toLat, toLng]];
+    let overlay = handoffOverlays.get(key);
+    if (!overlay) {
+      overlay = { line: null };
+      handoffOverlays.set(key, overlay);
+    }
+    if (!overlay.line) {
+      overlay.line = L.polyline(pts, {
+        color: '#0284c7',
+        weight: 3,
+        opacity: 0.55,
+        dashArray: '8 6',
+      }).addTo(map);
+    } else {
+      overlay.line.setLatLngs(pts);
+      if (!map.hasLayer(overlay.line)) overlay.line.addTo(map);
+    }
+  }
+
+  for (const [id, overlay] of handoffOverlays) {
+    if (!seen.has(id)) {
+      overlay.line?.remove();
+      handoffOverlays.delete(id);
     }
   }
 }
@@ -726,13 +793,44 @@ function openIncidentForBoat(code) {
 function isRescueBoat(code) {
   const key = String(code || '').trim();
   if (!key) return false;
-  const automated = (latest?.rescueMissions || []).find(
-    (mission) => String(mission.rescueBoatCode || '').trim() === key,
-  );
+  // Tàu thay (__xfer / takenOver) không đeo badge CỨU.
+  if (isReplacementBoat(key)) return false;
+  const automated = (latest?.rescueMissions || []).find((mission) => {
+    if (String(mission.rescueBoatCode || '').trim() !== key) return false;
+    // Mission tạm điều tàu thay tới hiện trường — không phải SOS.
+    if (String(mission.incidentId || '').endsWith('__xfer')) return false;
+    return true;
+  });
   if (!automated) return false;
   // Badge CỨU chỉ khi SOS đang chạy mission — không hiện vì chỉ bị gán trên Open incident.
   const status = String(automated.status || '');
   return ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status);
+}
+
+/** Tàu thay khách: takeover trip (ToHandoff / takenOverFrom) hoặc gán replacementBoatCode. */
+function isReplacementBoat(code, data = latest) {
+  const key = String(code || '').trim();
+  if (!key) return false;
+  const trips = Array.isArray(data?.tripMissions) ? data.tripMissions : [];
+  for (const trip of trips) {
+    if (String(trip.boatCode || '').trim() !== key) continue;
+    if (trip.takenOverFrom) return true;
+    if (String(trip.status || '') === 'ToHandoff') return true;
+  }
+  for (const mission of (data?.rescueMissions || [])) {
+    if (!String(mission.incidentId || '').endsWith('__xfer')) continue;
+    if (String(mission.rescueBoatCode || '').trim() === key) {
+      const st = String(mission.status || '');
+      if (['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(st)) return true;
+    }
+  }
+  for (const row of openIncidentsList(data)) {
+    const rep = String(row.replacementBoatCode || '').trim();
+    const res = String(row.rescueBoatCode || '').trim();
+    // Chỉ khi BE gửi cả SOS + TT riêng (không nhầm contract cũ: replacement = cứu).
+    if (rep === key && res && rep !== res) return true;
+  }
+  return false;
 }
 
 function syncLocalIncidentFlags() {
@@ -862,6 +960,7 @@ function boatMarkerZIndex(code, {
   selected = false,
   canDrag = false,
   rescue = false,
+  replacement = false,
   incident = false,
   updateMs = 0,
   newestMs = 0,
@@ -871,6 +970,7 @@ function boatMarkerZIndex(code, {
     ? Math.min(180, Math.round((updateMs / newestMs) * 180))
     : 0;
   if (rescue) return 1100 + recency;
+  if (replacement) return 1080 + recency;
   if (incident) return 1000 + recency;
   return 700 + recency;
 }
@@ -1057,6 +1157,20 @@ function phaseStatusText(code, lat, lng) {
         ? `Trip · về bến XP · ${nextLabel} · ${spd} km/h`
         : `Trip · về bến xuất phát · ${spd} km/h`;
     }
+    if (trip.status === 'ToHandoff') {
+      const handoff = trip.handoffMissionType === 'ContinueFromStation'
+        ? (nextLabel || 'bến bàn giao')
+        : 'hiện trường (nhận khách)';
+      return `Tàu thay · tới ${handoff} · ${spd} km/h`;
+    }
+    if (trip.takenOverFrom) {
+      const from = String(trip.takenOverFrom || '').trim();
+      if (trip.status === 'Running') {
+        return nextLabel
+          ? `Tàu thay · tiếp trip (${from}) · ${nextLabel} · ${spd} km/h`
+          : `Tàu thay · tiếp trip (${from}) · ${spd} km/h`;
+      }
+    }
     if (trip.delayActive) {
       const station = trip.waitingStationName || trip.nextStopName || null;
       const countdown = waitingCountdownLabel(trip);
@@ -1102,9 +1216,14 @@ function phaseStatusText(code, lat, lng) {
         ? `Đã cập bến · ${berthName} · Sự cố`
         : `Đã cập bến · ${berthName}`;
     }
-    const base = (open?.rescueBoatCode || open?.replacementBoatCode)
-      ? `Sự cố · cứu: ${open.rescueBoatCode || open.replacementBoatCode}`
-      : 'Sự cố';
+    const base = (() => {
+      const sos = String(open?.rescueBoatCode || '').trim();
+      const tt = String(open?.replacementBoatCode || '').trim();
+      if (sos && tt && sos !== tt) return `Sự cố · cứu: ${sos} · thay: ${tt}`;
+      if (sos) return `Sự cố · cứu: ${sos}`;
+      if (tt) return `Sự cố · thay: ${tt}`;
+      return 'Sự cố';
+    })();
     return dbLabel === 'Bảo trì' ? `${base} · Bảo trì` : base;
   }
   // Không còn sự cố mở nhưng DB vẫn UnderMaintenance.
@@ -1146,11 +1265,14 @@ function boatPopupHtml(code, catalogBoat, hub, lat, lng) {
   const name = boatDisplayName(code, catalogBoat, hub);
   const label = phaseLabel(code, lat, lng);
   const incident = Boolean(open || st.incident || phase === 'incident');
-  const rescue = isRescueBoat(code);
+  const replacement = isReplacementBoat(code);
+  const rescue = !replacement && isRescueBoat(code);
   const dotClass = incident
     ? 'is-incident'
-    : (signal ? 'is-ok' : 'is-off');
-  const extra = rescue && !incident ? 'Tàu cứu hộ' : '';
+    : (replacement ? 'is-replacement' : (signal ? 'is-ok' : 'is-off'));
+  const extra = replacement && !incident
+    ? 'Tàu thay thế'
+    : (rescue && !incident ? 'Tàu cứu hộ' : '');
   return `
     <div class="live-boat-popup">
       <div class="live-boat-popup-title">
@@ -1171,8 +1293,9 @@ function boatDeckCount(code, catalogBoat) {
   return 1;
 }
 
-function boatColor({ signal, incident, decks, rescue, maintenance }) {
+function boatColor({ signal, incident, decks, rescue, replacement, maintenance }) {
   if (incident) return '#dc2626';
+  if (replacement) return '#0284c7';
   if (rescue) return '#7c3aed';
   if (maintenance) return '#ca8a04';
   if (!signal) return '#94a3b8';
@@ -1183,14 +1306,16 @@ function boatColor({ signal, incident, decks, rescue, maintenance }) {
 function boatIcon(heading = 0, opts = {}) {
   const deg = Number(heading) || 0;
   const fill = boatColor(opts);
-  const size = opts.drag ? 52 : (opts.rescue ? 50 : 44);
+  const size = opts.drag ? 52 : (opts.rescue || opts.replacement ? 50 : 44);
   const tag = opts.rescue
     ? '<span class="live-boat-tag is-rescue">CỨU</span>'
-    : (opts.incident ? '<span class="live-boat-tag is-incident">SC</span>' : '');
+    : (opts.replacement
+      ? '<span class="live-boat-tag is-replacement">TT</span>'
+      : (opts.incident ? '<span class="live-boat-tag is-incident">SC</span>' : ''));
   return L.divIcon({
     className: 'live-boat-wrap',
     html: `
-      <div class="live-boat${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}${opts.rescue ? ' is-rescue' : ''}" style="--heading:${deg}deg;--boat:${fill}">
+      <div class="live-boat${opts.drag ? ' is-drag' : ''}${opts.signal ? ' has-signal' : ''}${opts.rescue ? ' is-rescue' : ''}${opts.replacement ? ' is-replacement' : ''}" style="--heading:${deg}deg;--boat:${fill}">
         <span class="live-boat-ring"></span>
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path fill="${fill}" stroke="#fff" stroke-width="1.5" d="M12 3 L20 19 L12 15 L4 19 Z"></path>
@@ -1394,7 +1519,7 @@ function activeTripForBoat(code, data = latest) {
   const list = Array.isArray(data?.tripMissions) ? data.tripMissions : [];
   return list.find((row) => {
     if (String(row.boatCode || '').trim() !== key) return false;
-    return ['Pending', 'ToDeparture', 'Boarding', 'Running', 'WaitingAtStop', 'Paused'].includes(String(row.status || ''));
+    return ['Pending', 'ToDeparture', 'ToHandoff', 'Boarding', 'Running', 'WaitingAtStop', 'Paused'].includes(String(row.status || ''));
   }) || null;
 }
 
@@ -1582,6 +1707,7 @@ async function applyBoatHeading(code, deg, { announce = true } = {}) {
       signal: !inIncident && hasSignal(key, hub),
       incident: inIncident,
       maintenance: !inIncident && boatDbStatus(key) === 'undermaintenance',
+      replacement: isReplacementBoat(key),
       rescue: isRescueBoat(key),
       decks: boatDeckCount(key, catalogBoat),
     }));
@@ -1905,10 +2031,13 @@ function renderHubBoats(hubBoats) {
     const canDrag = canDragBoat(code);
     const inIncident = Boolean(st.incident || phase === 'incident' || openIncidentForBoat(code));
     const updateMs = updateMsByCode.get(code) || 0;
+    const replacement = isReplacementBoat(code);
+    const rescue = isRescueBoat(code);
     const zIndex = boatMarkerZIndex(code, {
       selected: isSelected,
       canDrag,
-      rescue: isRescueBoat(code),
+      rescue,
+      replacement,
       incident: inIncident || boatDbStatus(code) === 'incident',
       updateMs,
       newestMs,
@@ -1919,7 +2048,8 @@ function renderHubBoats(hubBoats) {
       signal: !inIncident && signal,
       incident: inIncident || boatDbStatus(code) === 'incident',
       maintenance: !inIncident && boatDbStatus(code) === 'undermaintenance',
-      rescue: isRescueBoat(code),
+      replacement,
+      rescue,
       phase,
       decks,
     };
@@ -2544,9 +2674,14 @@ function renderIncidentsPanel(data = latest) {
     const meta = [
       row.severity || null,
       row.incidentType || null,
-      row.rescueBoatCode || row.replacementBoatCode
-        ? `cứu: ${row.rescueBoatCode || row.replacementBoatCode}`
-        : null,
+      (() => {
+        const sos = String(row.rescueBoatCode || '').trim();
+        const tt = String(row.replacementBoatCode || '').trim();
+        if (sos && tt && sos !== tt) return `cứu: ${sos} · thay: ${tt}`;
+        if (sos) return `cứu: ${sos}`;
+        if (tt) return `thay: ${tt}`;
+        return null;
+      })(),
       row.source === 'local' ? 'local' : null,
     ].filter(Boolean).join(' · ');
     const desc = row.description || '';
@@ -2555,6 +2690,11 @@ function renderIncidentsPanel(data = latest) {
       (m) => String(m.incidentId || '') === String(row.incidentId || ''),
     );
     const autoStatus = String(autoMission?.status || '');
+    const replacementTrip = (data?.tripMissions || []).find((t) => {
+      const code = String(row.replacementBoatCode || '').trim();
+      if (!code || String(t.boatCode || '').trim() !== code) return false;
+      return t.takenOverFrom || String(t.status || '') === 'ToHandoff';
+    });
     let missionText = '';
     if (autoStatus === 'AtStation' || autoStatus === 'Completed') {
       const stName = autoMission.destinationStationName
@@ -2572,6 +2712,12 @@ function renderIncidentsPanel(data = latest) {
       missionText = rescuePhaseLabel(mission.rescueBoatCode) || 'Cứu hộ';
     } else if (row.replacementBoatCode) {
       missionText = 'Chờ kéo tàu cứu';
+    }
+    if (replacementTrip) {
+      const ttBit = String(replacementTrip.status || '') === 'ToHandoff'
+        ? 'Tàu thay đang tới hiện trường nhận khách'
+        : `Tàu thay đang tiếp trip (${replacementTrip.takenOverFrom || '?'})`;
+      missionText = missionText ? `${missionText} · ${ttBit}` : ttBit;
     }
     return `
       <article class="live-incident-item" data-incident-id="${escapeHtml(row.incidentId)}">
@@ -2720,6 +2866,7 @@ async function assignRescue(incidentId, rescueBoatCode) {
     if (latest) {
       renderHubBoats(latest.hubBoats);
       renderRescueOverlays(latest);
+      renderHandoffOverlays(latest);
     }
   } catch (error) {
     toast(error.message, 'err');
@@ -2876,6 +3023,7 @@ function render(data) {
   renderStations(data.stations);
   renderHubBoats(data.hubBoats);
   renderRescueOverlays(data);
+  renderHandoffOverlays(data);
   renderIncidentsPanel(data);
   renderStatus(data);
   syncBoatControls();
