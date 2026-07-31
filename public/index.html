@@ -121,7 +121,7 @@
         <section class="charter-request-section" id="charterRequestSection">
           <div class="section-header">
             <h2>Yêu cầu Charter</h2>
-            <button type="button" class="secondary charter-refresh-btn" id="charterRefreshBtn" title="Tải lại danh sách">↻</button>
+            <button type="button" class="secondary charter-refresh-btn" id="charterRefreshBtn" title="Tải lại danh sách" aria-label="Tải lại danh sách">↻</button>
           </div>
           <div class="charter-active-banner is-empty" id="charterActiveBanner" hidden>
             <div class="charter-active-text">
@@ -148,11 +148,42 @@
             <span>Bến DB</span>
             <b id="stationCount">0</b>
           </div>
-          <div class="gps-live">
-            <div class="gps-dot"></div>
-            <div class="gps-live-text">
-              <strong id="gpsStatus">Chưa ghi GPS</strong>
-              <p id="sendLog">Chọn bến → vẽ đường → bắt đầu ghi.</p>
+          <div class="status-stack">
+            <div class="gps-live" data-state="idle" id="gpsLiveCard">
+              <span class="gps-dot" aria-hidden="true"></span>
+              <div class="gps-live-text">
+                <strong id="gpsStatus">Chưa ghi GPS</strong>
+                <p id="sendLog">Chọn bến → vẽ đường → bắt đầu ghi.</p>
+              </div>
+            </div>
+            <div class="hub-status" id="hubStatus" hidden>
+              <div class="hub-status-head">
+                <span class="hub-status-title">Tracking Hub</span>
+                <span class="hub-status-mode" id="hubStatusMode">Local</span>
+              </div>
+              <div class="hub-status-row" id="hubStatusEndpointRow">
+                <span>Endpoint</span>
+                <code id="hubStatusEndpoint">—</code>
+              </div>
+              <div class="hub-status-grid">
+                <div>
+                  <span>Azure</span>
+                  <strong id="hubStatusAzure">—</strong>
+                </div>
+                <div>
+                  <span>SignalR</span>
+                  <strong id="hubStatusSignalr">—</strong>
+                </div>
+                <div>
+                  <span>Gửi cuối</span>
+                  <strong id="hubStatusLastSend">—</strong>
+                </div>
+                <div>
+                  <span>Điểm</span>
+                  <strong id="hubStatusPoints">0 / 0</strong>
+                </div>
+              </div>
+              <p class="hub-status-note" id="hubStatusNote">Đang chờ dữ liệu từ Live.</p>
             </div>
           </div>
         </div>

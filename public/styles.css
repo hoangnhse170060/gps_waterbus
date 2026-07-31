@@ -739,6 +739,12 @@ button.secondary:hover,
   margin-bottom: 14px;
 }
 
+.status-stack {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
 .status-station {
   display: grid;
   align-content: center;
@@ -762,6 +768,149 @@ button.secondary:hover,
   color: var(--ink);
   font-size: 18px;
   line-height: 1;
+}
+
+.hub-status {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfdfc;
+  font-size: 11px;
+}
+
+.hub-status[data-state="ok"] {
+  border-color: #b8e0d4;
+  background: #f0faf6;
+}
+
+.hub-status[data-state="warn"] {
+  border-color: #f1d59e;
+  background: #fff8e7;
+}
+
+.hub-status[data-state="error"] {
+  border-color: #f5b6b6;
+  background: #fdecec;
+}
+
+.hub-status-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.hub-status-title {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+
+.hub-status-mode {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #e8eefc;
+  color: #1d4ed8;
+}
+
+.hub-status[data-state="ok"] .hub-status-mode {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.hub-status[data-state="warn"] .hub-status-mode {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.hub-status[data-state="error"] .hub-status-mode {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.hub-status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 10.5px;
+}
+
+.hub-status-row code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 6px;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hub-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 10px;
+}
+
+.hub-status-grid > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+  border-top: 1px dashed var(--line);
+  padding-top: 4px;
+}
+
+.hub-status-grid > div:first-child,
+.hub-status-grid > div:nth-child(2) {
+  border-top: none;
+  padding-top: 0;
+}
+
+.hub-status-grid strong {
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+
+.hub-status-grid strong.is-ok {
+  color: #15803d;
+}
+
+.hub-status-grid strong.is-warn {
+  color: #b45309;
+}
+
+.hub-status-grid strong.is-error {
+  color: #b91c1c;
+}
+
+.hub-status-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .toast-host {
@@ -1298,10 +1447,10 @@ input.is-invalid {
 }
 
 .charter-request-section {
-  border: 1px solid #d6e0f0;
-  border-radius: 8px;
-  padding: 13px;
-  background: #f7f9ff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface);
 }
 
 .charter-filter-row {
@@ -1309,70 +1458,114 @@ input.is-invalid {
 }
 
 .charter-refresh-btn {
-  min-width: 36px;
-  padding: 0 10px;
+  min-width: 34px;
+  height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  font-size: 16px;
+  line-height: 1;
 }
 
 .charter-request-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: grid;
-  gap: 8px;
-  max-height: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
   overflow: auto;
+}
+
+.charter-request-list > li {
+  margin: 0;
+  padding: 0;
 }
 
 .charter-request-list.is-empty .charter-request-empty {
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  padding: 8px 2px;
+  padding: 10px 4px;
+  text-align: left;
 }
 
 .charter-request-item {
   display: grid;
-  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  column-gap: 10px;
+  row-gap: 2px;
+  align-items: center;
   width: 100%;
   text-align: left;
-  border: 1px solid #d5deeb;
-  background: #fff;
+  border: 1px solid var(--line);
+  background: var(--soft);
   border-radius: 8px;
-  padding: 10px 11px;
+  padding: 8px 10px;
   cursor: pointer;
   color: var(--ink);
+  transition: border-color 0.12s ease, background 0.12s ease;
 }
 
 .charter-request-item:hover {
-  border-color: #93a9d4;
+  border-color: #9cb5b1;
+  background: #fff;
 }
 
 .charter-request-item.is-active {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  border-color: var(--brand);
+  background: #fff;
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.14);
 }
 
-.charter-request-item strong {
+.charter-request-item .charter-request-code {
+  grid-column: 1;
+  grid-row: 1;
+  margin: 0;
   font-size: 13px;
-}
-
-.charter-request-item small {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .charter-request-item .charter-status {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
   display: inline-flex;
-  align-self: start;
+  align-items: center;
+  justify-content: center;
+  max-width: 9.5rem;
   font-size: 10px;
   font-weight: 800;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 2px 7px;
-  border-radius: 999px;
+  letter-spacing: 0.03em;
+  padding: 4px 8px;
+  border-radius: 6px;
   background: #e8eefc;
   color: #1d4ed8;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+
+.charter-request-item .charter-request-meta {
+  grid-column: 1;
+  grid-row: 2;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .charter-request-item .charter-status.is-done {
@@ -1396,8 +1589,8 @@ input.is-invalid {
   margin: 0 0 10px;
   padding: 10px;
   border-radius: 8px;
-  background: #eef4ff;
-  border: 1px solid #c7d7f5;
+  background: #eef6f4;
+  border: 1px solid #c5ddd8;
 }
 
 .charter-active-banner.is-empty {

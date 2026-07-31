@@ -21,6 +21,16 @@ const sendModeEl = document.querySelector('#sendMode');
 const senderBadgeEl = document.querySelector('#senderBadge');
 const gpsStatusEl = document.querySelector('#gpsStatus');
 const sendLogEl = document.querySelector('#sendLog');
+const gpsLiveCardEl = document.querySelector('#gpsLiveCard');
+const hubStatusEl = document.querySelector('#hubStatus');
+const hubStatusModeEl = document.querySelector('#hubStatusMode');
+const hubStatusEndpointEl = document.querySelector('#hubStatusEndpoint');
+const hubStatusEndpointRowEl = document.querySelector('#hubStatusEndpointRow');
+const hubStatusAzureEl = document.querySelector('#hubStatusAzure');
+const hubStatusSignalrEl = document.querySelector('#hubStatusSignalr');
+const hubStatusLastSendEl = document.querySelector('#hubStatusLastSend');
+const hubStatusPointsEl = document.querySelector('#hubStatusPoints');
+const hubStatusNoteEl = document.querySelector('#hubStatusNote');
 const boatsEl = document.querySelector('#boats');
 const payloadLogEl = document.querySelector('#payloadLog');
 const mapLegendSelectEl = document.querySelector('#mapLegendSelect');
@@ -163,6 +173,7 @@ let selectedCollectorBoatCode = localStorage.getItem('surveyBoatCode') || '';
 const BOAT_DRAFT_STORAGE_KEY = 'surveyBoatDrafts.v1';
 let boatDrafts = loadBoatDrafts();
 let signalrConnection = null;
+let currentSignalR = null;
 const signalrLiveMarkers = new Map();
 let signalrConnectedOnce = false;
 
@@ -692,6 +703,12 @@ function connectSignalRIfConfigured(config = latest?.config) {
   if (config?.signalrRelay !== false) {
     const st = config?.signalrStatus;
     const hub = st?.hubUrl || 'hub';
+    currentSignalR = {
+      connected: Boolean(st?.connected),
+      hubUrl: hub,
+      lastError: st?.lastError || '',
+      state: st?.connected ? 'connected' : 'relay',
+    };
     if (st?.connected) {
       if (!signalrConnectedOnce) {
         signalrConnectedOnce = true;
@@ -721,26 +738,31 @@ function connectSignalRIfConfigured(config = latest?.config) {
     signalrConnection.on('BoatLocationUpdated', onBoatLocation);
 
     signalrConnection.onreconnecting((err) => {
+      currentSignalR = { connected: false, hubUrl, lastError: err?.message || '', state: 'reconnecting' };
       if (sendLogEl) sendLogEl.textContent = `SignalR reconnecting… ${err?.message || ''}`.trim();
     });
     signalrConnection.onreconnected(() => {
+      currentSignalR = { connected: true, hubUrl, lastError: '', state: 'connected' };
       if (sendLogEl) sendLogEl.textContent = `SignalR reconnected: ${hubUrl}`;
       notifyOk('SignalR đã kết nối lại.');
     });
     signalrConnection.onclose(() => {
       signalrConnection = null;
       signalrConnectedOnce = false;
+      currentSignalR = { connected: false, hubUrl, lastError: '', state: 'closed' };
       if (sendLogEl) sendLogEl.textContent = 'SignalR disconnected';
     });
 
     signalrConnection.start()
       .then(() => {
         signalrConnectedOnce = true;
+        currentSignalR = { connected: true, hubUrl, lastError: '', state: 'connected' };
         if (sendLogEl) sendLogEl.textContent = `SignalR connected: ${hubUrl}`;
         notifyOk('SignalR đã kết nối /hubs/tracking.');
       })
       .catch((error) => {
         console.warn('[signalr] connect failed', error.message);
+        currentSignalR = { connected: false, hubUrl, lastError: error.message, state: 'error' };
         if (!signalrConnectedOnce) {
           notifyWarn(`SignalR browser CORS thất bại (${error.message}). Dùng relay SSE.`);
         }
@@ -2760,6 +2782,7 @@ async function startRecording() {
     captureStatusEl.textContent = `Tàu chạy đúng đường vẽ · ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
     collectorStatusEl.textContent = `Đang chạy ${body.boatCode} · ${body.deviceId}`;
     gpsStatusEl.textContent = 'Đang ghi GPS';
+    setGpsCardState('running');
     ensureSurveyPathVisible();
     if (body.targetSessionWarning) notifyWarn(`Ghi GPS: ${body.targetSessionWarning}`);
     else notifyOk(`${body.boatCode} chạy theo đường vẽ`);
@@ -2796,6 +2819,7 @@ async function stopRecording({ autoSave = true } = {}) {
     captureStatusEl.textContent = `Đã lấy xong ${count} điểm GPS. Đang lưu lên DB...`;
     collectorStatusEl.textContent = `Session sẵn sàng lưu (${count} điểm).`;
     gpsStatusEl.textContent = 'Đã lấy GPS xong';
+    setGpsCardState('ok');
     if (autoSave) {
       const ok = await saveRouteGeometry({ silentClear: true });
       if (!ok) autoCompleteTriggered = false;
@@ -2923,6 +2947,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     recordingSession = null;
     updateWorkflow('done');
     gpsStatusEl.textContent = 'Lưu thành công';
+    setGpsCardState('ok');
     sendLogEl.textContent = `Tuyến ${body.routeCode || routeCode} đã đẩy lên ${where}.`;
     if (body.warning) notifyWarn(`Lưu ${body.routeCode || routeCode} lên ${where}${warn}`);
     else notifyOk(`Thành công: lưu ${body.routeCode || routeCode} lên ${where}`);
@@ -3148,6 +3173,7 @@ function handleAutoSavedRoute(autoSaved) {
   if (autoSaved.ok === false || autoSaved.error) {
     captureStatusEl.textContent = `Lỗi tự lưu: ${autoSaved.error || 'Không lưu được'}`;
     gpsStatusEl.textContent = 'Lưu thất bại';
+    setGpsCardState('error');
     notifyErr(`Tự lưu thất bại: ${autoSaved.error || 'Không lưu được'}`);
     updateWorkflow('run');
     return;
@@ -3172,6 +3198,7 @@ function handleAutoSavedRoute(autoSaved) {
   const warn = autoSaved.warning ? ` (Azure: ${autoSaved.warning})` : '';
   captureStatusEl.textContent = `Đã tự lưu ${autoSaved.routeCode || ''} lên ${where}.${warn}`;
   gpsStatusEl.textContent = 'Lưu thành công';
+    setGpsCardState('ok');
   sendLogEl.textContent = `Tuyến ${autoSaved.routeCode || ''} đã đẩy lên ${where}.`;
   if (autoSaved.warning) notifyWarn(`Tự lưu ${autoSaved.routeCode || ''} lên ${where}${warn}`);
   else notifyOk(`Tự lưu thành công: ${autoSaved.routeCode || ''} → ${where}`);
@@ -3229,6 +3256,7 @@ function renderCollector(collector, lastCollectorSend, session) {
     recordingActive = false;
     captureStatusEl.textContent = 'Tàu đã đến đích — đang tự lưu tuyến...';
     gpsStatusEl.textContent = 'Đang tự lưu...';
+    setGpsCardState('warn');
     stopCollectorEl.disabled = true;
     pauseCollectorEl.disabled = true;
     ensureSurveyPathVisible();
@@ -3270,6 +3298,7 @@ function renderCollector(collector, lastCollectorSend, session) {
   startCollectorEl.textContent = 'Đang ghi...';
   saveRouteGeometryEl.disabled = recordedCount < 2;
   gpsStatusEl.textContent = collector.paused ? 'Tạm dừng' : 'Đang ghi GPS';
+  setGpsCardState(collector.paused ? 'warn' : 'running');
   ensureSurveyPathVisible();
 }
 
@@ -3318,6 +3347,15 @@ function renderPanelLive(data) {
     senderBadgeEl.classList.toggle('is-live', Boolean(data.config?.senderEnabled));
   }
   updateSenderToggleChip(data);
+  renderHubStatus({
+    config: data.config,
+    lastSend: data.lastSend,
+    lastCollectorSend: data.lastCollectorSend,
+    signalR: data.signalR || currentSignalR || null,
+    stats: data.stats,
+    totalRecorded: data.totalRecorded,
+    sentRecorded: data.sentRecorded,
+  });
 
   const catalogFp = catalogBoats(data)
     .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.maxSpeedKmh}`)
@@ -3966,6 +4004,80 @@ function formatTime(value) {
   } catch {
     return String(value);
   }
+}
+
+function toneFor(state) {
+  if (state === 'ok') return 'is-ok';
+  if (state === 'warn') return 'is-warn';
+  if (state === 'error') return 'is-error';
+  return '';
+}
+
+function setGpsCardState(state) {
+  if (!gpsLiveCardEl) return;
+  gpsLiveCardEl.dataset.state = state || 'idle';
+}
+
+function hubStateFromData(data) {
+  if (!data) return { state: 'idle', azure: '—', signalr: '—', lastSend: '—', note: 'Đang chờ dữ liệu từ Live.' };
+  const azureEnabled = Boolean(data.config?.liveAzureWrite);
+  const senderOn = Boolean(data.config?.senderEnabled);
+  const signalrState = data.signalR?.state || data.signalR?.lastError || 'idle';
+  const last = data.lastSend || {};
+  const lastAt = last.at ? formatTime(last.at) : '';
+  const total = Number(data.stats?.total || data.totalRecorded || 0);
+  const sent = Number(data.stats?.sent || data.sentRecorded || 0);
+  let azureLabel = 'Tắt';
+  if (azureEnabled) azureLabel = senderOn ? `Bật · ${sent}/${total}` : `Bật · tạm dừng`;
+  if (azureEnabled && last.status === 409) azureLabel = `Bật · cảnh báo 409`;
+  if (azureEnabled && last.error && !last.ok) azureLabel = `Lỗi · ${last.error}`;
+  const azureState = !azureEnabled ? 'warn' : last.ok === false && /sequence|409/i.test(String(last.error || last.status)) ? 'warn' : last.ok === false ? 'error' : 'ok';
+  const signalrLabel = data.signalR?.connected ? `Kết nối · ${data.signalR?.hubUrl || ''}` : (signalrState === 'reconnecting' ? `Reconnect…` : (data.signalR?.lastError || 'Chờ'));
+  const signalrStateCls = data.signalR?.connected ? 'ok' : (signalrState === 'reconnecting' ? 'warn' : 'error');
+  const lastLabel = lastAt
+    ? `${formatTime(last.at)} · ${last.status || last.mode || ''}${last.sequence ? ` · seq ${last.sequence}` : ''}${last.error ? ` · ${last.error}` : ''}`
+    : '—';
+  const lastState = !last.ok && last.error && /sequence|409/i.test(String(last.error || last.status)) ? 'warn' : !last.ok ? 'error' : (lastAt ? 'ok' : 'idle');
+  let note = data.config?.senderEnabled
+    ? `Live ghi GPS liên tục, không lưu Neon; chỉ đẩy Azure + SignalR theo hub.`
+    : `Sender tạm dừng — chỉ giữ tại Live hub.`;
+  if (last.soft || /sequence|409/i.test(String(last.error || last.status))) note = `Cảnh báo sequence — điểm vẫn ghi local.`;
+  else if (last.error && !last.ok) note = `Lỗi gửi GPS: ${last.error}`;
+  return {
+    state: data.signalR?.connected && last.ok !== false ? 'ok' : (!last.ok ? azureState : 'ok'),
+    endpoint: data.config?.targetUrl || data.targetUrl || data.config?.azureBase || '',
+    mode: senderOn ? (azureEnabled ? 'Live → Azure' : 'Live · cục bộ') : (azureEnabled ? 'Azure · idle' : 'Idle'),
+    azure: azureLabel, azureState,
+    signalr: signalrLabel, signalrState: signalrStateCls,
+    lastSend: lastLabel, lastState,
+    points: `${sent} / ${total}`,
+    note,
+  };
+}
+
+function renderHubStatus(data) {
+  if (!hubStatusEl) return;
+  const view = hubStateFromData(data);
+  hubStatusEl.hidden = false;
+  hubStatusEl.dataset.state = view.state;
+  if (hubStatusEndpointEl) hubStatusEndpointEl.textContent = view.endpoint || '—';
+  if (hubStatusEndpointRowEl) hubStatusEndpointRowEl.hidden = !view.endpoint;
+  if (hubStatusModeEl) {
+    hubStatusModeEl.textContent = view.mode;
+    hubStatusModeEl.classList.remove('is-ok', 'is-warn', 'is-error');
+    hubStatusModeEl.classList.add(toneFor(view.state));
+  }
+  const apply = (el, label, cls) => {
+    if (!el) return;
+    el.textContent = label;
+    el.classList.remove('is-ok', 'is-warn', 'is-error');
+    el.classList.add(toneFor(cls));
+  };
+  apply(hubStatusAzureEl, view.azure, view.azureState);
+  apply(hubStatusSignalrEl, view.signalr, view.signalrState);
+  apply(hubStatusLastSendEl, view.lastSend, view.lastState);
+  if (hubStatusPointsEl) hubStatusPointsEl.textContent = view.points;
+  if (hubStatusNoteEl) hubStatusNoteEl.textContent = view.note;
 }
 
 function escapeHtml(value) {
@@ -4837,10 +4949,10 @@ function renderCharterRequestList(items) {
     const st = String(item.status || 'Pending');
     return `
       <li>
-        <button type="button" class="charter-request-item${activeCharterRequest?.requestId === id ? ' is-active' : ''}" data-request-id="${escapeHtml(id)}">
-          <strong>${escapeHtml(code)}</strong>
+        <button type="button" class="charter-request-item${activeCharterRequest?.requestId === id ? ' is-active' : ''}" data-request-id="${escapeHtml(id)}" title="${escapeHtml(id)}">
+          <span class="charter-request-code">${escapeHtml(code)}</span>
           <span class="charter-status ${route.cls}">${escapeHtml(route.label)}</span>
-          <small>${escapeHtml(st)} · ${escapeHtml(stopsHint)} · ${escapeHtml(id)}</small>
+          <span class="charter-request-meta">${escapeHtml(st)} · ${escapeHtml(stopsHint)}</span>
         </button>
       </li>
     `;
