@@ -143,21 +143,16 @@ const incidentsRelay = createSignalRRelay({
   getAccessToken: () => state.targetBearerToken,
   events: [
     {
-      names: ['IncidentUpdated', 'incidentUpdated'],
+      names: ['IncidentCreated', 'incidentCreated', 'IncidentUpdated', 'incidentUpdated'],
       onEvent: (payload) => {
-        upsertIncidentFromHub(payload, 'IncidentUpdated');
-        applyBoatStatusesFromBePayload(payload, 'IncidentUpdated');
-        scheduleIncidentsBroadcast();
-        // Đồng bộ list Open từ BE (staff app báo sự cố → Live nhận ngay).
+        handleIncidentHubEvent(payload, 'IncidentUpdated');
         refreshOpenIncidents({ force: false }).catch(() => {});
       },
     },
     {
       names: ['RescueDispatched', 'rescueDispatched'],
       onEvent: (payload) => {
-        upsertIncidentFromHub(payload, 'RescueDispatched');
-        applyBoatStatusesFromBePayload(payload, 'RescueDispatched');
-        scheduleIncidentsBroadcast();
+        handleIncidentHubEvent(payload, 'RescueDispatched');
         refreshOpenIncidents({ force: false }).catch(() => {});
       },
     },
@@ -165,6 +160,21 @@ const incidentsRelay = createSignalRRelay({
       names: ['BoatStatusUpdated', 'boatStatusUpdated', 'BoatUpdated', 'boatUpdated'],
       onEvent: (payload) => {
         applyBoatStatusesFromBePayload(payload, 'BoatStatusUpdated');
+        // Status Incident từ BE → đứng trip ngay (không chờ openIncidents).
+        const rows = extractIncidentRows(payload);
+        if (!rows.length && payload) rows.push(payload);
+        for (const row of rows) {
+          const status = canonicalBoatStatus(row.status || row.boatStatus || row.Status);
+          const code = String(row.boatCode || row.BoatCode || '').trim();
+          if (status === 'Incident' && code) {
+            freezeIncidentBoatNow({
+              boatCode: code,
+              boatId: row.boatId || row.BoatId,
+              lat: row.lat ?? row.latitude,
+              lng: row.lng ?? row.longitude,
+            });
+          }
+        }
         scheduleIncidentsBroadcast();
       },
     },
@@ -181,6 +191,98 @@ function scheduleIncidentsBroadcast() {
     incidentsBroadcastTimer = null;
     broadcast();
   }, 150);
+}
+
+/**
+ * SignalR / poll → cùng pipeline với webhook: mở sự cố, đứng trip, và nếu có SOS thì chạy cứu hộ.
+ * Trước đây SignalR chỉ upsert record → tàu SC vẫn chạy trip, SOS không start.
+ */
+function handleIncidentHubEvent(payload, eventName = 'IncidentUpdated') {
+  const eventLower = String(eventName || '').toLowerCase();
+  const rows = extractIncidentRows(payload);
+  if (!rows.length && payload && typeof payload === 'object') rows.push(payload);
+
+  const results = [];
+  for (const row of rows) {
+    const incident = normalizeIncident(row, `hub:${eventName}`);
+    if (!incident) continue;
+    upsertIncidentRecord(incident);
+    applyBoatStatusesFromBePayload(incident, eventName);
+    freezeIncidentBoatNow(incident);
+
+    const isRescue = eventLower.includes('rescue')
+      || eventLower.includes('dispatch')
+      || Boolean(pickRescueBoatCode(incident) || pickRescueBoatCode(row));
+    let rescueAutomation = null;
+    if (isRescue) {
+      if (incident.incidentId) state.resolvedIncidentIds.delete(incident.incidentId);
+      // Bổ sung tọa độ từ hub nếu SignalR thiếu lat/lng.
+      if ((incident.lat == null || incident.lng == null) && incident.boatCode) {
+        const hub = state.hubBoats.get(incident.boatCode);
+        if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+          incident.lat = Number(hub.lat);
+          incident.lng = Number(hub.lng);
+          upsertIncidentRecord(incident);
+        }
+      }
+      rescueAutomation = startRescueAutomation(incident);
+      console.log(
+        `[signalr-incidents] RescueDispatched boat=${incident.boatCode} rescue=${incident.rescueBoatCode}`
+          + ` started=${Boolean(rescueAutomation?.started)}`
+          + ` duplicate=${Boolean(rescueAutomation?.duplicate)}`
+          + ` err=${rescueAutomation?.error || '-'}`,
+      );
+    }
+    results.push({ incidentId: incident.incidentId, boatCode: incident.boatCode, rescueAutomation });
+  }
+  scheduleIncidentsBroadcast();
+  return results;
+}
+
+/** Neo tàu sự cố ngay: pause trip local + publish idle (không chờ tick rescue). */
+function freezeIncidentBoatNow(incident) {
+  const code = String(incident?.boatCode || '').trim();
+  if (!code) return;
+  applyBeBoatStatus({
+    boatId: incident.boatId,
+    boatCode: code,
+    status: 'Incident',
+    source: 'incident-freeze',
+  });
+  const boat = boatByIdOrCode(code);
+  if (boat) {
+    boat.dbStatus = boat.dbStatus === 'Active' || !boat.dbStatus ? 'Incident' : boat.dbStatus;
+    boat.beStatus = 'Incident';
+    boat.paused = true;
+    boat.speedKmh = 0;
+    boat.status = 'idle';
+  }
+  for (const mission of state.tripMissions.values()) {
+    if (String(mission.boatCode || '').trim() !== code) continue;
+    if (mission.takenOverFrom) continue; // tàu thay vẫn chạy
+    if (['Completed', 'Cancelled'].includes(String(mission.status || ''))) continue;
+    mission.status = 'Paused';
+    mission.speedKmh = 0;
+    mission.movementStatus = 'Delayed';
+    mission.incidentFreezePublished = false;
+    mission.updatedAt = new Date().toISOString();
+  }
+  const hub = state.hubBoats.get(code);
+  const lat = Number(incident?.lat ?? hub?.lat ?? boat?.lat);
+  const lng = Number(incident?.lng ?? hub?.lng ?? boat?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  publishLiveGpsPosition({
+    boatCode: code,
+    lat,
+    lng,
+    heading: Number(hub?.heading ?? boat?.heading ?? 0),
+    speedKmh: 0,
+    status: 'idle',
+    sendToTarget: true,
+    fromRescue: true,
+  }).catch((error) => {
+    console.warn(`[incident-freeze] ${code}: ${error.message}`);
+  });
 }
 
 const boatsSql = `
@@ -1461,6 +1563,15 @@ async function refreshBoatStatusesFromDatabase() {
       boat.dbStatus = status;
       changed = true;
       console.log(`[boat-status] ${code}: ${prevStatus || '—'} → ${status}`);
+      // Neon = Incident → đứng trip ngay (kể cả khi BE chưa push hook/SignalR).
+      if (statusNorm === 'incident') {
+        freezeIncidentBoatNow({
+          boatCode: code,
+          boatId: boat.boatId,
+          lat: state.hubBoats.get(code)?.lat ?? boat.lat,
+          lng: state.hubBoats.get(code)?.lng ?? boat.lng,
+        });
+      }
     }
     if (row.boatName && boat.boatName !== row.boatName) {
       boat.boatName = row.boatName;
@@ -4390,6 +4501,7 @@ function ingestIncidentHook(body = {}, req = null) {
     source: 'hook',
   });
   applyBoatStatusesFromBePayload(incident, event);
+  freezeIncidentBoatNow(incident);
 
   // Bổ sung tọa độ từ hub nếu hook không gửi lat/lng.
   if ((incident.lat == null || incident.lng == null) && incident.boatCode) {
