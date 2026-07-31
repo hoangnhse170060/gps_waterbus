@@ -255,7 +255,7 @@ function freezeIncidentBoatNow(incident) {
     boat.beStatus = 'Incident';
     boat.paused = true;
     boat.speedKmh = 0;
-    boat.status = 'idle';
+    boat.status = 'incident';
   }
   for (const mission of state.tripMissions.values()) {
     if (String(mission.boatCode || '').trim() !== code) continue;
@@ -271,17 +271,39 @@ function freezeIncidentBoatNow(incident) {
   const lat = Number(incident?.lat ?? hub?.lat ?? boat?.lat);
   const lng = Number(incident?.lng ?? hub?.lng ?? boat?.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
-  publishLiveGpsPosition({
-    boatCode: code,
+  // Contract BE: sau incident Open → status=incident, speed=0, không tripId.
+  publishIncidentGpsPosition(code, {
     lat,
     lng,
     heading: Number(hub?.heading ?? boat?.heading ?? 0),
-    speedKmh: 0,
-    status: 'idle',
-    sendToTarget: true,
-    fromRescue: true,
   }).catch((error) => {
     console.warn(`[incident-freeze] ${code}: ${error.message}`);
+  });
+}
+
+/**
+ * Contract BE: tàu lỗi chỉ gửi status=incident + speed 0, không tripId/route/nextStation.
+ * Không gọi stop-event / complete (BE 409).
+ */
+async function publishIncidentGpsPosition(boatCode, {
+  lat,
+  lng,
+  heading = 0,
+  sendToTarget = true,
+} = {}) {
+  const code = String(boatCode || '').trim();
+  if (!code) return { ok: false, error: 'missing boatCode' };
+  return publishLiveGpsPosition({
+    boatCode: code,
+    lat,
+    lng,
+    heading,
+    speedKmh: 0,
+    status: 'incident',
+    sendToTarget,
+    fromTrip: false,
+    fromRescue: true,
+    holdAuthority: true,
   });
 }
 
@@ -461,16 +483,11 @@ setInterval(() => {
     const spd = Number(hub?.speedKmh);
     const suppressUntil = hubBoatSuppressUntil.get(code) || 0;
     if (!(spd > 0.5) && suppressUntil > Date.now()) continue;
-    publishLiveGpsPosition({
-      boatCode: code,
+    // Contract: status=incident, speed 0, không tripId.
+    publishIncidentGpsPosition(code, {
       lat,
       lng,
       heading: Number(hub?.heading ?? boat.heading ?? 0),
-      speedKmh: 0,
-      status: 'idle',
-      sendToTarget: true,
-      fromRescue: true,
-      holdAuthority: true,
     }).catch(() => {});
   }
 }, Math.max(2000, Number(env.INCIDENT_FREEZE_REPIN_MS || 4000)));
@@ -2209,20 +2226,16 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   // Heartbeat / kéo tay cũng không được đẩy tàu sự cố chạy (speed > 0).
+  // Contract BE: neo bằng status=incident, không tripId.
   if (!fromRescue && boatNeedsIncidentFreeze(boatCode) && Number(body.speedKmh) > 0.5) {
     const hub = state.hubBoats.get(boatCode);
     const freezeLat = Number.isFinite(Number(hub?.lat)) ? Number(hub.lat) : lat;
     const freezeLng = Number.isFinite(Number(hub?.lng)) ? Number(hub.lng) : lng;
-    return publishLiveGpsPosition({
-      ...body,
+    return publishIncidentGpsPosition(boatCode, {
       lat: freezeLat,
       lng: freezeLng,
-      speedKmh: 0,
-      status: 'idle',
-      fromTrip: false,
-      fromRescue: true,
-      holdAuthority: true,
-      sendToTarget: body.sendToTarget,
+      heading: Number(hub?.heading || body.heading || 0),
+      sendToTarget: body.sendToTarget !== false,
     });
   }
 

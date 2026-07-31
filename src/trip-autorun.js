@@ -612,6 +612,11 @@ export function createTripAutorun(ctx) {
   async function completeTripOnBe(tripId, body = null) {
     const id = cleanOptionalText(tripId);
     if (!id) return { ok: false, error: 'missing tripId' };
+    const mission = state.tripMissions.get(id);
+    // Contract BE: tàu sự cố không gọi complete (409 Conflict).
+    if (mission && !mission.takenOverFrom && boatIsFrozenForIncident(mission.boatCode)) {
+      return { ok: false, skipped: true, status: 409, error: 'Tàu sự cố — không complete trip' };
+    }
     return requestTargetApi({
       method: 'POST',
       pathname: completePath(id),
@@ -636,6 +641,10 @@ export function createTripAutorun(ctx) {
     const stationId = cleanOptionalText(stop?.stationId || stop?.stationCode);
     const boatCode = cleanOptionalText(mission?.boatCode);
     if (!tripId || !stationId || !event) return { ok: false, skipped: true };
+    // Contract BE: tàu sự cố không gọi stop-event (409 Conflict).
+    if (!mission.takenOverFrom && boatIsFrozenForIncident(boatCode)) {
+      return { ok: false, skipped: true, status: 409, reason: 'incident-freeze' };
+    }
     if (!mission.stopEventsSent) mission.stopEventsSent = new Set();
     const key = `${stationId}:${event}`;
     if (mission.stopEventsSent.has(key)) return { ok: true, skipped: true, reason: 'already-sent' };
@@ -2047,11 +2056,21 @@ export function createTripAutorun(ctx) {
       mission.requiredSpeedKmh = 0;
       mission.movementStatus = 'Delayed';
       refreshNextStopInfo(mission, nowMs);
-      await maybeEmitStopEvents(mission);
-      // Publish idle 1 lần khi vừa pause — neo hub, chặn tiếp tục chạy path.
+      // Contract BE: không stop-event / complete; gửi locations status=incident, không tripId.
       if (wasActive || !mission.incidentFreezePublished) {
         mission.incidentFreezePublished = true;
-        await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
+        await publishLiveGpsPosition({
+          boatCode: mission.boatCode,
+          lat: mission.currentLat,
+          lng: mission.currentLng,
+          heading: mission.lastHeading,
+          speedKmh: 0,
+          status: 'incident',
+          sendToTarget: true,
+          fromTrip: false,
+          fromRescue: true,
+          holdAuthority: true,
+        });
       }
       mission.updatedAt = new Date().toISOString();
       mission.lastTickAt = nowMs;
@@ -2061,7 +2080,6 @@ export function createTripAutorun(ctx) {
       mission.status = 'Paused';
       mission.speedKmh = 0;
       refreshNextStopInfo(mission, nowMs);
-      await maybeEmitStopEvents(mission);
       mission.updatedAt = new Date().toISOString();
       return;
     }
