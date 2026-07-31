@@ -2035,11 +2035,17 @@ export function createTripAutorun(ctx) {
       return;
     }
 
-    // Tàu sự cố / SOS kéo → pause trip. Tàu thay sau takeover vẫn chạy (takenOverFrom).
-    if (!mission.takenOverFrom && boatIsFrozenForIncident(mission.boatCode)) {
+    // Tàu sự cố / bảo trì / SOS kéo → pause trip (giống nhau: không Active thì đứng).
+    // Tàu thay sau takeover vẫn chạy (takenOverFrom).
+    if (!mission.takenOverFrom && (
+      boatIsFrozenForIncident(mission.boatCode)
+      || (typeof isActiveBoatCode === 'function' && !isActiveBoatCode(mission.boatCode))
+    )) {
       const wasActive = String(mission.status) !== 'Paused';
       mission.status = 'Paused';
       mission.speedKmh = 0;
+      mission.requiredSpeedKmh = 0;
+      mission.movementStatus = 'Delayed';
       refreshNextStopInfo(mission, nowMs);
       await maybeEmitStopEvents(mission);
       // Publish idle 1 lần khi vừa pause — neo hub, chặn tiếp tục chạy path.
@@ -2048,6 +2054,7 @@ export function createTripAutorun(ctx) {
         await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
       }
       mission.updatedAt = new Date().toISOString();
+      mission.lastTickAt = nowMs;
       return;
     }
     if (!mission.takenOverFrom && isBoatInActiveRescueMission(mission.boatCode)) {

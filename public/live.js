@@ -2229,12 +2229,16 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = 
   const userDriven = !quiet;
   const rescueMission = missionForRescue(boatCode);
   const trip = activeTripForBoat(boatCode);
+  const dbSt = boatDbStatus(boatCode);
+  const frozenByStatus = Boolean(st.incident)
+    || dbSt === 'incident'
+    || dbSt === 'undermaintenance';
   const moving = (userDriven || Boolean(trip) || Boolean(rescueMission))
-    && !st.incident
+    && !frozenByStatus
     && (phase === 'enroute' || phase === 'departing' || phase === 'approaching'
       || rescueMission?.phase === 'to_incident' || rescueMission?.phase === 'returning'
       || (trip && ['Pending', 'ToDeparture', 'Boarding', 'Running', 'WaitingAtStop'].includes(String(trip.status || ''))));
-  const status = st.incident ? 'idle' : (moving ? 'moving' : 'idle');
+  const status = frozenByStatus ? 'idle' : (moving ? 'moving' : 'idle');
   const speedKmh = moving
     ? (Number(trip?.speedKmh) > 0 ? Number(trip.speedKmh) : cruise)
     : 0;

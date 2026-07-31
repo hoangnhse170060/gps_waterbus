@@ -1056,13 +1056,13 @@ function hasOpenIncidentForBoat(boatOrCode) {
   return false;
 }
 
-/** Tàu sự cố: đứng yên — không trip GPS, không heartbeat đẩy đi. */
+/** Tàu sự cố / bảo trì / inactive: đứng yên — không trip GPS đẩy đi. */
 function boatNeedsIncidentFreeze(boatOrCode) {
   const code = String(
     typeof boatOrCode === 'object' ? (boatOrCode.boatCode || '') : boatOrCode || '',
   ).trim();
   if (!code && typeof boatOrCode !== 'object') return false;
-  if (hasOpenIncidentForBoat(boatOrCode)) return true;
+  if (hasOpenIncidentForBoat(boatOrCode) || hasOpenIncidentForBoat(code)) return true;
   if (code) {
     for (const mission of state.rescueMissions.values()) {
       const status = String(mission?.status || '');
@@ -1072,10 +1072,24 @@ function boatNeedsIncidentFreeze(boatOrCode) {
     }
   }
   const boat = typeof boatOrCode === 'object' ? boatOrCode : boatByIdOrCode(boatOrCode);
-  const effective = String(effectiveBoatStatus(boat || code) || '').toLowerCase();
-  if (effective === 'incident') return true;
-  if (normalizeBoatStatus(boat?.dbStatus) === 'incident') return true;
-  if (normalizeBoatStatus(boat?.beStatus) === 'incident') return true;
+  const statuses = [
+    effectiveBoatStatus(boat || code),
+    boat?.dbStatus,
+    boat?.beStatus,
+    beStatusForBoat(boat || code),
+    beStatusForBoat(code),
+  ].map((value) => normalizeBoatStatus(value));
+  // Giống Bảo trì: Incident / UnderMaintenance / Inactive đều đứng.
+  if (statuses.some((s) => (
+    s === 'incident' || s === 'undermaintenance' || s === 'inactive' || s === 'retired'
+  ))) {
+    return true;
+  }
+  // Neon Active nhưng effective không Active (vd open incident) → đứng.
+  if (code && boat && !isActiveBoatCode(code)) {
+    const effective = normalizeBoatStatus(effectiveBoatStatus(boat));
+    if (effective && effective !== 'active') return true;
+  }
   return false;
 }
 
@@ -1563,8 +1577,8 @@ async function refreshBoatStatusesFromDatabase() {
       boat.dbStatus = status;
       changed = true;
       console.log(`[boat-status] ${code}: ${prevStatus || '—'} → ${status}`);
-      // Neon = Incident → đứng trip ngay (kể cả khi BE chưa push hook/SignalR).
-      if (statusNorm === 'incident') {
+      // Neon = Incident / UnderMaintenance → đứng trip ngay (giống nhau).
+      if (statusNorm === 'incident' || statusNorm === 'undermaintenance') {
         freezeIncidentBoatNow({
           boatCode: code,
           boatId: boat.boatId,
@@ -2114,11 +2128,14 @@ async function publishLiveGpsPosition(body = {}) {
   const fromRescue = body.fromRescue === true || body._fromRescue === true;
   const fromTrip = body.fromTrip === true || body._fromTrip === true;
 
-  // Trip không được đẩy tàu đang sự cố / đang bị SOS neo-kéo (chỉ chặn khi còn di chuyển).
+  // Trip không được đẩy tàu sự cố / bảo trì / inactive (chỉ chặn khi còn di chuyển).
   if (
     fromTrip
     && !fromRescue
-    && boatNeedsIncidentFreeze(boatCode)
+    && (
+      boatNeedsIncidentFreeze(boatCode)
+      || !isActiveBoatCode(boatCode)
+    )
     && Number(body.speedKmh) > 0.5
   ) {
     return {
@@ -2127,7 +2144,7 @@ async function publishLiveGpsPosition(body = {}) {
       soft: true,
       status: 200,
       mode: 'incident-freeze',
-      error: `Tàu ${boatCode} đang sự cố — chặn trip GPS đang chạy.`,
+      error: `Tàu ${boatCode} không Active (sự cố/bảo trì) — chặn trip GPS đang chạy.`,
     };
   }
 
