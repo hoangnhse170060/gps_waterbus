@@ -989,19 +989,39 @@ server.on('error', (error) => {
   throw error;
 });
 
-server.listen(port, '0.0.0.0', () => {
+server.listen(port, '0.0.0.0', async () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
   console.log(`[build] commit ${buildInfo.commitShort} (${buildInfo.commit})`);
   console.log(`[gps-write] Azure write ${liveAzureWriteEnabled() ? 'ON (primary)' : 'OFF (follow Azure only)'}`);
   const hookMode = Boolean(String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim());
-  const jwtMode = Boolean(state.targetBearerToken);
   if (hookMode) {
     console.log('[incidents] nhận lệnh qua webhook POST /api/incidents/hook (không cần JWT)');
   }
   signalrRelay.start().catch((error) => {
     console.warn(`[signalr-relay] start: ${error.message}`);
   });
-  // Chỉ nối hub/poll Azure incidents khi có JWT. Hook mode thì bỏ qua (tránh 401 spam).
+
+  // Login admin để poll Open incidents + SignalR (kể cả khi chỉ có LIVE_HOOK_SECRET).
+  // Không có JWT → không biết BE đã gán SOS → tàu cứu không chạy.
+  const adminCreds = readAzureAdminCredentials();
+  if (adminCreds.user && adminCreds.pass) {
+    const login = await loginAzureAdmin({ force: true }).catch((error) => ({
+      ok: false,
+      error: error.message,
+    }));
+    if (login.ok) {
+      console.log('[incidents] JWT admin OK — bật poll Open + SignalR incidents');
+    } else {
+      console.warn(`[incidents] login admin fail: ${login.error || 'unknown'} — chỉ nhận webhook`);
+    }
+  } else if (!state.targetBearerToken) {
+    console.warn(
+      '[incidents] Chưa AZURE_ADMIN_EMAIL/PASSWORD — không poll Open. '
+      + 'SOS chỉ chạy khi BE POST /api/incidents/hook (RescueDispatched).',
+    );
+  }
+
+  const jwtMode = Boolean(state.targetBearerToken);
   if (jwtMode) {
     incidentsRelay.start().catch((error) => {
       console.warn(`[signalr-incidents] start: ${error.message}`);
@@ -1023,7 +1043,7 @@ server.listen(port, '0.0.0.0', () => {
       mode: 'hook',
     };
   } else {
-    console.warn('[incidents] Chưa có LIVE_HOOK_SECRET lẫn TARGET_BEARER_TOKEN — chỉ demo local');
+    console.warn('[incidents] Chưa có LIVE_HOOK_SECRET lẫn JWT admin — chỉ demo local');
   }
   // BE: GET /api/tracking/boats/latest lần đầu rồi poll (fallback khi hub chưa có).
   pollLatestBoatLocations({ force: true }).catch((error) => {
@@ -4699,11 +4719,14 @@ async function refreshOpenIncidents({ force = false } = {}) {
     return { ok: false, status: 400, error: 'Chưa cấu hình Azure endpoint' };
   }
   if (!state.targetBearerToken) {
-    return {
-      ok: false,
-      status: 401,
-      error: 'Thiếu TARGET_BEARER_TOKEN (JWT Staff/Admin) cho /api/incidents',
-    };
+    const login = await ensureAzureAdminToken({ force: true });
+    if (!login.ok) {
+      return {
+        ok: false,
+        status: 401,
+        error: login.error || 'Thiếu JWT admin cho /api/incidents',
+      };
+    }
   }
   const result = await requestTargetApi({
     method: 'GET',
@@ -4711,10 +4734,30 @@ async function refreshOpenIncidents({ force = false } = {}) {
     auth: 'bearer',
     silent: !force,
   });
-  if (!result.ok) return result;
+  if (!result.ok) {
+    if (result.status === 401 || result.status === 403) {
+      const retryLogin = await loginAzureAdmin({ force: true });
+      if (retryLogin.ok) {
+        const retry = await requestTargetApi({
+          method: 'GET',
+          pathname: '/api/incidents?resolutionStatus=Open',
+          auth: 'bearer',
+          silent: !force,
+        });
+        if (retry.ok) {
+          return applyOpenIncidentsFromApi(retry.data);
+        }
+        return retry;
+      }
+    }
+    return result;
+  }
+  return applyOpenIncidentsFromApi(result.data);
+}
 
+function applyOpenIncidentsFromApi(data) {
   const next = new Map();
-  for (const row of extractIncidentRows(result.data)) {
+  for (const row of extractIncidentRows(data)) {
     const incident = normalizeIncident(row, 'api');
     if (!incident) continue;
     const prev = state.openIncidents.get(incident.incidentId);
@@ -4929,7 +4972,8 @@ async function assignReplacementBoat(incidentId, body = {}) {
     note: body.note || `Điều tàu ${rescueBoatCode || replacementBoatId} cứu hộ từ Live GPS`,
   };
 
-  let azure = { ok: false, status: 401, error: 'Thiếu TARGET_BEARER_TOKEN' };
+  await ensureAzureAdminToken({ force: !state.targetBearerToken });
+  let azure = { ok: false, status: 401, error: 'Thiếu JWT admin' };
   if (state.targetBearerToken) {
     azure = await requestTargetApi({
       method: 'PATCH',
@@ -4937,11 +4981,36 @@ async function assignReplacementBoat(incidentId, body = {}) {
       payload,
       auth: 'bearer',
     });
+    if ((azure.status === 401 || azure.status === 403)) {
+      const relogin = await loginAzureAdmin({ force: true });
+      if (relogin.ok) {
+        azure = await requestTargetApi({
+          method: 'PATCH',
+          pathname: `/api/incidents/${encodeURIComponent(id)}/assign-replacement-boat`,
+          payload,
+          auth: 'bearer',
+        });
+      }
+    }
   }
 
   const existing = state.openIncidents.get(id) || { incidentId: id, resolutionStatus: 'Open' };
+  // Bổ sung lat/lng từ hub tàu sự cố nếu thiếu — startRescue cần tọa độ.
+  let sceneLat = existing.lat;
+  let sceneLng = existing.lng;
+  const incidentBoat = String(existing.boatCode || body.boatCode || '').trim();
+  if ((!Number.isFinite(Number(sceneLat)) || !Number.isFinite(Number(sceneLng))) && incidentBoat) {
+    const hub = state.hubBoats.get(incidentBoat);
+    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+      sceneLat = Number(hub.lat);
+      sceneLng = Number(hub.lng);
+    }
+  }
   const next = {
     ...existing,
+    boatCode: existing.boatCode || incidentBoat || null,
+    lat: Number.isFinite(Number(sceneLat)) ? Number(sceneLat) : existing.lat,
+    lng: Number.isFinite(Number(sceneLng)) ? Number(sceneLng) : existing.lng,
     replacementBoatId: replacementBoatId || existing.replacementBoatId || null,
     rescueBoatCode: rescueBoatCode || rescue?.boatCode || existing.rescueBoatCode || null,
     replacementBoatCode: replacementBoatCode && replacementBoatCode !== rescueBoatCode
@@ -4962,7 +5031,14 @@ async function assignReplacementBoat(incidentId, body = {}) {
     }
   }
   upsertIncidentRecord(next);
+  freezeIncidentBoatNow(next);
   const rescueAutomation = startRescueAutomation(next);
+  console.log(
+    `[rescue-assign] boat=${next.boatCode} rescue=${next.rescueBoatCode}`
+      + ` started=${Boolean(rescueAutomation?.started)}`
+      + ` duplicate=${Boolean(rescueAutomation?.duplicate)}`
+      + ` err=${rescueAutomation?.error || '-'}`,
+  );
   broadcast();
 
   return {
@@ -7469,10 +7545,17 @@ function publicConfig() {
     hasAzureAdminEmail: Boolean(readAzureAdminCredentials().user),
     hasAzureAdminPassword: Boolean(readAzureAdminCredentials().pass),
     hasLiveHookSecret: Boolean(state.liveHookSecret || env.LIVE_HOOK_SECRET || process.env.LIVE_HOOK_SECRET),
-    incidentReceiveMode: (state.liveHookSecret || env.LIVE_HOOK_SECRET || process.env.LIVE_HOOK_SECRET)
-      ? 'hook'
-      : (state.targetBearerToken ? 'jwt' : 'local'),
+    incidentReceiveMode: (() => {
+      const hook = Boolean(state.liveHookSecret || env.LIVE_HOOK_SECRET || process.env.LIVE_HOOK_SECRET);
+      const jwt = Boolean(state.targetBearerToken);
+      if (hook && jwt) return 'hook+jwt';
+      if (hook) return 'hook';
+      if (jwt) return 'jwt';
+      return 'local';
+    })(),
     openIncidentCount: state.openIncidents.size,
+    activeRescueCount: [...state.rescueMissions.values()]
+      .filter((m) => ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(String(m.status || ''))).length,
     tripAutorun: parseBool(env.TRIP_AUTORUN ?? 'true'),
     tripDuePollMs: Number(env.TRIP_DUE_POLL_MS || 30000),
     tripGpsIntervalMs: Number(env.TRIP_GPS_INTERVAL_MS || 1000),
