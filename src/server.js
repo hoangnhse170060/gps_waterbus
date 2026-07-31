@@ -4639,6 +4639,29 @@ async function refreshOpenIncidents({ force = false } = {}) {
       status: 'Incident',
       source: 'incidents:open',
     });
+    freezeIncidentBoatNow(incident);
+
+    // BE đã gán SOS (assign-replacement-boat) nhưng hook RescueDispatched có thể
+    // không tới GPS → poll Open vẫn phải tự start kéo, không chỉ hiện badge TC.
+    const rescueCode = pickRescueBoatCode(incident);
+    if (!rescueCode || !incident.boatCode) continue;
+    const existing = state.rescueMissions.get(incident.incidentId);
+    const st = String(existing?.status || '');
+    const running = ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(st);
+    if (running) continue;
+    if (!Number.isFinite(Number(incident.lat)) || !Number.isFinite(Number(incident.lng))) {
+      console.warn(
+        `[incidents-poll] ${incident.incidentId}: có rescue=${rescueCode} nhưng thiếu lat/lng — chưa start`,
+      );
+      continue;
+    }
+    const started = startRescueAutomation(incident);
+    console.log(
+      `[incidents-poll] auto RescueDispatched boat=${incident.boatCode} rescue=${rescueCode}`
+        + ` started=${Boolean(started?.started)}`
+        + ` duplicate=${Boolean(started?.duplicate)}`
+        + ` err=${started?.error || '-'}`,
+    );
   }
   broadcast();
   return { ok: true, status: 200, count: next.size, data: [...next.values()] };

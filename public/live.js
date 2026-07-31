@@ -729,15 +729,10 @@ function isRescueBoat(code) {
   const automated = (latest?.rescueMissions || []).find(
     (mission) => String(mission.rescueBoatCode || '').trim() === key,
   );
-  if (automated) {
-    // Badge CỨU chỉ khi đang chạy — cập bến / Completed thì nhả.
-    const status = String(automated.status || '');
-    return ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status);
-  }
-  return openIncidentsList().some((row) => {
-    const rescue = String(row.rescueBoatCode || row.replacementBoatCode || '').trim();
-    return rescue === key;
-  });
+  if (!automated) return false;
+  // Badge CỨU chỉ khi SOS đang chạy mission — không hiện vì chỉ bị gán trên Open incident.
+  const status = String(automated.status || '');
+  return ['Dispatched', 'InTransit', 'Arrived', 'Towing'].includes(status);
 }
 
 function syncLocalIncidentFlags() {
