@@ -365,6 +365,26 @@ from routes
 where route_geometry is not null;
 `;
 
+/** Fingerprint nhẹ — tránh kéo lại full GeoJSON tuyến sông mỗi lần refresh (Neon egress). */
+const routesFingerprintSql = `
+select jsonb_build_object(
+  'n', count(*)::int,
+  'fp', coalesce(md5(string_agg(
+    route_id::text
+      || ':' || coalesce(route_code, '')
+      || ':' || coalesce(status, '')
+      || ':' || coalesce(ST_NPoints(route_geometry)::text, '0')
+      || ':' || coalesce(round(ST_Length(route_geometry::geography))::text, '0'),
+    '|' order by route_id
+  )), '')
+)
+from routes
+where route_geometry is not null;
+`;
+
+/** Cache GeoJSON routes giữa các lần refreshFromDatabase. */
+let cachedRoutesFingerprint = '';
+
 const routeStopsSql = `
 select coalesce(jsonb_agg(jsonb_build_object(
   'routeId', rs.route_id,
@@ -443,13 +463,14 @@ const tripAutorun = createTripAutorun({
 });
 
 await refreshFromDatabase();
-setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 15000));
-// Status tàu từ Neon ~2s — cập nhật DB là Live GPS nhận gần như ngay.
+// Full refresh (boats/stations/stops). GeoJSON tuyến chỉ tải lại khi fingerprint đổi.
+setInterval(refreshFromDatabase, Number(env.DB_REFRESH_MS || 60000));
+// Status tàu từ Neon — mặc định 8s (trước 2s gây egress Neon lớn).
 setInterval(() => {
   refreshBoatStatusesFromDatabase().catch((error) => {
     console.warn(`[boat-status] ${error.message}`);
   });
-}, Math.max(1000, Number(env.BOAT_STATUS_POLL_MS || 2000)));
+}, Math.max(3000, Number(env.BOAT_STATUS_POLL_MS || 8000)));
 setInterval(tickSimulator, 1000);
 setInterval(publishGpsPositions, Number(env.SEND_INTERVAL_MS || 2000));
 setInterval(publishCollectorPosition, Number(env.SEND_INTERVAL_MS || 2000));
@@ -1725,11 +1746,36 @@ async function refreshBoatStatusesFromDatabase() {
   }
 }
 
+async function loadRoutesGeojsonIfChanged({ force = false } = {}) {
+  let meta;
+  try {
+    meta = await queryJson(routesFingerprintSql);
+  } catch (error) {
+    console.warn(`[db] routes fingerprint: ${error.message} — fallback full geojson`);
+    meta = null;
+  }
+  const fp = meta
+    ? `${Number(meta.n) || 0}:${String(meta.fp || '')}`
+    : `force:${Date.now()}`;
+  if (
+    !force
+    && meta
+    && fp
+    && fp === cachedRoutesFingerprint
+    && state.routes.size > 0
+  ) {
+    return { skipped: true, routes: null, fingerprint: fp };
+  }
+  const routes = await queryJson(routesSql);
+  cachedRoutesFingerprint = fp;
+  return { skipped: false, routes: Array.isArray(routes) ? routes : [], fingerprint: fp };
+}
+
 async function refreshFromDatabase() {
   try {
-    let [boats, routes, stations, routeStops, gpsDevices] = await Promise.all([
+    let [boats, routeLoad, stations, routeStops, gpsDevices] = await Promise.all([
       queryJson(boatsSql),
-      queryJson(routesSql),
+      loadRoutesGeojsonIfChanged(),
       queryJson(stationsSql),
       queryJson(routeStopsSql),
       queryJson(gpsDevicesSql).catch(() => []),
@@ -1748,22 +1794,27 @@ async function refreshFromDatabase() {
       if (code && deviceId) state.gpsDevicesByBoatCode.set(code, deviceId);
     }
 
-    state.routes.clear();
-    for (const route of routes) {
-      const coordinates = parseRouteCoordinates(route.geojson);
-      if (coordinates.length >= 2) {
-        state.routes.set(route.routeId, {
-          ...route,
-          coordinates,
-          lengthMeters: routeLength(coordinates),
-          baseDistanceKm: route.baseDistanceKm != null
-            ? Number(route.baseDistanceKm)
-            : round(routeLength(coordinates) / 1000, 3),
-          estimatedDurationMin: route.estimatedDurationMin != null
-            ? Number(route.estimatedDurationMin)
-            : null,
-        });
+    if (!routeLoad.skipped) {
+      state.routes.clear();
+      for (const route of routeLoad.routes || []) {
+        const coordinates = parseRouteCoordinates(route.geojson);
+        if (coordinates.length >= 2) {
+          state.routes.set(route.routeId, {
+            ...route,
+            coordinates,
+            lengthMeters: routeLength(coordinates),
+            baseDistanceKm: route.baseDistanceKm != null
+              ? Number(route.baseDistanceKm)
+              : round(routeLength(coordinates) / 1000, 3),
+            estimatedDurationMin: route.estimatedDurationMin != null
+              ? Number(route.estimatedDurationMin)
+              : null,
+          });
+        }
       }
+      console.log(
+        `[db] routes geojson loaded · ${state.routes.size} routes · fp=${routeLoad.fingerprint || '?'}`,
+      );
     }
 
     state.stations = stations.map((station) => ({
