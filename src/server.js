@@ -3,6 +3,16 @@ import { createServer } from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+
+// Catch ALL crashes so Railway logs them
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] unhandledRejection:', reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason));
+  process.exit(1);
+});
+process.on('uncaughtException', (error) => {
+  console.error(`[FATAL] uncaughtException: ${error.message}\n${error.stack}`);
+  process.exit(1);
+});
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import pg from 'pg';
@@ -25,17 +35,24 @@ const sequenceStatePath = path.join(rootDir, '.simulator-sequences.json');
 const lastPositionsPath = path.join(rootDir, '.simulator-last-positions.json');
 
 const env = await loadEnv();
+console.log('[startup] env loaded, has db:', !!(env.DATABASE_URL || env.DB_HOST));
 if (parseBool(env.TARGET_GPS_ALLOW_SELF_SIGNED)) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
 const port = Number(env.PORT || 5177);
+console.log('[startup] port:', port);
 const buildInfo = resolveBuildInfo(env, rootDir);
+console.log('[startup] buildInfo resolved');
 const sequenceState = await loadSequenceState();
+console.log('[startup] sequenceState loaded');
 let sequenceSaveTimer = null;
 const lastPositions = await loadLastPositions();
+console.log('[startup] lastPositions loaded, count:', lastPositions.size);
 let lastPositionsSaveTimer = null;
 const dbPool = createDbPool(env);
+console.log('[startup] dbPool created:', !!dbPool);
 const osmWaterbusCorridor = await loadOsmWaterbusCorridor();
+console.log('[startup] osm corridor loaded:', osmWaterbusCorridor.length, 'pts');
 
 const clients = new Set();
 const state = {
@@ -1013,18 +1030,22 @@ server.on('error', (error) => {
 server.listen(port, '0.0.0.0', async () => {
   console.log(`Waterbus GPS simulator: http://localhost:${port}`);
   console.log(`[build] commit ${buildInfo.commitShort} (${buildInfo.commit})`);
+  console.log('[startup] after listen, step 1...');
   console.log(`[gps-write] Azure write ${liveAzureWriteEnabled() ? 'ON (primary)' : 'OFF (follow Azure only)'}`);
   const hookMode = Boolean(String(state.liveHookSecret || env.LIVE_HOOK_SECRET || '').trim());
   if (hookMode) {
     console.log('[incidents] nhận lệnh qua webhook POST /api/incidents/hook (không cần JWT)');
   }
+  console.log('[startup] after hook check, step 2...');
   signalrRelay.start().catch((error) => {
     console.warn(`[signalr-relay] start: ${error.message}`);
   });
+  console.log('[startup] after signalr start, step 3...');
 
   // Login admin để poll Open incidents + SignalR (kể cả khi chỉ có LIVE_HOOK_SECRET).
   // Không có JWT → không biết BE đã gán SOS → tàu cứu không chạy.
   const adminCreds = readAzureAdminCredentials();
+  console.log('[startup] after readAzureAdminCredentials, step 4...', { hasUser: !!adminCreds.user });
   if (adminCreds.user && adminCreds.pass) {
     const login = await loginAzureAdmin({ force: true }).catch((error) => ({
       ok: false,
@@ -1424,6 +1445,43 @@ function upsertHubBoat(payload) {
   // Vừa nhận GPS Live/trip: bỏ Azure echo cũ trong cửa sổ ngắn.
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (!forceAccept && liveAuthUntil > Date.now()) return;
+
+  // Gate no-trip: tàu không có trip/rescue/survey → KHÔNG nhảy tọa độ, giữ vị trí cũ.
+  // Lý do: tàu đậu bến/đợi khách vẫn có thể nhận POST locations từ device (heartbeat/noise) —
+  // nếu cho ghi đè, marker nhảy lung tung dù đáng lẽ đứng yên.
+  // Vẫn update heading/speed cho FE biết trạng thái (idle), và vẫn gửi Azure nếu BE chấp nhận.
+  const incomingHasTrip = Boolean(payload.tripId || payload.tripCode);
+  const allowMoveBySource = (
+    String(payload.source || '').startsWith('azure')
+    || String(payload.source || '') === 'survey'
+    || payload._fromRescue === true
+    || payload._skipNoTripFreeze === true
+  );
+  if (!forceAccept && !incomingHasTrip && !allowMoveBySource) {
+    const prevForFreeze = state.hubBoats.get(code);
+    if (prevForFreeze) {
+      state.hubBoats.set(code, {
+        ...prevForFreeze,
+        speedKmh: Number.isFinite(Number(payload.speedKmh)) ? Number(payload.speedKmh) : 0,
+        heading: Number.isFinite(Number(payload.heading)) ? Number(payload.heading) : prevForFreeze.heading ?? null,
+        status: 'idle',
+        boatStatus: 'NoTrip',
+        tripId: null,
+        tripCode: null,
+        routeId: null,
+        routeCode: null,
+        isOnline: payload.isOnline !== false,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    // Đồng bộ snapshot/FE: giữ lat/lng cũ, không cho boat.lat/lng trôi.
+    const boatForFreeze = [...state.boats.values()].find((b) => String(b.boatCode || '').trim() === code);
+    if (boatForFreeze) {
+      boatForFreeze.speedKmh = Number.isFinite(Number(payload.speedKmh)) ? Number(payload.speedKmh) : 0;
+      boatForFreeze.updatedAt = new Date().toISOString();
+    }
+    return null;
+  }
 
   const prev = state.hubBoats.get(code);
   const incoming = {
@@ -2395,6 +2453,9 @@ async function publishLiveGpsPosition(body = {}) {
       forceAccept: true,
       holdAuthority,
       source: holdAuthority ? 'live' : 'live-heartbeat',
+      // Trip / rescue / survey vẫn phải cho tàu chạy khi không có tripId trong payload —
+      // Ví dụ: kéo tay user khởi đầu, beacon rescue khởi động, vẽ survey…
+      _skipNoTripFreeze: userOrMissionWrite || holdAuthority,
     });
     broadcast();
   }
