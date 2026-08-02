@@ -7123,6 +7123,7 @@ function createDbPool(envValues) {
       database: envValues.DB_NAME || 'waterbusdb',
       user: envValues.DB_USER || 'postgres',
       password: envValues.DB_PASSWORD || '',
+      ssl: { rejectUnauthorized: false },
       max: 5,
       idleTimeoutMillis: 30_000,
     });
