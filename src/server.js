@@ -579,6 +579,9 @@ const server = createServer(async (req, res) => {
         collectorRunning: Boolean(state.collector),
       });
     }
+    if (url.pathname === '/health' && req.method === 'GET') {
+      return sendJson(res, { ok: true });
+    }
     if (url.pathname === '/events') return handleEvents(req, res);
     if (url.pathname === '/api/snapshot') return sendJson(res, snapshot());
     if (url.pathname === '/api/river-path' && req.method === 'POST') {
