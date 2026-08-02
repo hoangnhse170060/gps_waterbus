@@ -1023,6 +1023,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.on('error', (error) => {
+  console.error(`[server.on error] ${error.code || '?'}: ${error.message}`);
   if (error.code === 'EADDRINUSE') {
     console.error(`Port ${port} is already in use. Stop the running simulator or set another PORT in .env.`);
     process.exit(1);
@@ -1030,8 +1031,9 @@ server.on('error', (error) => {
   throw error;
 });
 
+console.log(`[startup] about to listen on ${port}...`);
 server.listen(port, '0.0.0.0', async () => {
-  console.log(`Waterbus GPS simulator: http://localhost:${port}`);
+  console.log(`[startup] LISTEN OK on ${port}`);
   console.log(`[build] commit ${buildInfo.commitShort} (${buildInfo.commit})`);
   console.log('[startup] after listen, step 1...');
   console.log(`[gps-write] Azure write ${liveAzureWriteEnabled() ? 'ON (primary)' : 'OFF (follow Azure only)'}`);
