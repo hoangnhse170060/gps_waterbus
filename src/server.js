@@ -13,6 +13,29 @@ process.on('uncaughtException', (error) => {
   console.error(`[FATAL] uncaughtException: ${error.message}\n${error.stack}`);
   process.exit(1);
 });
+
+// Graceful shutdown for Railway healthcheck restarts
+let isShuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[shutdown] nhận ${signal}, đang đóng...`);
+  try {
+    if (typeof saveLastPositions === 'function') await saveLastPositions();
+    if (typeof saveSequences === 'function') await saveSequences();
+    if (signalrRelay?.stop) signalrRelay.stop();
+    if (incidentsRelay?.stop) incidentsRelay.stop();
+    if (dbPool) await dbPool.end().catch(() => {});
+    if (state.collector?.stop) state.collector.stop();
+  } catch (e) {
+    console.warn(`[shutdown] warning: ${e.message}`);
+  }
+  console.log('[shutdown] xong, bye.');
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import pg from 'pg';
@@ -140,6 +163,12 @@ const signalrRelay = createSignalRRelay({
       onEvent: (payload) => {
         applyBoatStatusesFromBePayload(payload, 'tracking:BoatStatusUpdated');
         scheduleIncidentsBroadcast();
+      },
+    },
+    {
+      names: ['tripstopupdated', 'TripStopUpdated', 'tripStopUpdated', 'Tripstopsupdated'],
+      onEvent: (payload) => {
+        console.log(`[signalr-tracking] TripStopUpdated: ${JSON.stringify(payload)}`);
       },
     },
   ],
