@@ -3197,32 +3197,26 @@ function ensureRescueBoatOnMap(boatCode, nearLat = null, nearLng = null) {
       boat.lng = lng;
     }
   }
-  const hub = state.hubBoats.get(code);
-  const hubLat = Number(hub?.lat ?? boat.lat);
-  const hubLng = Number(hub?.lng ?? boat.lng);
-  if (!Number.isFinite(hubLat) || !Number.isFinite(hubLng)) {
+  // Rescue boat không có GPS thật (không có device) → seed mới hiện trên map.
+  // Chỉ seed khi chưa có hub hoặc hub GPS cũ (stale).
+  const existingHub = state.hubBoats.get(code);
+  const hubMs = existingHub
+    ? Date.parse(existingHub.receivedAt || existingHub.recordedAt || existingHub.updatedAt || '')
+    : 0;
+  const hubFresh = Number.isFinite(hubMs) && Date.now() - hubMs < 30_000;
+  const hadRescueGps = existingHub && Number.isFinite(Number(existingHub.lat))
+    && Number.isFinite(Number(existingHub.lng))
+    && !String(existingHub.source || '').startsWith('rescue-seed');
+  if (Number.isFinite(lat) && Number.isFinite(lng) && (!existingHub || !hadRescueGps)) {
     state.hubBoats.set(code, {
-      ...(hub || {}),
+      ...(existingHub || {}),
       boatCode: code,
       boatName: boat.boatName,
       boatId: boat.boatId,
       lat,
       lng,
       speedKmh: 0,
-      heading: Number(hub?.heading ?? boat.heading ?? 0),
-      isOnline: true,
-      source: 'rescue-seed',
-      updatedAt: new Date().toISOString(),
-    });
-  } else if (!hub) {
-    state.hubBoats.set(code, {
-      boatCode: code,
-      boatName: boat.boatName,
-      boatId: boat.boatId,
-      lat: hubLat,
-      lng: hubLng,
-      speedKmh: 0,
-      heading: Number(boat.heading || 0),
+      heading: Number(existingHub?.heading ?? boat.heading ?? 0),
       isOnline: true,
       source: 'rescue-seed',
       updatedAt: new Date().toISOString(),
@@ -3791,14 +3785,28 @@ function startRescueAutomation(incident) {
     && Number.isFinite(Number(rescueHubBefore?.lng))
     && !String(rescueHubBefore?.source || '').startsWith('rescue-seed');
 
-  ensureRescueBoatOnMap(rescueBoatCode, sceneLat, sceneLng);
+  // Tàu thay (replacement): ưu tiên dùng GPS thật từ BE, không seed tại hiện trường.
+  const hasOverrideStart = Number.isFinite(incident._overrideStartLat)
+    && Number.isFinite(incident._overrideStartLng);
+  if (hasOverrideStart) {
+    // Seed tàu thay tại GPS thật, không phải tại hiện trường.
+    ensureRescueBoatOnMap(rescueBoatCode, incident._overrideStartLat, incident._overrideStartLng);
+  } else {
+    // Tàu cứu: seed tại hiện trường (không có GPS thật vì không chạy trip).
+    ensureRescueBoatOnMap(rescueBoatCode, sceneLat, sceneLng);
+  }
+
   const rescueBoat = boatByIdOrCode(rescueBoatCode);
-  let startLat = Number(
-    hadRescueGps ? rescueHubBefore.lat : (state.hubBoats.get(rescueBoatCode)?.lat ?? rescueBoat?.lat),
-  );
-  let startLng = Number(
-    hadRescueGps ? rescueHubBefore.lng : (state.hubBoats.get(rescueBoatCode)?.lng ?? rescueBoat?.lng),
-  );
+  let startLat = hasOverrideStart
+    ? incident._overrideStartLat
+    : Number(
+        hadRescueGps ? rescueHubBefore.lat : (state.hubBoats.get(rescueBoatCode)?.lat ?? rescueBoat?.lat),
+      );
+  let startLng = hasOverrideStart
+    ? incident._overrideStartLng
+    : Number(
+        hadRescueGps ? rescueHubBefore.lng : (state.hubBoats.get(rescueBoatCode)?.lng ?? rescueBoat?.lng),
+      );
 
   const resolved = resolveIncidentTargetCoords({
     incidentBoatCode,
@@ -4102,14 +4110,9 @@ function startRescueAutomation(incident) {
       replacementDelayMinutes: mission.replacementDelayMinutes,
       incidentId,
     });
-    // Chưa có trip local → vẫn điều tàu thay tới điểm bàn giao (visual), takeover khi trip xuất hiện.
-    if (transferAutomation?.pending) {
-      const xfer = startReplacementBoatAutomation(mission, {
-        incidentLat: resolvedTargetLat,
-        incidentLng: resolvedTargetLng,
-      });
-      transferAutomation = { ...transferAutomation, xfer };
-    }
+    // Chưa có trip local → KHÔNG tạo __xfer rescue mission (đi thẳng sai route).
+    // Trip takeover sẽ điều khiển tàu thay đi đúng route khi BE gửi trip.
+    // Tàu thay đứng yên tại vị trí hiện tại cho đến khi trip takeover được apply.
   } else {
     transferAutomation = startReplacementBoatAutomation(mission, {
       incidentLat: resolvedTargetLat,
@@ -4134,8 +4137,8 @@ function startRescueAutomation(incident) {
 function startReplacementBoatAutomation(rescueMission, { incidentLat, incidentLng } = {}) {
   const replacementBoatCode = String(rescueMission?.replacementBoatCode || '').trim();
   if (!replacementBoatCode) {
-    return { started: false, skipped: true, reason: 'no-replacement' };
-  }
+  return { started: false, skipped: true, reason: 'no-replacement' };
+}
 
   let missionType = normalizeReplacementMissionType(rescueMission.replacementMissionType);
   // Backward compatible: có tàu thay nhưng BE chưa gửi type → coi như chuyển khách tại hiện trường.
@@ -4179,9 +4182,18 @@ function startReplacementBoatAutomation(rescueMission, { incidentLat, incidentLn
     return { started: false, error: 'Thiếu tọa độ đích tàu thay khách', missionType };
   }
 
+  // Lấy GPS thật của tàu thay TRƯỚC khi seed — để nó bắt đầu từ vị trí hiện tại (Thanh Đa),
+  // không phải từ hiện trường.
+  const realHub = state.hubBoats.get(replacementBoatCode);
+  const hadRealGps = realHub
+    && Number.isFinite(Number(realHub.lat))
+    && Number.isFinite(Number(realHub.lng))
+    && !String(realHub.source || '').startsWith('rescue-seed');
+
   console.log(
     `[rescue-gps] replacement ${missionType} ${replacementBoatCode} → `
     + `${targetLat.toFixed(5)},${targetLng.toFixed(5)}`
+    + ` (start from current: ${hadRealGps ? `${realHub.lat.toFixed(5)},${realHub.lng.toFixed(5)}` : 'seed at target'})`
     + (rescueMission.replacementTargetStationName
       ? ` (${rescueMission.replacementTargetStationName})`
       : ''),
@@ -4195,6 +4207,9 @@ function startReplacementBoatAutomation(rescueMission, { incidentLat, incidentLn
     replacementMissionType: missionType,
     lat: targetLat,
     lng: targetLng,
+    // Ghi đè start position bằng GPS thật nếu có
+    _overrideStartLat: hadRealGps ? Number(realHub.lat) : undefined,
+    _overrideStartLng: hadRealGps ? Number(realHub.lng) : undefined,
   });
 }
 
