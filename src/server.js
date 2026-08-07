@@ -901,6 +901,84 @@ const server = createServer(async (req, res) => {
         })),
       });
     }
+    // ============================================================
+    // GPS Event Endpoint: POST /api/incidents/{incidentId}/gps-event
+    // Contract: GPS sends actual events; BE validates sequence & decides trip changes.
+    // ============================================================
+    {
+      const gpsEventMatch = url.pathname.match(/^\/api\/incidents\/([^/]+)\/gps-event$/);
+      if (gpsEventMatch && req.method === 'POST') {
+        const incidentId = decodeURIComponent(gpsEventMatch[1]);
+        const body = await readJson(req);
+        const result = handleGpsEvent(incidentId, body);
+        const statusCode = result.accepted ? 200 : (result.status || 400);
+        return sendJson(res, result, statusCode);
+      }
+    }
+    // GET GPS event log: GET /api/incidents/{incidentId}/gps-events
+    {
+      const gpsEventsMatch = url.pathname.match(/^\/api\/incidents\/([^/]+)\/gps-events$/);
+      if (gpsEventsMatch && req.method === 'GET') {
+        const incidentId = decodeURIComponent(gpsEventsMatch[1]);
+        const incident = state.openIncidents.get(incidentId);
+        if (!incident) {
+          return sendJson(res, { error: 'Incident not found' }, 404);
+        }
+        const events = getGpsEventLog(incidentId);
+        return sendJson(res, {
+          incidentId,
+          // missionStatus có thể null khi incident vừa tạo, chưa dispatch
+          missionStatus: incident.missionStatus ?? null,
+          timestamps: {
+            rescueArrivedAt: incident.rescueArrivedAt || null,
+            replacementArrivedAt: incident.replacementArrivedAt || null,
+            passengerTransferCompletedAt: incident.passengerTransferCompletedAt || null,
+            towingStartedAt: incident.towingStartedAt || null,
+            towingCompletedAt: incident.towingCompletedAt || null,
+          },
+          events,
+        });
+      }
+    }
+    // Debug: Create test incident for GPS event testing
+    // POST /api/debug/test-incident
+    if (url.pathname === '/api/debug/test-incident' && req.method === 'POST') {
+      const body = await readJson(req);
+      const incidentId = body.incidentId || `test-incident-${Date.now()}`;
+      const testIncident = {
+        incidentId,
+        boatCode: body.boatCode || 'BOAT_001',
+        rescueBoatCode: body.rescueBoatCode || 'RESCUE_001',
+        replacementBoatCode: body.replacementBoatCode || 'REPLACEMENT_001',
+        replacementMissionType: body.replacementMissionType || 'TransferAtIncidentLocation',
+        replacementTargetStationId: body.replacementTargetStationId || null,
+        replacementTargetStationCode: body.replacementTargetStationCode || null,
+        lat: body.lat ?? 10.8,
+        lng: body.lng ?? 106.7,
+        sceneLat: body.sceneLat ?? body.lat ?? 10.8,
+        sceneLng: body.sceneLng ?? body.lng ?? 106.7,
+        onboardPassengerCount: body.onboardPassengerCount ?? 5,
+        futurePassengerCount: body.futurePassengerCount ?? 0,
+        missionStatus: 'Dispatched',
+        replacementEstimatedResumeAt: body.replacementEstimatedResumeAt
+          ? new Date(Date.now() + 30 * 60000).toISOString()
+          : null,
+        resolutionStatus: 'Open',
+        source: 'debug:test-incident',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      state.openIncidents.set(incidentId, testIncident);
+      console.log(`[debug] test incident created: ${incidentId}`);
+      return sendJson(res, { ok: true, incident: testIncident }, 201);
+    }
+    // Debug: Reset GPS event cache/log for testing
+    // DELETE /api/debug/gps-events
+    if (url.pathname === '/api/debug/gps-events' && req.method === 'DELETE') {
+      state.gpsEventCache?.clear();
+      state.gpsEventLog = [];
+      return sendJson(res, { ok: true, message: 'GPS event cache and log cleared' });
+    }
     if (url.pathname === '/api/collector/start' && req.method === 'POST') {
       const body = await readJson(req);
       let collector;
@@ -3282,6 +3360,14 @@ function normalizeIncident(row, source = 'api') {
     nested.resolutionStatus || nested.ResolutionStatus || 'Open',
   ).trim() || 'Open';
 
+  // Cờ cảnh báo: incident đang mở + đã có tàu cứu nhưng Admin/BE chưa chọn tàu thay.
+  // FE render badge "Cần điều tàu thay" — quyết định điều phương tiện không thuộc GPS.
+  const isOpen = /^(open|inprogress|in_progress|onrescue|rescue|active|on_scene|onscene)$/i
+    .test(resolutionStatus.replace(/[\s_-]/g, ''));
+  const hasRescue = Boolean(effectiveRescue);
+  const hasReplacement = Boolean(replacementBoatCode || replacementBoatId);
+  const pendingReplacementAssignment = Boolean(isOpen && hasRescue && !hasReplacement);
+
   return {
     incidentId,
     boatId: boatId || null,
@@ -3297,6 +3383,7 @@ function normalizeIncident(row, source = 'api') {
     replacementBoatId: replacementBoatId || null,
     replacementBoatCode: replacementBoatCode || null,
     rescueBoatCode: effectiveRescue,
+    pendingReplacementAssignment,
     ...extractReplacementMissionFields(nested, row),
     lat: Number.isFinite(lat) ? lat : null,
     lng: Number.isFinite(lng) ? lng : null,
@@ -3402,6 +3489,658 @@ function upsertIncidentRecord(incident, { removeIfResolved = true } = {}) {
     futurePassengerCount: incident.futurePassengerCount ?? prev.futurePassengerCount ?? null,
   });
   return true;
+}
+
+// ============================================================
+// GPS Event Handler — Contract với GPS Team
+// GPS gửi event thực tế xảy ra. BE validate sequence & decide trip changes.
+// ============================================================
+
+/**
+ * INTERNAL mission statuses (DB only - không leak ra public API)
+ * Đây là trạng thái nội bộ BE dùng để track rescue operation
+ */
+const INTERNAL_MISSION_STATUSES = Object.freeze([
+  'IncidentCreated',     // INTERNAL: khi incident được tạo (chưa dispatch)
+  'RescueDispatched',   // INTERNAL: khi BE assign tàu cứu (chưa public)
+  'ReplacementDispatched', // INTERNAL: khi BE assign tàu thay thế (chưa public)
+  'Towing',             // INTERNAL: rescue boat đã sát hiện trường, đang kéo (không gửi GPS)
+  'Resolved',           // INTERNAL: incident đã đóng (record bị xóa khỏi openIncidents)
+]);
+
+/**
+ * PUBLIC mission statuses (DTO/API) - BE map từ internal ra public
+ * Đây là trạng thái public mà FE/Mobile dùng
+ * Map: ToPublicMissionStatus(internalStatus, resolutionStatus)
+ */
+const PUBLIC_MISSION_STATUSES = Object.freeze([
+  'Dispatched',                    // Public: BE đã dispatch tàu cứu/thay thế
+  'RescueArrived',                 // Public: GPS gửi
+  'ReplacementArrived',            // Public: GPS gửi
+  'PassengerTransferCompleted',    // Public: GPS gửi
+  'TowingStarted',                 // Public: GPS gửi
+  'TowingCompleted',              // Public: GPS gửi
+  'Completed',                     // Public: incident đã đóng (IncidentResolved)
+]);
+
+/**
+ * Map INTERNAL status → PUBLIC missionStatus
+ * Contract: BE là source of truth, chỉ public những status cần thiết
+ *
+ * @param {string|null} internalStatus - Trạng thái nội bộ (internalRescueStatus hoặc missionStatus)
+ * @param {string} resolutionStatus - resolutionStatus từ BE (Open, Resolved, ...)
+ * @returns {string|null} Public missionStatus phù hợp với FE/Mobile
+ */
+function ToPublicMissionStatus(internalStatus, resolutionStatus) {
+  // Incident đã đóng (Resolved/Closed) → 'Completed'
+  if (resolutionStatus && /^(resolved|closed|completed)$/i.test(resolutionStatus)) {
+    return 'Completed';
+  }
+
+  // Incident đang mở (Open/InProgress)
+  const internal = String(internalStatus || '').trim();
+
+  // INTERNAL statuses → PUBLIC mapping
+  switch (internal) {
+    // Incident vừa tạo, chưa dispatch tàu → null (chưa có mission)
+    case 'IncidentCreated':
+    case '':
+      return null;
+
+    // BE đã dispatch tàu cứu/thay thế
+    case 'RescueDispatched':
+    case 'ReplacementDispatched':
+    case 'Dispatched':
+      return 'Dispatched';
+
+    // GPS events
+    case 'RescueArrived':
+      return 'RescueArrived';
+    case 'ReplacementArrived':
+      return 'ReplacementArrived';
+    case 'PassengerTransferCompleted':
+      return 'PassengerTransferCompleted';
+    case 'TowingStarted':
+      return 'TowingStarted';
+    case 'TowingCompleted':
+      return 'TowingCompleted';
+
+    // INTERNAL: đang kéo (không gửi GPS, không public)
+    case 'Towing':
+      return 'TowingStarted'; // Map internal Towing → public TowingStarted
+
+    default:
+      // Fallback: nếu không match, giữ nguyên (có thể là public status hợp lệ)
+      return internal || null;
+  }
+}
+
+/** Valid GPS events enum - GPS device chỉ gửi những events này */
+const GPS_EVENTS = Object.freeze([
+  'RescueArrived',
+  'ReplacementArrived',
+  'PassengerTransferCompleted',
+  'TowingStarted',
+  'TowingCompleted',
+]);
+
+/**
+ * PUBLIC mission statuses (DTO/API) - BE map từ internal ra public
+ * Đây là trạng thái public mà FE/Mobile dùng
+ */
+const PUBLIC_MISSION_STATUSES = Object.freeze([
+  'Dispatched',                    // Public: BE đã dispatch tàu cứu/thay thế
+  'RescueArrived',                 // Public: GPS gửi
+  'ReplacementArrived',            // Public: GPS gửi
+  'PassengerTransferCompleted',    // Public: GPS gửi
+  'TowingStarted',                 // Public: GPS gửi
+  'TowingCompleted',              // Public: GPS gửi
+  'Completed',                     // Public: incident đã đóng
+]);
+
+/** Mission status progression sequence - CHỈ public statuses */
+const MISSION_STATUS_SEQUENCE = Object.freeze([
+  'Dispatched',        // 0: Initial (từ BE khi dispatch)
+  'RescueArrived',     // 1: Tàu cứu hộ đã tới hiện trường
+  'ReplacementArrived', // 2: Tàu thay thế đã tới (nếu có mission)
+  'PassengerTransferCompleted', // 3: Chuyển khách xong (nếu có khách onboard)
+  'TowingStarted',     // 4: Bắt đầu kéo
+  'TowingCompleted',    // 5: Kéo xong
+  'Completed',         // 6: Hoàn thành
+]);
+
+/**
+ * Get mission status priority (lower = earlier in sequence)
+ */
+function getMissionStatusPriority(status) {
+  const idx = MISSION_STATUS_SEQUENCE.indexOf(status);
+  return idx >= 0 ? idx : -1;
+}
+
+/**
+ * Validate GPS event request body
+ */
+function validateGpsEventRequest(body) {
+  const errors = [];
+
+  if (!body?.gpsEventId) {
+    errors.push('gpsEventId là bắt buộc (uuid từ GPS để idempotency/retry)');
+  }
+
+  if (!body?.event) {
+    errors.push('event là bắt buộc');
+  } else if (!GPS_EVENTS.includes(body.event)) {
+    errors.push(`event không hợp lệ. Các giá trị hợp lệ: ${GPS_EVENTS.join(', ')}`);
+  }
+
+  if (!body?.boatCode) {
+    errors.push('boatCode là bắt buộc');
+  }
+
+  if (!body?.occurredAt) {
+    errors.push('occurredAt là bắt buộc (ISO 8601 format)');
+  } else {
+    const date = new Date(body.occurredAt);
+    if (isNaN(date.getTime())) {
+      errors.push('occurredAt không đúng định dạng ISO 8601');
+    }
+  }
+
+  if (body.lat != null && !Number.isFinite(Number(body.lat))) {
+    errors.push('lat phải là số hợp lệ');
+  }
+
+  if (body.lng != null && !Number.isFinite(Number(body.lng))) {
+    errors.push('lng phải là số hợp lệ');
+  }
+
+  return errors;
+}
+
+/**
+ * Main GPS event handler
+ * @param {string} incidentId
+ * @param {object} body - Request body from GPS
+ * @returns {object} Response with accepted, gpsEventId, previousMissionStatus, missionStatus, canReplacementContinueTrip
+ */
+function handleGpsEvent(incidentId, body) {
+  const gpsEventId = String(body?.gpsEventId || '').trim();
+
+  // 1. Idempotency check: nếu đã xử lý gpsEventId này rồi, return success
+  if (gpsEventId) {
+    const cached = state.gpsEventCache?.get(gpsEventId);
+    if (cached) {
+      console.log(`[gps-event] idempotent replay: ${gpsEventId}`);
+      return cached;
+    }
+  }
+
+  // 2. Validate request
+  const validationErrors = validateGpsEventRequest(body);
+  if (validationErrors.length > 0) {
+    return {
+      accepted: false,
+      gpsEventId,
+      error: 'Validation failed',
+      details: validationErrors,
+      status: 400,
+    };
+  }
+
+  // 3. Find incident
+  const incident = state.openIncidents.get(incidentId);
+  if (!incident) {
+    return {
+      accepted: false,
+      gpsEventId,
+      error: 'Incident not found hoặc đã resolved',
+      status: 404,
+    };
+  }
+
+  const event = body.event;
+  const boatCode = String(body.boatCode || '').trim();
+  const occurredAt = new Date(body.occurredAt);
+
+  // 4. Validate event-specific rules
+  const validationResult = validateGpsEventSequence(incident, event, boatCode, body);
+  if (!validationResult.valid) {
+    return {
+      accepted: false,
+      gpsEventId,
+      // missionStatus có thể null khi incident chưa dispatch
+      previousMissionStatus: incident.missionStatus ?? null,
+      missionStatus: incident.missionStatus ?? null,
+      error: validationResult.error,
+      details: validationResult.details,
+      status: 409, // Conflict - event out of sequence
+    };
+  }
+
+  // 5. Calculate canReplacementContinueTrip
+  const canReplacementContinueTrip = calculateCanReplacementContinueTrip(
+    incident, event, body
+  );
+
+  // 6. Update incident with new mission status & timestamps
+  // previousMissionStatus có thể null (incident chưa được dispatch)
+  const previousMissionStatus = incident.missionStatus ?? null;
+  const now = new Date().toISOString();
+
+  // Build update object for mission status
+  const missionStatusUpdates = {
+    missionStatus: event,
+    updatedAt: now,
+  };
+
+  // Set timestamp field based on event
+  switch (event) {
+    case 'RescueArrived':
+      missionStatusUpdates.rescueArrivedAt = occurredAt.toISOString();
+      break;
+    case 'ReplacementArrived':
+      missionStatusUpdates.replacementArrivedAt = occurredAt.toISOString();
+      break;
+    case 'PassengerTransferCompleted':
+      missionStatusUpdates.passengerTransferCompletedAt = occurredAt.toISOString();
+      break;
+    case 'TowingStarted':
+      missionStatusUpdates.towingStartedAt = occurredAt.toISOString();
+      // Store estimated towing duration if provided
+      if (body.estimatedTowingMinutes != null) {
+        missionStatusUpdates.estimatedTowingMinutes = Number(body.estimatedTowingMinutes);
+      }
+      break;
+    case 'TowingCompleted':
+      missionStatusUpdates.towingCompletedAt = occurredAt.toISOString();
+      break;
+  }
+
+  // Update incident record
+  const updatedIncident = {
+    ...incident,
+    ...missionStatusUpdates,
+  };
+  state.openIncidents.set(incidentId, updatedIncident);
+
+  // 7. Log GPS event for audit
+  logGpsEvent({
+    incidentId,
+    gpsEventId,
+    event,
+    boatCode,
+    occurredAt: occurredAt.toISOString(),
+    lat: body.lat,
+    lng: body.lng,
+    stationId: body.stationId || null,
+    note: body.note || null,
+    previousMissionStatus,
+    newMissionStatus: event,
+    timestamp: now,
+  });
+
+  // 8. Build response
+  const response = {
+    accepted: true,
+    gpsEventId,
+    previousMissionStatus,
+    missionStatus: event,
+    canReplacementContinueTrip,
+    updatedAt: now,
+  };
+
+  // 9. Cache response for idempotency (TTL: 1 hour)
+  if (gpsEventId) {
+    if (!state.gpsEventCache) {
+      state.gpsEventCache = new Map();
+    }
+    state.gpsEventCache.set(gpsEventId, response);
+    // Cleanup old entries periodically
+    if (state.gpsEventCache.size > 1000) {
+      const nowMs = Date.now();
+      for (const [key, val] of state.gpsEventCache) {
+        if (nowMs - new Date(val.updatedAt).getTime() > 3600000) {
+          state.gpsEventCache.delete(key);
+        }
+      }
+    }
+  }
+
+  // 10. Check for warnings (non-blocking)
+  const warnings = checkGpsEventWarnings(updatedIncident);
+  if (warnings.length > 0) {
+    response.warnings = warnings;
+    console.log(`[gps-event] warnings for ${incidentId}:`, warnings);
+  }
+
+  // 11. Trigger trip logic if needed
+  if (event === 'ReplacementArrived' && canReplacementContinueTrip) {
+    // Notify that replacement boat can continue trip
+    // This would trigger trip continuation logic
+    console.log(`[gps-event] replacement ${boatCode} can continue trip for incident ${incidentId}`);
+  }
+
+  if (event === 'TowingCompleted') {
+    // Mark rescue mission as completed
+    const mission = state.rescueMissions.get(incidentId);
+    if (mission) {
+      mission.status = 'Completed';
+      mission.towingCompletedAt = occurredAt.toISOString();
+      mission.updatedAt = now;
+      console.log(`[gps-event] rescue mission ${incidentId} marked as completed`);
+    }
+  }
+
+  console.log(
+    `[gps-event] accepted: incident=${incidentId} event=${event} boat=${boatCode}`
+    + ` prev=${previousMissionStatus} curr=${event} canContinue=${canReplacementContinueTrip}`
+  );
+
+  return response;
+}
+
+/**
+ * Validate GPS event against incident state & sequence rules
+ */
+function validateGpsEventSequence(incident, event, boatCode, body) {
+  // BE là source of truth cho missionStatus. GPS chỉ gửi events tiếp theo.
+  // Nếu missionStatus = null (incident vừa tạo, chưa dispatch) → GPS KHÔNG được gửi Dispatched
+  const currentStatus = String(incident.missionStatus || '');
+  const currentPriority = getMissionStatusPriority(currentStatus);
+  const eventPriority = getMissionStatusPriority(event);
+
+  // Rule: GPS KHÔNG được gửi 'Dispatched' - đó là BE set khi dispatch tàu cứu
+  if (event === 'Dispatched') {
+    return {
+      valid: false,
+      error: 'GPS không được gửi event Dispatched',
+      details: [
+        'Dispatched là BE set khi dispatch tàu cứu/thay thế',
+        'GPS event đầu tiên phải là RescueArrived hoặc ReplacementArrived',
+      ],
+    };
+  }
+
+  // Rule: Nếu incident chưa dispatch (missionStatus = null), first event phải là RescueArrived/ReplacementArrived
+  if (!currentStatus) {
+    if (!['RescueArrived', 'ReplacementArrived'].includes(event)) {
+      return {
+        valid: false,
+        error: 'Mission chưa được dispatch hoặc event không hợp lệ',
+        details: [
+          'incident chưa có missionStatus (chưa dispatch)',
+          'First GPS event phải là RescueArrived hoặc ReplacementArrived',
+        ],
+      };
+    }
+    // Cho phép tiếp tục với priority = 1 (RescueArrived) hoặc 2 (ReplacementArrived)
+  }
+
+  // Event must be forward in sequence (or same for idempotency)
+  if (eventPriority < currentPriority && event !== currentStatus) {
+    return {
+      valid: false,
+      error: 'Event sequence violated',
+      details: [
+        `Event "${event}" (priority ${eventPriority}) không hợp lệ sau "${currentStatus}" (priority ${currentPriority})`,
+        'Source of truth là missionStatus trong DB, không phải previousMissionStatus từ GPS',
+      ],
+    };
+  }
+
+  // Rule: RescueArrived - boatCode phải là rescueBoatCode của incident
+  if (event === 'RescueArrived') {
+    const rescueBoatCode = String(incident.rescueBoatCode || '').trim();
+    if (rescueBoatCode && boatCode !== rescueBoatCode) {
+      return {
+        valid: false,
+        error: 'boatCode không đúng cho RescueArrived',
+        details: [
+          `Expected: ${rescueBoatCode}`,
+          `Received: ${boatCode}`,
+        ],
+      };
+    }
+  }
+
+  // Rule: ReplacementArrived - boatCode phải là replacementBoatCode
+  if (event === 'ReplacementArrived') {
+    const replacementBoatCode = String(incident.replacementBoatCode || '').trim();
+    if (replacementBoatCode && boatCode !== replacementBoatCode) {
+      return {
+        valid: false,
+        error: 'boatCode không đúng cho ReplacementArrived',
+        details: [
+          `Expected: ${replacementBoatCode}`,
+          `Received: ${boatCode}`,
+        ],
+      };
+    }
+
+    // Nếu mission = TransferAtIncidentLocation: phải tới vị trí sự cố (kiểm tra lat/lng gần incident)
+    const missionType = normalizeReplacementMissionType(incident.replacementMissionType);
+    if (missionType === 'TransferAtIncidentLocation') {
+      const incidentLat = Number(incident.lat || incident.sceneLat);
+      const incidentLng = Number(incident.lng || incident.sceneLng);
+      const eventLat = Number(body.lat);
+      const eventLng = Number(body.lng);
+      if (Number.isFinite(incidentLat) && Number.isFinite(incidentLng)
+          && Number.isFinite(eventLat) && Number.isFinite(eventLng)) {
+        const distMeters = distanceMeters(
+          { lat: incidentLat, lng: incidentLng },
+          { lat: eventLat, lng: eventLng },
+        );
+        const arrivalMeters = Math.max(50, Number(env.RESCUE_ARRIVE_METERS || 50));
+        if (distMeters > arrivalMeters) {
+          return {
+            valid: false,
+            error: 'ReplacementArrived phải tới vị trí sự cố (TransferAtIncidentLocation)',
+            details: [
+              `Khoảng cách từ vị trí sự cố: ${Math.round(distMeters)}m (max: ${arrivalMeters}m)`,
+            ],
+          };
+        }
+      }
+    }
+
+    // Nếu mission = ContinueFromStation: phải tới replacementTargetStation
+    if (missionType === 'ContinueFromStation') {
+      const targetStationCode = String(incident.replacementTargetStationCode || '').trim();
+      const stationId = String(body.stationId || '').trim();
+      if (targetStationCode && stationId && stationId !== targetStationCode) {
+        return {
+          valid: false,
+          error: 'ReplacementArrived phải tới replacementTargetStation (ContinueFromStation)',
+          details: [
+            `Expected station: ${targetStationCode}`,
+            `Received station: ${stationId}`,
+          ],
+        };
+      }
+    }
+  }
+
+  // Rule: PassengerTransferCompleted
+  if (event === 'PassengerTransferCompleted') {
+    const onboardPassengerCount = Number(incident.onboardPassengerCount ?? 0);
+
+    // Chỉ hợp lệ khi onboardPassengerCount > 0
+    if (onboardPassengerCount <= 0) {
+      return {
+        valid: false,
+        error: 'PassengerTransferCompleted không hợp lệ khi không có khách onboard',
+        details: [
+          `onboardPassengerCount hiện tại: ${onboardPassengerCount}`,
+          'Event này chỉ được gửi khi có khách cần chuyển',
+        ],
+      };
+    }
+
+    // Phải có ReplacementArrived trước
+    if (!['ReplacementArrived', 'PassengerTransferCompleted', 'TowingStarted', 'TowingCompleted', 'Completed'].includes(currentStatus)) {
+      return {
+        valid: false,
+        error: 'Phải có ReplacementArrived trước PassengerTransferCompleted',
+        details: [
+          `Current status: ${currentStatus}`,
+          'Expected: ReplacementArrived hoặc sau đó',
+        ],
+      };
+    }
+  }
+
+  // Rule: TowingStarted
+  if (event === 'TowingStarted') {
+    const onboardPassengerCount = Number(incident.onboardPassengerCount ?? 0);
+
+    // Nếu onboardPassengerCount > 0: bắt buộc PassengerTransferCompleted
+    if (onboardPassengerCount > 0) {
+      const validPriorStates = ['PassengerTransferCompleted', 'TowingStarted', 'TowingCompleted', 'Completed'];
+      if (!validPriorStates.includes(currentStatus)) {
+        return {
+          valid: false,
+          error: 'TowingStarted không được chấp nhận khi còn khách onboard mà chưa PassengerTransferCompleted',
+          details: [
+            `onboardPassengerCount: ${onboardPassengerCount}`,
+            `Current status: ${currentStatus}`,
+            'Phải hoàn thành PassengerTransferCompleted trước khi kéo',
+          ],
+        };
+      }
+    }
+    // Nếu onboardPassengerCount = 0: RescueArrived là đủ (đã có trong sequence)
+  }
+
+  // Rule: TowingCompleted - chỉ hợp lệ sau TowingStarted
+  if (event === 'TowingCompleted') {
+    if (!['TowingStarted', 'TowingCompleted', 'Completed'].includes(currentStatus)) {
+      return {
+        valid: false,
+        error: 'TowingCompleted chỉ hợp lệ sau TowingStarted',
+        details: [
+          `Current status: ${currentStatus}`,
+          'Expected: TowingStarted hoặc sau đó',
+        ],
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Calculate canReplacementContinueTrip flag
+ */
+function calculateCanReplacementContinueTrip(incident, event, body) {
+  // Only applies when event is ReplacementArrived
+  if (event !== 'ReplacementArrived') {
+    return false;
+  }
+
+  const missionType = normalizeReplacementMissionType(incident.replacementMissionType);
+  const onboardPassengerCount = Number(incident.onboardPassengerCount ?? 0);
+
+  // ContinueFromStation: always true
+  if (missionType === 'ContinueFromStation') {
+    return true;
+  }
+
+  // TransferAtIncidentLocation
+  if (missionType === 'TransferAtIncidentLocation') {
+    // Nếu không có khách onboard: true ngay
+    if (onboardPassengerCount <= 0) {
+      return true;
+    }
+
+    // Có khách: phải sau PassengerTransferCompleted mới được tiếp tục
+    if (incident.passengerTransferCompletedAt) {
+      return true;
+    }
+
+    return false;
+  }
+
+  // No replacement mission or unknown type: false
+  return false;
+}
+
+/**
+ * Check for warning conditions (non-blocking)
+ */
+function checkGpsEventWarnings(incident) {
+  const warnings = [];
+  const now = new Date();
+
+  // Warning 1: RescueArrived + có khách + >15 phút chưa PassengerTransferCompleted
+  if (incident.rescueArrivedAt && incident.onboardPassengerCount > 0 && !incident.passengerTransferCompletedAt) {
+    const arrivedAt = new Date(incident.rescueArrivedAt);
+    const minutesSinceArrival = (now - arrivedAt) / 60000;
+    const warningThreshold = 15; // minutes
+    if (minutesSinceArrival >= warningThreshold) {
+      warnings.push({
+        type: 'PASSENGER_TRANSFER_DELAY',
+        message: 'Tàu cứu hộ đã tới nhưng khách chưa được chuyển sang tàu thay thế',
+        minutesSinceArrival: Math.round(minutesSinceArrival),
+        thresholdMinutes: warningThreshold,
+      });
+    }
+  }
+
+  // Warning 2: ReplacementDispatched + >ETA + 10 phút chưa ReplacementArrived
+  if (incident.replacementEstimatedResumeAt && !incident.replacementArrivedAt) {
+    const eta = new Date(incident.replacementEstimatedResumeAt);
+    const minutesPastEta = (now - eta) / 60000;
+    const warningThreshold = 10; // minutes
+    if (minutesPastEta >= warningThreshold) {
+      warnings.push({
+        type: 'REPLACEMENT_ARRIVAL_DELAY',
+        message: 'Tàu thay thế chưa tới điểm nhận khách',
+        minutesPastEta: Math.round(minutesPastEta),
+        thresholdMinutes: warningThreshold,
+        eta: incident.replacementEstimatedResumeAt,
+      });
+    }
+  }
+
+  // Warning 3: TowingStarted + >timeout chưa TowingCompleted
+  if (incident.towingStartedAt && !incident.towingCompletedAt) {
+    const startedAt = new Date(incident.towingStartedAt);
+    const minutesSinceStart = (now - startedAt) / 60000;
+    // Use estimatedTowingMinutes if provided, else default 60 minutes
+    const timeoutMinutes = Number(incident.estimatedTowingMinutes) || 60;
+    if (minutesSinceStart >= timeoutMinutes) {
+      warnings.push({
+        type: 'TOWING_TIMEOUT',
+        message: 'Tàu cứu hộ kéo tàu lỗi quá thời gian dự kiến',
+        minutesSinceStart: Math.round(minutesSinceStart),
+        timeoutMinutes,
+      });
+    }
+  }
+
+  return warnings;
+}
+
+/**
+ * Log GPS event for audit trail
+ */
+function logGpsEvent(logEntry) {
+  if (!state.gpsEventLog) {
+    state.gpsEventLog = [];
+  }
+  // Keep last 1000 events
+  if (state.gpsEventLog.length >= 1000) {
+    state.gpsEventLog.shift();
+  }
+  state.gpsEventLog.push(logEntry);
+}
+
+/**
+ * Get GPS event log for an incident
+ */
+function getGpsEventLog(incidentId) {
+  if (!state.gpsEventLog) return [];
+  return state.gpsEventLog.filter((e) => e.incidentId === incidentId);
 }
 
 function rescueMissionPublic(mission) {
@@ -3949,7 +4688,10 @@ function startRescueAutomation(incident) {
   state.rescueMissions.set(incidentId, mission);
   const open = state.openIncidents.get(incidentId);
   if (open) {
-    open.missionStatus = initialStatus;
+    // INTERNAL: rescue operation status (không leak ra public missionStatus)
+    open.internalRescueStatus = initialStatus; // 'Dispatched' | 'Towing' - INTERNAL ONLY
+    // PUBLIC: missionStatus luôn là 'Dispatched' khi BE đã dispatch
+    open.missionStatus = 'Dispatched';
     open.rescueBoatCode = rescueBoatCode;
     open.replacementBoatCode = mission.replacementBoatCode;
     // Giữ sceneLat gốc; không đè bằng hub đã về bến.
@@ -4652,6 +5394,16 @@ function ingestIncidentHook(body = {}, req = null) {
     const id = String(body.incidentId || body.id || '').trim();
     if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId để đóng' };
     const existing = state.openIncidents.get(id);
+
+    // PUBLIC: Set missionStatus = 'Completed' BEFORE deleting record
+    // FE cần thấy 'Completed' trong DTO trước khi record bị xóa
+    const resolvedMissionStatus = 'Completed'; // Public: incident đã đóng
+    if (existing) {
+      existing.missionStatus = resolvedMissionStatus;
+      existing.resolutionStatus = 'Resolved';
+      state.openIncidents.set(id, existing); // Update record with Completed status
+    }
+
     state.openIncidents.delete(id);
     state.resolvedIncidentIds.set(id, Date.now());
     completeRescueMission(id);
@@ -4667,6 +5419,8 @@ function ingestIncidentHook(body = {}, req = null) {
       event: 'IncidentResolved',
       incidentId: id,
       boatCode: existing?.boatCode || body.boatCode || null,
+      // PUBLIC: missionStatus = 'Completed' để FE update UI
+      missionStatus: resolvedMissionStatus,
       openCount: state.openIncidents.size,
     };
   }
@@ -5073,13 +5827,15 @@ async function assignReplacementBoat(incidentId, body = {}) {
   const id = String(incidentId || '').trim();
   if (!id) return { ok: false, status: 400, error: 'Thiếu incidentId' };
 
+  // Contract: request body dùng ID (rescueBoatId, replacementBoatId), BE tự resolve.
+  // Chỉ chấp nhận rescueBoatCode tham khảo nếu FE admin panel cũ vẫn gửi code.
   const rescueBoatCode = pickRescueBoatCode(body)
-    || String(body.replacementBoatCode || body.boatCode || '').trim();
+    || String(body.boatCode || '').trim();
   const replacementBoatCode = pickReplacementBoatCode(body) || null;
   const rescue = boatByIdOrCode(body.replacementBoatId || rescueBoatCode);
   const replacementBoatId = body.replacementBoatId || rescue?.boatId;
   if (!rescueBoatCode && !replacementBoatId) {
-    return { ok: false, status: 400, error: 'Thiếu rescueBoatCode / replacementBoatCode' };
+    return { ok: false, status: 400, error: 'Thiếu rescueBoatId / replacementBoatId' };
   }
 
   const payload = {
