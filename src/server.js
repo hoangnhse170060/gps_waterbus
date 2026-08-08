@@ -3584,20 +3584,6 @@ const GPS_EVENTS = Object.freeze([
   'TowingCompleted',
 ]);
 
-/**
- * PUBLIC mission statuses (DTO/API) - BE map từ internal ra public
- * Đây là trạng thái public mà FE/Mobile dùng
- */
-const PUBLIC_MISSION_STATUSES = Object.freeze([
-  'Dispatched',                    // Public: BE đã dispatch tàu cứu/thay thế
-  'RescueArrived',                 // Public: GPS gửi
-  'ReplacementArrived',            // Public: GPS gửi
-  'PassengerTransferCompleted',    // Public: GPS gửi
-  'TowingStarted',                 // Public: GPS gửi
-  'TowingCompleted',              // Public: GPS gửi
-  'Completed',                     // Public: incident đã đóng
-]);
-
 /** Mission status progression sequence - CHỈ public statuses */
 const MISSION_STATUS_SEQUENCE = Object.freeze([
   'Dispatched',        // 0: Initial (từ BE khi dispatch)
