@@ -149,6 +149,8 @@ let charterRouteFilterIds = null;
 let activeCharterRequest = null;
 /** Chặng charter đang vẽ — BE contract: 1 route = 1 chặng = đúng 2 bến / 1 lần gửi. */
 let activeCharterLeg = null;
+/** Set các requestId charter đã hoàn tất (route đã lưu đủ chặng) — lưu localStorage để ẩn khỏi panel. */
+let charterDoneRequestIds = new Set(JSON.parse(localStorage.getItem('charterDoneIds') || '[]'));
 let charterCandidateLayer = null;
 let charterStopLayer = null;
 /** stationId → stopOrder của yêu cầu charter đang mở (đổi màu cờ bến sẵn có). */
@@ -2977,12 +2979,22 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       const done = (Number(activeCharterRequest._legIndex) || 0) + 1;
       notifyOk(`Đã lưu chặng ${done}/${queue.length} — còn ${queue.length - done} chặng`);
     } else if (body.charterComplete?.ok) {
+      if (activeCharterRequest?.requestId) {
+        charterDoneRequestIds.add(activeCharterRequest.requestId);
+        localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
+      }
       notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest({ refresh: true });
+      await loadCharterRequests();
     } else if (activeCharterRequest?.requestId && isFinalCharterLeg()) {
       // Đã vẽ hết chặng thiếu → CB đủ tuyến, thoát chế độ charter (không còn hiện ở panel).
       const ids = [...(charterRouteFilterIds || [])];
       if (savedId) ids.push(String(savedId));
+      // Đánh dấu request này đã hoàn tất để lần refresh sau tự ẩn khỏi panel.
+      if (activeCharterRequest.requestId) {
+        charterDoneRequestIds.add(activeCharterRequest.requestId);
+        localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
+      }
       notifyOk('CB đã đủ tuyến — đã bỏ khỏi danh sách');
       exitCharterKeepRoutes(ids);
     }
@@ -4948,8 +4960,14 @@ function renderCharterRequestList(items) {
   if (!charterRequestListEl) return;
   const all = Array.isArray(items) ? items : [];
   // Đủ tuyến rồi thì không còn việc để vẽ — bỏ khỏi danh sách.
-  const covered = all.filter((item) => isCharterFullyCovered(item));
-  const list = all.filter((item) => !isCharterFullyCovered(item));
+  const covered = all.filter((item) => {
+    const id = item.requestId || item.id;
+    return charterDoneRequestIds.has(id) || isCharterFullyCovered(item);
+  });
+  const list = all.filter((item) => {
+    const id = item.requestId || item.id;
+    return !charterDoneRequestIds.has(id) && !isCharterFullyCovered(item);
+  });
   const coveredNote = covered.length
     ? `<li class="charter-request-empty">${covered.length} yêu cầu đã đủ tuyến — đã ẩn.</li>`
     : '';
