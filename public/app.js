@@ -1456,17 +1456,34 @@ function updateRouteTypeHint() {
 
 function updateStopChainPreview(orderedInput) {
   if (!stopChainPreviewEl) return;
-  // Charter: chỉ hiện 2 bến của chặng đang vẽ, không hiện cả chuỗi.
-  if (activeCharterLeg?.from && activeCharterLeg?.to) {
-    const from = activeCharterLeg.from;
-    const to = activeCharterLeg.to;
-    const nameFrom = from.stationCode || from.stationName || from.stationId || '?';
-    const nameTo = to.stationCode || to.stationName || to.stationId || '?';
-    const legLabel = activeCharterLeg.label || '';
-    stopChainPreviewEl.innerHTML = `<span class="stop-chip"><b>Đầu</b> ${escapeHtml(nameFrom)}</span>` +
-      `<span class="stop-sep"> → </span>` +
-      `<span class="stop-chip"><b>Cuối</b> ${escapeHtml(nameTo)}</span>` +
-      (legLabel ? ` <span class="leg-label">(${escapeHtml(legLabel)})</span>` : '');
+  // Charter: hiện MỖI chặng (matched + missing) trên 1 dòng riêng, không gộp.
+  // Đã có route → hiện đầy đủ "Đầu X → Cuối Y (Tuyến CODE)".
+  // Còn thiếu → "Đầu X → Cuối Y (cần vẽ)".
+  if (activeCharterRequest?.requestId) {
+    const match = activeCharterRequest._savedMatch;
+    if (!match) {
+      stopChainPreviewEl.innerHTML = '<span class="stop-seg is-missing">Đang tải…</span>';
+      stopChainPreviewEl.classList.remove('is-empty');
+      return;
+    }
+    const allLegs = [
+      ...(match.matchedLegs || []).map((l) => ({ ...l, _state: 'ok' })),
+      ...(match.missingLegs || []).map((l) => ({ ...l, _state: 'miss' })),
+    ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    if (!allLegs.length) {
+      stopChainPreviewEl.innerHTML = '<span class="stop-seg is-missing">Chưa có chặng nào</span>';
+      stopChainPreviewEl.classList.add('is-empty');
+      return;
+    }
+    stopChainPreviewEl.innerHTML = allLegs.map((leg) => {
+      const from = leg.from.stationCode || leg.from.stationName || leg.from.stationId || '?';
+      const to = leg.to.stationCode || leg.to.stationName || leg.to.stationId || '?';
+      const label = leg.label || '';
+      const badge = leg._state === 'ok'
+        ? `<span class="stop-seg"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag">(${escapeHtml(leg.routeCode || 'khớp')})</span></span>`
+        : `<span class="stop-seg is-missing"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag is-miss">(cần vẽ)</span></span>`;
+      return badge;
+    }).join('<br>');
     stopChainPreviewEl.classList.remove('is-empty');
     return;
   }
@@ -2990,6 +3007,9 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       // Đã vẽ hết chặng thiếu → CB đủ tuyến, thoát chế độ charter (không còn hiện ở panel).
       const ids = [...(charterRouteFilterIds || [])];
       if (savedId) ids.push(String(savedId));
+      // Cập nhật match cache & rebuild preview trước khi clear.
+      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      updateStopChainPreview();
       // Đánh dấu request này đã hoàn tất để lần refresh sau tự ẩn khỏi panel.
       if (activeCharterRequest.requestId) {
         charterDoneRequestIds.add(activeCharterRequest.requestId);
@@ -2997,6 +3017,11 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       }
       notifyOk('CB đã đủ tuyến — đã bỏ khỏi danh sách');
       exitCharterKeepRoutes(ids);
+    } else if (activeCharterRequest?.requestId) {
+      // Vừa lưu chặng xong (còn chặng khác) → rebuild match + preview.
+      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      updateStopChainPreview();
+      updateCharterActiveBanner();
     }
     if (!hasMoreCharterLegs) hideDrawingKeepGps({ routeCode: body.routeCode || routeCode });
     if (silentClear && !hasMoreCharterLegs) {
