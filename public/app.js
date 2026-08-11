@@ -4680,6 +4680,10 @@ function updateCharterActiveBanner() {
 /** Đủ tuyến: bỏ chế độ charter (ẩn banner, cờ về thường) nhưng vẫn hiện tuyến của CB. */
 async function exitCharterKeepRoutes(routeIds) {
   const ids = [...new Set(Array.from(routeIds || [], String).filter(Boolean))];
+  // Cập nhật match cache trước khi refresh list - để isCharterFullyCovered đúng.
+  if (activeCharterRequest?.requestId) {
+    activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+  }
   clearActiveCharterRequest({ refresh: true });
   if (!ids.length) return;
   showSavedRoutes = true;
