@@ -4394,6 +4394,8 @@ function applyCharterStationsToForm(stops) {
   updateReverseRouteUi();
   updateRouteTypeHint();
   checkRouteCodeDuplicate();
+  updateCharterActiveBanner();
+  updateStopChainPreview();
 }
 
 /** 2 bến của 1 chặng charter — đúng payload 1 route được phép gửi. */
@@ -4440,6 +4442,7 @@ function applyCharterLegToForm(leg, total) {
   updateRouteTypeHint();
   checkRouteCodeDuplicate();
   updateCharterActiveBanner();
+  updateStopChainPreview();
 }
 
 /** Lưu xong 1 chặng → mở chặng thiếu kế tiếp (không gộp, không tự nối). */
