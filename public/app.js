@@ -3029,23 +3029,33 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       if (activeCharterRequest?.requestId) {
         charterDoneRequestIds.add(activeCharterRequest.requestId);
         localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
+        removeCharterRequestFromList(activeCharterRequest.requestId);
       }
       notifyOk('Charter request Done — đã gắn route vào booking');
-      clearActiveCharterRequest({ refresh: true });
-      await loadCharterRequests();
+      clearActiveCharterRequest();
+      // Refresh sau 1.5s (đủ để BE persist status mới).
+      setTimeout(() => loadCharterRequests().catch(() => {}), 1500);
     } else if (activeCharterRequest?.requestId && isFinalCharterLeg()) {
       // Đã vẽ hết chặng thiếu → CB đủ tuyến, thoát chế độ charter (không còn hiện ở panel).
       const ids = [...(charterRouteFilterIds || [])];
       if (savedId) ids.push(String(savedId));
-      // Cập nhật match cache & rebuild preview trước khi clear.
-      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
-      updateStopChainPreview();
       // Đánh dấu request này đã hoàn tất để lần refresh sau tự ẩn khỏi panel.
-      if (activeCharterRequest.requestId) {
-        charterDoneRequestIds.add(activeCharterRequest.requestId);
+      const doneId = activeCharterRequest.requestId;
+      if (doneId) {
+        charterDoneRequestIds.add(doneId);
         localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
       }
       notifyOk('CB đã đủ tuyến — đã bỏ khỏi danh sách');
+      // Cập nhật match cache trước khi clear.
+      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      updateStopChainPreview();
+      // Clear form + xóa khỏi panel ngay (không chờ server).
+      const requestToRemove = activeCharterRequest;
+      activeCharterRequest = null;
+      activeCharterLeg = null;
+      removeCharterRequestFromList(requestToRemove.requestId);
+      // Refresh danh sách sau 1.5s (đủ để BE persist status).
+      setTimeout(() => loadCharterRequests().catch(() => {}), 1500);
       exitCharterKeepRoutes(ids);
     } else if (activeCharterRequest?.requestId) {
       // Vừa lưu chặng xong (còn chặng khác) → rebuild match + preview.
@@ -5062,6 +5072,22 @@ function renderCharterRequestList(items) {
   charterRequestListEl.querySelectorAll('.charter-request-item').forEach((btn) => {
     btn.addEventListener('click', () => openCharterRequest(btn.dataset.requestId));
   });
+}
+
+/** Xóa ngay 1 request khỏi DOM panel (khi đã đủ tuyến → không chờ server refresh). */
+function removeCharterRequestFromList(requestId) {
+  if (!requestId || !charterRequestListEl) return;
+  const btn = charterRequestListEl.querySelector(`.charter-request-item[data-request-id="${CSS.escape(requestId)}"]`);
+  if (btn) {
+    const li = btn.closest('li');
+    if (li) li.remove();
+    else btn.remove();
+  }
+  // Nếu rỗng → hiện placeholder.
+  if (!charterRequestListEl.querySelector('.charter-request-item')) {
+    charterRequestListEl.classList.add('is-empty');
+    charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không còn yêu cầu charter nào.</li>';
+  }
 }
 
 async function fetchCharterListByStatus(status) {
