@@ -709,7 +709,7 @@ const server = createServer(async (req, res) => {
     }
     {
       const charterMatch = url.pathname.match(
-        /^\/api\/charter\/route-draw-requests\/([^/]+)(?:\/(in-progress|complete|cancel))?$/,
+        /^\/api\/charter\/route-draw-requests\/([^/]+)(?:\/(in-progress|complete|cancel|acknowledge))?$/,
       );
       if (charterMatch) {
         const requestId = decodeURIComponent(charterMatch[1]);
@@ -757,6 +757,13 @@ const server = createServer(async (req, res) => {
           const result = await charterAdminRequest('POST', `${basePath}/cancel`);
           if (!result.ok) {
             return sendJson(res, { error: result.error || 'cancel thất bại' }, result.status || 502);
+          }
+          return sendJson(res, { ok: true, requestId, data: result.data });
+        }
+        if (action === 'acknowledge' && req.method === 'POST') {
+          const result = await acknowledgeCharterRouteDrawRequest(requestId);
+          if (!result.ok) {
+            return sendJson(res, { error: result.error || 'acknowledge thất bại' }, result.status || 502);
           }
           return sendJson(res, { ok: true, requestId, data: result.data });
         }
@@ -7382,6 +7389,36 @@ async function completeCharterRouteDrawRequest(requestId, routeId) {
     state.charterDrawRequests.set(id, row);
   }
   return result;
+}
+
+/**
+ * Báo BE "đã xem/xong" request này (chỉ ẩn khỏi queue Pending/InProgress).
+ * Khác complete (cần routeId) và cancel (hủy bỏ request).
+ * Fallback nếu BE chưa có endpoint /acknowledge: tự set local map → list call sẽ skip.
+ */
+async function acknowledgeCharterRouteDrawRequest(requestId) {
+  const id = cleanOptionalText(requestId);
+  if (!id) {
+    return { ok: false, status: 400, error: 'Thiếu requestId', data: null };
+  }
+  // Cập nhật local map trước → list(filter Pending/InProgress) sẽ tự skip ngay.
+  if (state.charterDrawRequests.has(id)) {
+    const row = state.charterDrawRequests.get(id);
+    row.status = 'Acknowledged';
+    row.acknowledgedAt = new Date().toISOString();
+    state.charterDrawRequests.set(id, row);
+  }
+  // Thử gọi BE nếu có endpoint (optional - không fail nếu 404).
+  const result = await charterAdminRequest(
+    'POST',
+    `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(id)}/acknowledge`,
+    {},
+  );
+  // Nếu BE không có endpoint → vẫn ok local (FE poll vẫn thấy status Acknowledged → skip).
+  if (!result.ok && result.status && result.status !== 404 && result.status !== 405) {
+    return result;
+  }
+  return { ok: true, requestId: id, data: { acknowledged: true } };
 }
 
 function verifyLiveHookSecret(body = {}, req = null) {

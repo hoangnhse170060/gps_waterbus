@@ -5183,17 +5183,24 @@ async function loadCharterRequests() {
 
 charterRefreshBtnEl?.addEventListener('click', () => loadCharterRequests());
 charterClearBtnEl?.addEventListener('click', () => clearActiveCharterRequest());
-charterNextLegBtnEl?.addEventListener('click', () => {
+charterNextLegBtnEl?.addEventListener('click', async () => {
   if (!activeCharterRequest?.requestId) return;
   const queue = charterLegQueue();
   const idx = Number(activeCharterRequest._legIndex) || 0;
   if (idx >= queue.length - 1) {
-    // Chặng cuối rồi → user xác nhận hoàn tất: ẩn + lưu localStorage.
     const doneId = activeCharterRequest.requestId;
+    const doneCode = activeCharterRequest.bookingCode || doneId;
+    // Báo BE ẩn khỏi queue Pending/InProgress (FE khác/reload sẽ không thấy nữa).
+    fetch(`/api/charter/route-draw-requests/${encodeURIComponent(doneId)}/acknowledge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).catch(() => {});
+    // Lưu local + ẩn DOM ngay.
     charterDoneRequestIds.add(doneId);
     localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
     removeCharterRequestFromList(doneId);
-    notifyOk('Đã đủ tuyến — request đã ẩn khỏi danh sách');
+    notifyOk(`CB ${doneCode} đã đủ tuyến — đã báo BE, ẩn khỏi danh sách`);
     activeCharterRequest = null;
     activeCharterLeg = null;
     updateCharterActiveBanner();
