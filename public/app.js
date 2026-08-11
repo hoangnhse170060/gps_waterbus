@@ -1454,6 +1454,20 @@ function updateRouteTypeHint() {
 
 function updateStopChainPreview(orderedInput) {
   if (!stopChainPreviewEl) return;
+  // Charter: chỉ hiện 2 bến của chặng đang vẽ, không hiện cả chuỗi.
+  if (activeCharterLeg?.from && activeCharterLeg?.to) {
+    const from = activeCharterLeg.from;
+    const to = activeCharterLeg.to;
+    const nameFrom = from.stationCode || from.stationName || from.stationId || '?';
+    const nameTo = to.stationCode || to.stationName || to.stationId || '?';
+    const legLabel = activeCharterLeg.label || '';
+    stopChainPreviewEl.innerHTML = `<span class="stop-chip"><b>Đầu</b> ${escapeHtml(nameFrom)}</span>` +
+      `<span class="stop-sep"> → </span>` +
+      `<span class="stop-chip"><b>Cuối</b> ${escapeHtml(nameTo)}</span>` +
+      (legLabel ? ` <span class="leg-label">(${escapeHtml(legLabel)})</span>` : '');
+    stopChainPreviewEl.classList.remove('is-empty');
+    return;
+  }
   const ordered = orderedInput || collectOrderedStopsFromClicks();
   if (!ordered.length) {
     stopChainPreviewEl.innerHTML = 'Chưa có bến — click bến hoặc vẽ qua gần bến catalog.';
@@ -4664,7 +4678,7 @@ function updateCharterActiveBanner() {
 }
 
 /** Đủ tuyến: bỏ chế độ charter (ẩn banner, cờ về thường) nhưng vẫn hiện tuyến của CB. */
-function exitCharterKeepRoutes(routeIds) {
+async function exitCharterKeepRoutes(routeIds) {
   const ids = [...new Set(Array.from(routeIds || [], String).filter(Boolean))];
   clearActiveCharterRequest({ refresh: true });
   if (!ids.length) return;
@@ -4677,6 +4691,8 @@ function exitCharterKeepRoutes(routeIds) {
     updateLegendSwatch();
   }
   showSelectedRouteStops(ids[0]);
+  // Refresh danh sách charter request - ẩn những cái đã đủ tuyến.
+  await loadCharterRequests();
 }
 
 function clearActiveCharterRequest({ refresh = false } = {}) {
