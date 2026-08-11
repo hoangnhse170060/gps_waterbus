@@ -3026,15 +3026,16 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       const done = (Number(activeCharterRequest._legIndex) || 0) + 1;
       notifyOk(`Đã lưu chặng ${done}/${queue.length} — còn ${queue.length - done} chặng`);
     } else if (body.charterComplete?.ok) {
-      if (activeCharterRequest?.requestId) {
-        charterDoneRequestIds.add(activeCharterRequest.requestId);
+      const doneId = activeCharterRequest?.requestId;
+      if (doneId) {
+        charterDoneRequestIds.add(doneId);
         localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
-        removeCharterRequestFromList(activeCharterRequest.requestId);
+        removeCharterRequestFromList(doneId);
       }
       notifyOk('Charter request Done — đã gắn route vào booking');
       clearActiveCharterRequest();
-      // Refresh sau 1.5s (đủ để BE persist status mới).
-      setTimeout(() => loadCharterRequests().catch(() => {}), 1500);
+      // Poll server tới khi nó cũng trả rỗng (status đã Done/Completed).
+      pollCharterRequestUntilGone(doneId);
     } else if (activeCharterRequest?.requestId && isFinalCharterLeg()) {
       // Đã vẽ hết chặng thiếu → CB đủ tuyến, thoát chế độ charter (không còn hiện ở panel).
       const ids = [...(charterRouteFilterIds || [])];
@@ -3044,18 +3045,18 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       if (doneId) {
         charterDoneRequestIds.add(doneId);
         localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
+        removeCharterRequestFromList(doneId);
       }
       notifyOk('CB đã đủ tuyến — đã bỏ khỏi danh sách');
       // Cập nhật match cache trước khi clear.
       activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
       updateStopChainPreview();
-      // Clear form + xóa khỏi panel ngay (không chờ server).
+      // Clear form ngay.
       const requestToRemove = activeCharterRequest;
       activeCharterRequest = null;
       activeCharterLeg = null;
-      removeCharterRequestFromList(requestToRemove.requestId);
-      // Refresh danh sách sau 1.5s (đủ để BE persist status).
-      setTimeout(() => loadCharterRequests().catch(() => {}), 1500);
+      // Poll server cho tới khi nó trả về không còn request (status Done).
+      pollCharterRequestUntilGone(requestToRemove.requestId);
       exitCharterKeepRoutes(ids);
     } else if (activeCharterRequest?.requestId) {
       // Vừa lưu chặng xong (còn chặng khác) → rebuild match + preview.
@@ -5088,6 +5089,43 @@ function removeCharterRequestFromList(requestId) {
     charterRequestListEl.classList.add('is-empty');
     charterRequestListEl.innerHTML = '<li class="charter-request-empty">Không còn yêu cầu charter nào.</li>';
   }
+}
+
+/**
+ * Poll server cho tới khi BE xác nhận request đã không còn ở Pending/InProgress
+ * (tức đã chuyển Done/Completed). Gọi loadCharterRequests ở mỗi tick — filter localStorage
+ * sẽ giữ request ẩn đến khi server sẵn sàng, rồi render lần cuối lấy trạng thái thật.
+ */
+function pollCharterRequestUntilGone(requestId, attempt = 0) {
+  if (!requestId) return;
+  const max = 12;
+  const delay = Math.min(1500 + attempt * 500, 4000);
+  setTimeout(async () => {
+    try {
+      const [pending, inProgress] = await Promise.all([
+        fetchCharterListByStatus('Pending'),
+        fetchCharterListByStatus('InProgress'),
+      ]);
+      const byId = new Map();
+      for (const item of [...pending, ...inProgress]) {
+        const id = item.requestId || item.id;
+        if (id) byId.set(id, item);
+      }
+      if (!byId.has(requestId)) {
+        // BE confirm: request không còn ở Pending/InProgress → render từ server.
+        await loadCharterRequests();
+        return;
+      }
+    } catch (error) {
+      // ignore — sẽ retry.
+    }
+    if (attempt < max) {
+      pollCharterRequestUntilGone(requestId, attempt + 1);
+    } else {
+      // Hết retry → render lại lần cuối.
+      loadCharterRequests().catch(() => {});
+    }
+  }, delay);
 }
 
 async function fetchCharterListByStatus(status) {
