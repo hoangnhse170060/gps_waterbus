@@ -94,6 +94,7 @@ const charterActiveBannerEl = document.querySelector('#charterActiveBanner');
 const charterActiveTitleEl = document.querySelector('#charterActiveTitle');
 const charterActiveMetaEl = document.querySelector('#charterActiveMeta');
 const charterClearBtnEl = document.querySelector('#charterClearBtn');
+const charterNextLegBtnEl = document.querySelector('#charterNextLegBtn');
 
 function toast(message, type = 'info', ms = 3200) {
   const text = String(message || '').trim();
@@ -3074,7 +3075,13 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       renderCaptureState();
     }
     await fetch('/api/refresh', { method: 'POST' });
-    if (hasMoreCharterLegs) advanceCharterLeg();
+    // KHÔNG auto-advance: user bấm nút "Chặng kế →" để chuyển sang chặng tiếp theo.
+    // Sau save mà còn chặng → chỉ rebuild match + preview + show nút.
+    if (hasMoreCharterLegs) {
+      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      updateStopChainPreview();
+      updateCharterActiveBanner();
+    }
     return true;
   } catch (error) {
     captureStatusEl.textContent = `Lỗi: ${error.message}`;
@@ -4753,6 +4760,21 @@ function updateCharterActiveBanner() {
       charterActiveMetaEl.textContent = `${stopNames || '—'} · chưa có path — vẽ rồi ghi GPS`;
     }
   }
+  // Nút "Chặng kế / Hoàn tất" — hiện khi còn chặng sau chặng hiện tại.
+  if (charterNextLegBtnEl) {
+    const queue = charterLegQueue();
+    const idx = Number(activeCharterRequest?._legIndex) || 0;
+    const hasNext = idx < queue.length - 1;
+    // Nếu đã đủ tuyến (fullyCovered) → ẩn nút, request tự xử lý.
+    if (fullyCovered) {
+      charterNextLegBtnEl.hidden = true;
+    } else {
+      charterNextLegBtnEl.hidden = false;
+      charterNextLegBtnEl.textContent = hasNext
+        ? `Chặng kế (${idx + 2}/${queue.length}) →`
+        : `Hoàn tất (${queue.length}/${queue.length}) →`;
+    }
+  }
   charterRequestListEl?.querySelectorAll('.charter-request-item').forEach((btn) => {
     btn.classList.toggle('is-active', btn.dataset.requestId === activeCharterRequest.requestId);
   });
@@ -5161,6 +5183,25 @@ async function loadCharterRequests() {
 
 charterRefreshBtnEl?.addEventListener('click', () => loadCharterRequests());
 charterClearBtnEl?.addEventListener('click', () => clearActiveCharterRequest());
+charterNextLegBtnEl?.addEventListener('click', () => {
+  if (!activeCharterRequest?.requestId) return;
+  const queue = charterLegQueue();
+  const idx = Number(activeCharterRequest._legIndex) || 0;
+  if (idx >= queue.length - 1) {
+    // Chặng cuối rồi → user xác nhận hoàn tất: ẩn + lưu localStorage.
+    const doneId = activeCharterRequest.requestId;
+    charterDoneRequestIds.add(doneId);
+    localStorage.setItem('charterDoneIds', JSON.stringify([...charterDoneRequestIds]));
+    removeCharterRequestFromList(doneId);
+    notifyOk('Đã đủ tuyến — request đã ẩn khỏi danh sách');
+    activeCharterRequest = null;
+    activeCharterLeg = null;
+    updateCharterActiveBanner();
+    loadCharterRequests().catch(() => {});
+    return;
+  }
+  advanceCharterLeg();
+});
 
 loadCharterRequests();
 

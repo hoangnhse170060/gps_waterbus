@@ -1654,6 +1654,13 @@ input.is-invalid {
   gap: 8px;
 }
 
+.charter-active-actions button:not(.secondary) {
+  background: var(--accent, #0a7cff);
+  color: #fff;
+  border-color: var(--accent, #0a7cff);
+  font-weight: 600;
+}
+
 .charter-stop-pin {
   background: transparent;
   border: none;
