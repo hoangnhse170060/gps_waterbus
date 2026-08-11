@@ -1456,9 +1456,8 @@ function updateRouteTypeHint() {
 
 function updateStopChainPreview(orderedInput) {
   if (!stopChainPreviewEl) return;
-  // Charter: hiện MỖI chặng (matched + missing) trên 1 dòng riêng, không gộp.
-  // Đã có route → hiện đầy đủ "Đầu X → Cuối Y (Tuyến CODE)".
-  // Còn thiếu → "Đầu X → Cuối Y (cần vẽ)".
+  // Charter: hiện từng chặng (matched + missing) trên 1 dòng riêng.
+  // Nếu đang vẽ 1 chặng (activeCharterLeg) → chỉ hiện chặng đó (kèm context matched trước đó).
   if (activeCharterRequest?.requestId) {
     const match = activeCharterRequest._savedMatch;
     if (!match) {
@@ -1466,6 +1465,38 @@ function updateStopChainPreview(orderedInput) {
       stopChainPreviewEl.classList.remove('is-empty');
       return;
     }
+    // Đang vẽ 1 chặng: chỉ hiện context (các chặng đã khớp) + chặng đang vẽ + (tuỳ chọn) chặng tới.
+    if (activeCharterLeg?.from && activeCharterLeg?.to) {
+      const queue = activeCharterRequest._legQueue || [];
+      const curIdx = activeCharterRequest._legIndex || 0;
+      const allLegs = [
+        ...(match.matchedLegs || []).map((l) => ({ ...l, _state: 'ok' })),
+        ...(match.missingLegs || []).map((l, i) => ({ ...l, _state: curIdx === i ? 'drawing' : 'miss' })),
+      ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+      const head = allLegs.slice(0, curIdx + 1);
+      if (!head.length) {
+        stopChainPreviewEl.innerHTML = '<span class="stop-seg is-missing">Chưa có chặng nào</span>';
+        stopChainPreviewEl.classList.add('is-empty');
+        return;
+      }
+      const tail = queue.length - curIdx - 1;
+      stopChainPreviewEl.innerHTML = head.map((leg, i) => {
+        const from = leg.from.stationCode || leg.from.stationName || leg.from.stationId || '?';
+        const to = leg.to.stationCode || leg.to.stationName || leg.to.stationId || '?';
+        const isCur = i === head.length - 1;
+        if (leg._state === 'ok') {
+          return `<span class="stop-seg"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag">(${escapeHtml(leg.routeCode || 'khớp')})</span></span>`;
+        }
+        if (isCur) {
+          return `<span class="stop-seg is-drawing"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag is-drawing">→ đang vẽ</span></span>`;
+        }
+        return `<span class="stop-seg is-missing"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag is-miss">(cần vẽ)</span></span>`;
+      }).join('<br>') +
+        (tail > 0 ? `<br><span class="stop-seg is-muted">… còn ${tail} chặng nữa</span>` : '');
+      stopChainPreviewEl.classList.remove('is-empty');
+      return;
+    }
+    // Chưa vẽ (chỉ preview tổng): hiện tất cả.
     const allLegs = [
       ...(match.matchedLegs || []).map((l) => ({ ...l, _state: 'ok' })),
       ...(match.missingLegs || []).map((l) => ({ ...l, _state: 'miss' })),
@@ -1478,7 +1509,6 @@ function updateStopChainPreview(orderedInput) {
     stopChainPreviewEl.innerHTML = allLegs.map((leg) => {
       const from = leg.from.stationCode || leg.from.stationName || leg.from.stationId || '?';
       const to = leg.to.stationCode || leg.to.stationName || leg.to.stationId || '?';
-      const label = leg.label || '';
       const badge = leg._state === 'ok'
         ? `<span class="stop-seg"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag">(${escapeHtml(leg.routeCode || 'khớp')})</span></span>`
         : `<span class="stop-seg is-missing"><b>${escapeHtml(from)}</b> → <b>${escapeHtml(to)}</b> <span class="route-tag is-miss">(cần vẽ)</span></span>`;
@@ -4938,7 +4968,9 @@ async function openCharterRequest(requestId) {
       // Vẽ & gửi từng chặng: mỗi route chỉ 2 bến, hết chặng này mới sang chặng sau.
       activeCharterRequest._legQueue = savedMatch.missingLegs;
       activeCharterRequest._legIndex = 0;
+      activeCharterLeg = savedMatch.missingLegs[0];
       applyCharterLegToForm(savedMatch.missingLegs[0], savedMatch.missingLegs.length);
+      updateStopChainPreview();
       setDrawTool('draw');
       const first = savedMatch.missingLegs[0].label;
       captureStatusEl.textContent = ok
@@ -4954,6 +4986,10 @@ async function openCharterRequest(requestId) {
     }
     updateCharterActiveBanner();
     updateWorkflow('draw');
+    updateStopChainPreview();
+    // Cuộn panel "Thiết lập tuyến" vào view để user thấy bảng chặng ngay.
+    const sec = document.getElementById('captureSection');
+    if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) {
     notifyErr(`Mở yêu cầu charter thất bại: ${error.message}`);
   }
