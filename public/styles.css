@@ -282,19 +282,24 @@ input[type="number"][readonly] {
 }
 
 .route-estimate {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  display: flex;
+  gap: 12px;
   margin-top: 4px;
   padding: 10px;
   border: 1px solid #bfe7df;
   border-radius: 8px;
   background: #effbf8;
+  justify-content: space-between;
+}
+
+.route-estimate > div {
+  text-align: center;
+  flex: 1;
 }
 
 .route-estimate span {
   display: block;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   color: var(--muted);
   font-size: 10px;
   font-weight: 800;

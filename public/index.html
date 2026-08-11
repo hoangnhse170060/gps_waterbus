@@ -121,19 +121,19 @@
         <section class="charter-request-section" id="charterRequestSection">
           <div class="section-header">
             <h2>Yêu cầu Charter</h2>
-            <button type="button" class="secondary charter-refresh-btn" id="charterRefreshBtn" title="Tải lại danh sách" aria-label="Tải lại danh sách">↻</button>
+            <button type="button" class="secondary charter-refresh-btn" id="charterRefreshBtn" title="Tải lại" aria-label="Tải lại danh sách">↻</button>
           </div>
           <div class="charter-active-banner is-empty" id="charterActiveBanner" hidden>
             <div class="charter-active-text">
-              <strong id="charterActiveTitle">Chưa chọn yêu cầu</strong>
+              <strong id="charterActiveTitle">Chưa chọn</strong>
               <p id="charterActiveMeta"></p>
             </div>
             <div class="charter-active-actions">
-              <button type="button" class="secondary" id="charterClearBtn">Bỏ chọn</button>
+              <button type="button" class="secondary" id="charterClearBtn">Bỏ</button>
             </div>
           </div>
           <ul class="charter-request-list is-empty" id="charterRequestList">
-            <li class="charter-request-empty">Đang tải yêu cầu…</li>
+            <li class="charter-request-empty">Đang tải…</li>
           </ul>
         </section>
 
@@ -161,10 +161,6 @@
                 <span class="hub-status-title">Tracking Hub</span>
                 <span class="hub-status-mode" id="hubStatusMode">Local</span>
               </div>
-              <div class="hub-status-row" id="hubStatusEndpointRow">
-                <span>Endpoint</span>
-                <code id="hubStatusEndpoint">—</code>
-              </div>
               <div class="hub-status-grid">
                 <div>
                   <span>Azure</span>
@@ -175,12 +171,12 @@
                   <strong id="hubStatusSignalr">—</strong>
                 </div>
                 <div>
-                  <span>Gửi cuối</span>
-                  <strong id="hubStatusLastSend">—</strong>
-                </div>
-                <div>
                   <span>Điểm</span>
                   <strong id="hubStatusPoints">0 / 0</strong>
+                </div>
+                <div>
+                  <span>Gửi cuối</span>
+                  <strong id="hubStatusLastSend">—</strong>
                 </div>
               </div>
               <p class="hub-status-note" id="hubStatusNote">Đang chờ dữ liệu từ Live.</p>
@@ -216,50 +212,28 @@
               </div>
               <input type="hidden" id="endStation" value="">
               <div class="stop-chain" id="stopChainPreview">Chưa có chuỗi bến.</div>
-              <small class="field-hint" id="routeTypeHint">Click từng bến muốn dừng. Vẽ nét thẳng — không tự nhận bến đi qua.</small>
             </label>
 
             <div class="route-estimate" id="routeEstimate">
-              <div><span>Quãng đường (km)</span><strong id="estimateKm">0 km</strong></div>
-              <div><span>Vận tốc (km/h)</span><strong id="estimateSpeed">16 km/h</strong></div>
-              <div><span>Chạy thuần</span><strong id="estimateCruiseMin">0 phút</strong></div>
-              <div><span>Đệm cập bến</span><strong id="estimateBufferMin">0 phút</strong></div>
-              <div><span>Tổng (phút)</span><strong id="estimateMin">0 phút</strong></div>
+              <div><span>Quãng đường</span><strong id="estimateKm">0 km</strong></div>
+              <div><span>Vận tốc</span><strong id="estimateSpeed">16 km/h</strong></div>
+              <div><span>Tổng phút</span><strong id="estimateMin">0 phút</strong></div>
             </div>
-            <p class="meta estimate-note" id="estimateFormula">phút gửi BE = chạy thuần + đệm cập bến (admin chỉnh)</p>
 
             <label>
               <span>Mã tuyến (routeCode)</span>
               <input id="captureRouteCode" type="text" placeholder="VD: BD-TT" autocomplete="off">
-              <small id="routeCodeHint" class="field-hint">Mã sẽ được kiểm tra trùng trên hệ thống.</small>
             </label>
             <label>
               <span>Tên tuyến</span>
               <input id="captureRouteName" type="text" placeholder="VD: Bạch Đằng - Thủ Thiêm">
             </label>
 
-            <label class="checkbox-row" for="createReverseRoute">
-              <input id="createReverseRoute" type="checkbox">
-              <span>Tạo thêm chiều về (createReverseRoute)</span>
-            </label>
-            <div class="reverse-fields" id="reverseFields" hidden>
-              <label>
-                <span>Mã chiều về (reverseRouteCode)</span>
-                <input id="reverseRouteCode" type="text" placeholder="VD: TT-BD" autocomplete="off">
-                <small id="reverseRouteCodeHint" class="field-hint">Khác mã tuyến chính; không trùng DB; không dùng cho vòng tham quan.</small>
-              </label>
-              <label>
-                <span>Tên chiều về (reverseRouteName)</span>
-                <input id="reverseRouteName" type="text" placeholder="VD: Thủ Thiêm - Bạch Đằng">
-              </label>
-            </div>
-
             <label>
               <span>Tàu GPS (boatCode)</span>
               <select id="collectorBoatCode">
                 <option value="">Chọn tàu...</option>
               </select>
-              <small id="boatSpeedHint" class="field-hint">Chọn tàu đã đăng ký rồi mới ghi GPS. Đổi tàu = đổi bản vẽ GPS của tàu đó (không chung một route).</small>
             </label>
             <div class="field-row">
               <label>
@@ -268,14 +242,9 @@
               </label>
               <label>
                 <span>Tốc độ chạy (km/h)</span>
-                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16" title="Tốc độ giữa sông; ≤ max đăng ký">
+                <input id="collectorSpeed" type="number" min="1" max="80" step="0.1" value="16">
               </label>
             </div>
-            <label>
-              <span>Đệm cập bến / tăng giảm tốc (phút mỗi chặng)</span>
-              <input id="berthBufferMin" type="number" min="0" max="60" step="0.5" value="0" title="Admin chỉnh. Cộng vào phút chạy thuần trước khi gửi BE/Charter">
-              <small class="field-hint">VD TT↔BD ~1,4p chạy + 4p đệm ≈ 5,4p. Để 0 nếu BE tự cộng đệm.</small>
-            </label>
           </div>
 
           <div class="recording-actions">
@@ -284,8 +253,7 @@
             <button id="stopCollector" class="secondary" type="button" disabled>Kết thúc &amp; lưu</button>
           </div>
 
-          <p id="captureStatus" class="meta">1) Bến đầu · 2) Click bến giữa (nếu cần) · 3) Double-click bến cuối · 4) Xong (nét thẳng) · 5) Ghi GPS.</p>
-          <p id="collectorStatus" class="meta">Chưa ghi GPS.</p>
+          <p id="captureStatus" class="meta">1) Bến đầu · 2) Click bến giữa (nếu cần) · 3) Double-click bến cuối · 4) Xong · 5) Ghi GPS.</p>
           <div class="route-result-card hidden" id="routeResult"></div>
         </section>
 
