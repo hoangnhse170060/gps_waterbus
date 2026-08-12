@@ -707,6 +707,27 @@ const server = createServer(async (req, res) => {
         source: 'azure-admin',
       });
     }
+    // GET /api/gps/active-trips → BE: /api/gps/active-trips
+    if (url.pathname === '/api/gps/active-trips' && req.method === 'GET') {
+      const authed = await ensureAzureAdminToken();
+      if (!authed.ok) {
+        return sendJson(res, { error: authed.error || 'Chưa login admin JWT', trips: [] }, authed.status || 401);
+      }
+      const result = await requestTargetApi({
+        method: 'GET',
+        pathname: '/api/gps/active-trips',
+        auth: 'bearer',
+      });
+      if (!result.ok) {
+        return sendJson(res, {
+          error: result.error || 'Không lấy được active trips',
+          trips: [],
+        }, result.status || 502);
+      }
+      const data = result.data || {};
+      const trips = Array.isArray(data.trips) ? data.trips : [];
+      return sendJson(res, { ok: true, trips, data });
+    }
     {
       const charterMatch = url.pathname.match(
         /^\/api\/charter\/route-draw-requests\/([^/]+)(?:\/(in-progress|complete|cancel|acknowledge))?$/,
@@ -7408,9 +7429,9 @@ async function acknowledgeCharterRouteDrawRequest(requestId) {
     row.acknowledgedAt = new Date().toISOString();
     state.charterDrawRequests.set(id, row);
   }
-  // Thử gọi BE nếu có endpoint (optional - không fail nếu 404).
+  // BE dùng PATCH (không phải POST). Fallback ok nếu 404/405.
   const result = await charterAdminRequest(
-    'POST',
+    'PATCH',
     `/api/charter-bookings/admin/route-draw-requests/${encodeURIComponent(id)}/acknowledge`,
     {},
   );

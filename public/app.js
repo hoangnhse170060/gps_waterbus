@@ -5192,7 +5192,7 @@ charterNextLegBtnEl?.addEventListener('click', async () => {
     const doneCode = activeCharterRequest.bookingCode || doneId;
     // Báo BE ẩn khỏi queue Pending/InProgress (FE khác/reload sẽ không thấy nữa).
     fetch(`/api/charter/route-draw-requests/${encodeURIComponent(doneId)}/acknowledge`, {
-      method: 'POST',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     }).catch(() => {});
