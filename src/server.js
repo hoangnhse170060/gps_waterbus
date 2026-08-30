@@ -79,6 +79,7 @@ const state = {
   openIncidents: new Map(),
   rescueMissions: new Map(),
   tripMissions: new Map(),
+  lastTripsReset: null,
   resolvedIncidentIds: new Map(),
   beBoatStatuses: new Map(), // boatCode|boatId → { status, boatId, boatCode, source, updatedAt }
   signalrStatus: {
@@ -142,12 +143,72 @@ const signalrRelay = createSignalRRelay({
         scheduleIncidentsBroadcast();
       },
     },
+    {
+      names: ['tripsReset', 'TripsReset'],
+      onEvent: (payload, eventName) => {
+        handleTripsResetSignalR(payload, eventName).catch((error) => {
+          console.warn(`[signalr-tracking] ${eventName}: ${error.message}`);
+        });
+      },
+    },
   ],
+  onConnected: (connection) => joinTrackingBoatGroups(connection),
   onStatus: (status) => {
     state.signalrStatus = status;
     broadcast();
   },
 });
+
+async function joinTrackingBoatGroups(connection) {
+  const method = cleanOptionalText(env.SIGNALR_JOIN_BOAT_METHOD) || 'JoinBoat';
+  const boatIds = [...new Set(
+    [...state.boats.values()]
+      .filter((boat) => !String(boat?.boatId || '').startsWith('collector-'))
+      .map((boat) => cleanOptionalText(boat?.boatId))
+      .filter(Boolean),
+  )];
+  let joined = 0;
+  for (const boatId of boatIds) {
+    try {
+      await connection.invoke(method, boatId);
+      joined += 1;
+    } catch (error) {
+      console.warn(`[signalr-tracking] ${method}(${boatId}) failed: ${error?.message || error}`);
+    }
+  }
+  console.log(`[signalr-tracking] ${method}: joined ${joined}/${boatIds.length} boat groups`);
+}
+
+async function handleTripsResetSignalR(payload, eventName = 'tripsReset') {
+  const result = await tripAutorun.handleTripsReset(payload, {
+    source: `signalr:${eventName}`,
+  });
+  state.lastTripsReset = result;
+  broadcast();
+
+  const ackMethod = cleanOptionalText(env.SIGNALR_TRIPS_RESET_ACK_METHOD)
+    || 'AcknowledgeTripsReset';
+  try {
+    await signalrRelay.invoke(ackMethod, {
+      boatId: result.boatId,
+      boatCode: result.boatCode,
+      operatingDate: result.operatingDate,
+      receivedAt: result.receivedAt,
+      ok: result.ok,
+      results: result.results,
+    });
+    result.acknowledged = true;
+    result.ackMethod = ackMethod;
+  } catch (error) {
+    result.acknowledged = false;
+    result.ackMethod = ackMethod;
+    result.ackError = error?.message || String(error);
+    console.warn(`[signalr-tracking] ${ackMethod} failed: ${result.ackError}`);
+  }
+  state.lastTripsReset = { ...result };
+  broadcast();
+  return result;
+}
 
 const incidentsRelay = createSignalRRelay({
   name: 'signalr-incidents',
@@ -636,7 +697,7 @@ const server = createServer(async (req, res) => {
       broadcast();
       return sendJson(res, result, result.created ? 201 : 200);
     }
-    // BE hủy chuyến → GPS dừng mission (không còn chạy path + locations kèm tripId).
+    // BE hủy/reset chuyến → GPS dừng trip hoặc đưa tàu an toàn về bến.
     // POST /api/gps/trips/hook + X-Live-Hook-Secret
     // { "event": "TripCancelled", "tripId": "..." }
     if (url.pathname === '/api/gps/trips/hook' && req.method === 'POST') {
@@ -2497,6 +2558,8 @@ async function publishLiveGpsPosition(body = {}) {
     speedKmh,
   });
   const status = cleanOptionalText(body.status) || (speedKmh > 0.5 ? 'moving' : 'idle');
+  const movementStatus = cleanOptionalText(body.movementStatus) || null;
+  const currentStationCode = cleanOptionalText(body.currentStationCode) || null;
   const tripId = fromTrip
     ? (cleanOptionalText(body.tripId) || null)
     : null;
@@ -2544,6 +2607,8 @@ async function publishLiveGpsPosition(body = {}) {
     gpsFixQuality: 'good',
     direction: 'forward',
     status,
+    ...(movementStatus ? { movementStatus } : {}),
+    ...(currentStationCode ? { currentStationCode } : {}),
     capturedRoute: null,
   };
 
@@ -7464,11 +7529,12 @@ function verifyLiveHookSecret(body = {}, req = null) {
 }
 
 /**
- * BE push hủy / cập nhật trip → GPS.
+ * BE push hủy/reset trip → GPS.
  * POST /api/gps/trips/hook
  * Header: X-Live-Hook-Secret
  *
  * { "event": "TripCancelled", "tripId": "...", "reason": "..." }
+ * { "event": "tripsReset", "removedTrips": [...], "keptActiveTrips": [...] }
  * Alias path: POST /api/gps/trips/{tripId}/cancel
  */
 async function ingestTripHook(body = {}, req = null) {
@@ -7477,6 +7543,13 @@ async function ingestTripHook(body = {}, req = null) {
 
   const event = String(body.event || body.type || body.action || 'TripCancelled').trim();
   const eventLower = event.toLowerCase();
+  if (eventLower === 'tripsreset' || eventLower === 'trips-reset' || eventLower === 'resettrips') {
+    const result = await tripAutorun.handleTripsReset(body.payload || body.data || body, {
+      source: 'hook:tripsReset',
+    });
+    state.lastTripsReset = { ...result, acknowledged: true, ackMethod: 'HTTP 200' };
+    return { ...result, event: event || 'tripsReset', acknowledged: true };
+  }
   const tripId = cleanOptionalText(
     body.tripId || body.id || body.TripId || body.data?.tripId || body.data?.id,
   );
@@ -8479,7 +8552,8 @@ function publicConfig() {
     tripGpsIntervalMs: Number(env.TRIP_GPS_INTERVAL_MS || 1000),
     tripLookaheadMinutes: Number(env.TRIP_LOOKAHEAD_MINUTES || 120),
     activeTripCount: [...state.tripMissions.values()]
-      .filter((m) => !['Completed'].includes(String(m.status || ''))).length,
+      .filter((m) => !['Completed', 'Cancelled', 'ReturnedToBase'].includes(String(m.status || ''))).length,
+    lastTripsReset: state.lastTripsReset,
     // Ưu tiên phút lịch Waterbus khi cặp bến khớp (khớp đời thực).
     preferWaterbusSchedule: parseBool(env.PREFER_WATERBUS_SCHEDULE ?? 'true'),
     waterbusSchedule: waterbusSchedulePublic(),

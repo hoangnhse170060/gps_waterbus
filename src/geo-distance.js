@@ -2,7 +2,9 @@
  * Đo khoảng cách khảo sát thực tế (WGS84) bằng Turf.js.
  * Dọc polyline GPS / đường vẽ — không lấy đường thẳng bến↔bến.
  */
-import * as turf from '@turf/turf';
+import distance from '@turf/distance';
+import { lineString, point } from '@turf/helpers';
+import length from '@turf/length';
 
 function toLatLng(point) {
   if (!point || typeof point !== 'object') return null;
@@ -17,9 +19,9 @@ export function distanceMeters(a, b) {
   const p1 = toLatLng(a);
   const p2 = toLatLng(b);
   if (!p1 || !p2) return 0;
-  return turf.distance(
-    turf.point([p1.lng, p1.lat]),
-    turf.point([p2.lng, p2.lat]),
+  return distance(
+    point([p1.lng, p1.lat]),
+    point([p2.lng, p2.lat]),
     { units: 'meters' },
   );
 }
@@ -36,7 +38,7 @@ export function pathLengthMeters(points) {
     coords.push([p.lng, p.lat]);
   }
   if (coords.length < 2) return 0;
-  return turf.length(turf.lineString(coords), { units: 'meters' });
+  return length(lineString(coords), { units: 'meters' });
 }
 
 export const routeLength = pathLengthMeters;

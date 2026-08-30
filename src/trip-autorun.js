@@ -20,6 +20,7 @@ const ACTIVE_TRIP_STATUSES = new Set([
   'Running',
   'WaitingAtStop',
   'Paused',
+  'ReturnToBase',
 ]);
 
 const HANDOFF_ARRIVE_M = 35;
@@ -122,8 +123,10 @@ export function createTripAutorun(ctx) {
 
   function tripMissionPublic(mission) {
     if (!mission) return null;
+    const returning = mission.status === 'ReturnToBase' || mission.status === 'ReturnedToBase';
     return {
-      tripId: mission.tripId,
+      tripId: returning ? null : mission.tripId,
+      resetTripId: returning ? (mission.resetTripId || mission.tripId) : null,
       tripCode: mission.tripCode || null,
       boatCode: mission.boatCode,
       takenOverFrom: mission.takenOverFrom || null,
@@ -136,8 +139,8 @@ export function createTripAutorun(ctx) {
       cancelReason: mission.cancelReason || null,
       cancelSource: mission.cancelSource || null,
       cancelledAt: mission.cancelledAt || null,
-      departureTime: mission.departureTime,
-      arrivalTime: mission.arrivalTime,
+      departureTime: returning ? null : mission.departureTime,
+      arrivalTime: returning ? null : mission.arrivalTime,
       delayActive: Boolean(mission.delayActive),
       delayInfo: mission.delayInfo || null,
       progressMeters: round1(mission.progressMeters),
@@ -165,6 +168,12 @@ export function createTripAutorun(ctx) {
       waitingStationName: mission.waitingStationName || null,
       waitingStationCode: mission.waitingStationCode || null,
       movementStatus: mission.movementStatus || null,
+      returnStationCode: mission.returnStationCode || null,
+      returnStationName: mission.returnStationName || null,
+      currentStationCode: mission.currentStationCode || null,
+      resetAt: mission.resetAt || null,
+      resetSource: mission.resetSource || null,
+      requiresAdminConfirmation: Boolean(mission.requiresAdminConfirmation),
       lastError: mission.lastError || null,
       completedAt: mission.completedAt || null,
       updatedAt: mission.updatedAt || null,
@@ -2022,8 +2031,299 @@ export function createTripAutorun(ctx) {
     };
   }
 
+  function normalizeStationKey(value) {
+    return String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^st[-_\s]*/, '')
+      .replace(/[^a-z0-9]/g, '');
+  }
+
+  function findReturnStation(row, mission) {
+    const stationId = cleanOptionalText(
+      row?.endStationId || row?.EndStationId || row?.stationId || row?.StationId,
+    );
+    const stationCode = cleanOptionalText(
+      row?.endStationCode || row?.EndStationCode || row?.stationCode || row?.StationCode,
+    );
+    const stationName = cleanOptionalText(row?.endStationName || row?.EndStationName);
+    const keys = new Set([stationId, stationCode, stationName].map(normalizeStationKey).filter(Boolean));
+    const catalog = (state.stations || []).find((station) => (
+      keys.has(normalizeStationKey(station.stationId))
+      || keys.has(normalizeStationKey(station.stationCode || station.code))
+      || keys.has(normalizeStationKey(station.stationName || station.name))
+    ));
+    const lastStop = [...(mission?.stops || [])].reverse().find((stop) => {
+      if (!keys.size) return true;
+      return keys.has(normalizeStationKey(stop.stationId))
+        || keys.has(normalizeStationKey(stop.stationCode))
+        || keys.has(normalizeStationKey(stop.stationName));
+    });
+    const explicit = sanitizeLatLng(
+      row?.endStationLat ?? row?.EndStationLat ?? row?.lat ?? row?.Latitude,
+      row?.endStationLng ?? row?.EndStationLng ?? row?.lng ?? row?.Longitude,
+    );
+    const point = explicit || sanitizeLatLng(
+      catalog?.lat ?? lastStop?.lat,
+      catalog?.lng ?? lastStop?.lng,
+    );
+    if (!point) return null;
+    return {
+      ...point,
+      stationId: stationId || catalog?.stationId || lastStop?.stationId || null,
+      stationCode: stationCode || catalog?.stationCode || lastStop?.stationCode || stationId || null,
+      stationName: stationName || catalog?.stationName || lastStop?.stationName || stationCode || null,
+    };
+  }
+
+  function passengerCountForReset(row, mission) {
+    const values = [
+      row?.onboardPassengerCount,
+      row?.OnboardPassengerCount,
+      row?.passengerCount,
+      row?.PassengerCount,
+      row?.currentPassengerCount,
+      mission?.onboardPassengerCount,
+    ];
+    for (const value of values) {
+      const count = Number(value);
+      if (Number.isFinite(count)) return Math.max(0, count);
+    }
+    return 0;
+  }
+
+  function resetNeedsAdmin(row, mission) {
+    const status = String(
+      row?.status || row?.Status || row?.tripStatus || row?.TripStatus || mission?.status || '',
+    ).trim().toLowerCase();
+    const unsafeStatus = status === 'inprogress'
+      || status === 'running'
+      || status === 'waitingatstop'
+      || status === 'tohandoff'
+      || status === 'paused';
+    const underway = Number(mission?.progressMeters || 0) > 5;
+    const passengers = passengerCountForReset(row, mission);
+    return {
+      blocked: unsafeStatus || underway || passengers > 0,
+      status,
+      underway,
+      passengers,
+    };
+  }
+
+  async function publishReturnPoint(mission, { arrived = false } = {}) {
+    const result = await publishLiveGpsPosition({
+      boatCode: mission.boatCode,
+      lat: mission.currentLat,
+      lng: mission.currentLng,
+      heading: mission.lastHeading,
+      speedKmh: arrived ? 0 : mission.speedKmh,
+      status: arrived ? 'idle' : 'moving',
+      movementStatus: arrived ? 'AtStation' : 'Moving',
+      currentStationCode: arrived ? mission.returnStationCode : null,
+      tripId: null,
+      routeCode: null,
+      sendToTarget: true,
+      fromTrip: false,
+      holdAuthority: true,
+    });
+    mission.lastError = result.ok || result.skipped || result.soft
+      ? null
+      : (result.error || result.warning || 'return publish failed');
+    return result;
+  }
+
+  async function startReturnToBase(row, { source = 'signalr:tripsReset' } = {}) {
+    const tripId = cleanOptionalText(row?.tripId || row?.TripId || row?.id);
+    const boatCode = cleanOptionalText(row?.boatCode || row?.BoatCode);
+    let mission = tripId ? state.tripMissions.get(tripId) : null;
+    if (!mission && boatCode) {
+      mission = [...state.tripMissions.values()].find((item) => (
+        ACTIVE_TRIP_STATUSES.has(String(item.status || ''))
+        && String(item.boatCode || '').trim() === boatCode
+      ));
+    }
+    if (!mission) {
+      return { ok: true, skipped: true, tripId, boatCode, reason: 'không có trip đang chạy trên GPS' };
+    }
+    if (mission.status === 'ReturnToBase' || mission.status === 'ReturnedToBase') {
+      return {
+        ok: true,
+        skipped: true,
+        tripId: mission.resetTripId || mission.tripId,
+        boatCode: mission.boatCode,
+        status: mission.status,
+        reason: 'đã nhận reset trước đó',
+      };
+    }
+
+    const safety = resetNeedsAdmin(row, mission);
+    if (safety.blocked) {
+      mission.requiresAdminConfirmation = true;
+      mission.resetRequestedAt = new Date().toISOString();
+      mission.resetSource = source;
+      console.warn(
+        `[trip-gps] RESET BLOCKED ${mission.boatCode} trip=${mission.tripId}`
+          + ` status=${safety.status || '?'} progress=${Math.round(Number(mission.progressMeters) || 0)}m`
+          + ` passengers=${safety.passengers}`,
+      );
+      return {
+        ok: true,
+        skipped: true,
+        requiresAdminConfirmation: true,
+        tripId: mission.tripId,
+        boatCode: mission.boatCode,
+        reason: safety.passengers > 0 ? 'tàu đang có hành khách' : 'trip đang InProgress',
+      };
+    }
+
+    const station = findReturnStation(row, mission);
+    if (!station) {
+      return {
+        ok: false,
+        tripId: mission.tripId,
+        boatCode: mission.boatCode,
+        error: `Không tìm thấy tọa độ bến ${row?.endStationCode || row?.EndStationCode || '(unknown)'}`,
+      };
+    }
+
+    const from = sanitizeLatLng(mission.currentLat, mission.currentLng);
+    if (!from) {
+      return { ok: false, tripId: mission.tripId, boatCode: mission.boatCode, error: 'GPS chưa có vị trí tàu' };
+    }
+    const base = resolveRiverBasePath({
+      stations: state.stations || [],
+      routes: [...state.routes.values()],
+      osmCorridor: state.osmWaterbusCorridor || [],
+    });
+    const built = buildRiverPath(from, station, base, { joinMeters: 90 });
+    if (!Array.isArray(built.coordinates) || built.coordinates.length < 2) {
+      return { ok: false, tripId: mission.tripId, boatCode: mission.boatCode, error: 'Không dựng được đường về bến' };
+    }
+    const returnPath = [...built.coordinates];
+    const pathEnd = returnPath[returnPath.length - 1];
+    if (distanceMetersFn(pathEnd, station) > 3) returnPath.push({ lat: station.lat, lng: station.lng });
+
+    mission.resetTripId = mission.tripId;
+    mission.resetAt = new Date().toISOString();
+    mission.resetSource = source;
+    mission.status = 'ReturnToBase';
+    mission.movementStatus = 'Moving';
+    mission.speedKmh = clampSpeedToBoatMax(
+      Number(env.RETURN_TO_BASE_SPEED_KMH || env.DEFAULT_SPEED_KMH || 16),
+      mission.maxSpeedKmh,
+    );
+    mission.requiredSpeedKmh = mission.speedKmh;
+    mission.returnStationId = station.stationId;
+    mission.returnStationCode = station.stationCode;
+    mission.returnStationName = station.stationName;
+    mission.returnLat = station.lat;
+    mission.returnLng = station.lng;
+    mission.returnPath = returnPath;
+    mission.returnProgressMeters = 0;
+    mission.lengthMeters = routeLengthFn(returnPath);
+    mission.progressMeters = 0;
+    mission.routeCode = null;
+    mission.nextStationId = null;
+    mission.nextStopCode = null;
+    mission.nextStopName = null;
+    mission.nextStopDistanceKm = null;
+    mission.nextStopEtaMin = null;
+    mission.remainingDistanceKm = null;
+    mission.remainingEtaMin = null;
+    mission.waitingUntil = null;
+    mission.waitingStationName = null;
+    mission.waitingStationCode = null;
+    mission.lastTickAt = Date.now();
+    mission.updatedAt = mission.resetAt;
+    mission.requiresAdminConfirmation = false;
+
+    await publishReturnPoint(mission);
+    console.log(
+      `[trip-gps] RETURN TO BASE ${mission.boatCode} trip=${mission.resetTripId}`
+        + ` → ${mission.returnStationCode || mission.returnStationName || '?'}`,
+    );
+    return {
+      ok: true,
+      tripId: mission.resetTripId,
+      boatCode: mission.boatCode,
+      status: mission.status,
+      endStationCode: mission.returnStationCode,
+    };
+  }
+
+  async function handleTripsReset(payload = {}, { source = 'signalr:tripsReset' } = {}) {
+    const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+    const removed = data?.removedTrips || data?.RemovedTrips || [];
+    const kept = data?.keptActiveTrips || data?.KeptActiveTrips || [];
+    const keptIds = new Set(kept.map((row) => cleanOptionalText(row?.tripId || row?.TripId || row?.id)).filter(Boolean));
+    const results = [];
+    for (const item of Array.isArray(removed) ? removed : []) {
+      const tripId = cleanOptionalText(item?.tripId || item?.TripId || item?.id);
+      if (tripId && keptIds.has(tripId)) {
+        results.push({ ok: true, skipped: true, tripId, reason: 'trip nằm trong keptActiveTrips' });
+        continue;
+      }
+      results.push(await startReturnToBase({
+        ...(item && typeof item === 'object' ? item : {}),
+        boatCode: item?.boatCode || item?.BoatCode || data?.boatCode || data?.BoatCode,
+      }, { source }));
+    }
+    return {
+      ok: results.every((item) => item.ok !== false),
+      boatId: cleanOptionalText(data?.boatId || data?.BoatId),
+      boatCode: cleanOptionalText(data?.boatCode || data?.BoatCode),
+      operatingDate: cleanOptionalText(data?.operatingDate || data?.OperatingDate),
+      receivedAt: new Date().toISOString(),
+      results,
+    };
+  }
+
+  async function tickReturnToBase(mission, nowMs) {
+    const target = sanitizeLatLng(mission.returnLat, mission.returnLng);
+    const from = sanitizeLatLng(mission.currentLat, mission.currentLng);
+    if (!target || !from) {
+      mission.lastError = 'Thiếu vị trí hoặc bến quay về';
+      return;
+    }
+    const dist = distanceMetersFn(from, target);
+    if (dist <= TO_DEPARTURE_ARRIVE_M) {
+      mission.currentLat = target.lat;
+      mission.currentLng = target.lng;
+      mission.speedKmh = 0;
+      mission.status = 'ReturnedToBase';
+      mission.movementStatus = 'AtStation';
+      mission.currentStationCode = mission.returnStationCode;
+      mission.completedAt = new Date().toISOString();
+      mission.updatedAt = mission.completedAt;
+      await publishReturnPoint(mission, { arrived: true });
+      console.log(`[trip-gps] AT BASE ${mission.boatCode} → ${mission.currentStationCode || '?'}`);
+      return;
+    }
+
+    const path = mission.returnPath || [];
+    const elapsedSeconds = mission.lastTickAt
+      ? Math.max(0.2, Math.min(5, (nowMs - mission.lastTickAt) / 1000))
+      : 1;
+    const stepMeters = Math.max(0.5, (mission.speedKmh * 1000 / 3600) * elapsedSeconds);
+    const adv = advanceAlongCoordinates(path, mission.returnProgressMeters || 0, stepMeters);
+    mission.returnProgressMeters = adv.progressMeters;
+    mission.currentLat = adv.lat;
+    mission.currentLng = adv.lng;
+    if (Number.isFinite(Number(adv.heading))) mission.lastHeading = Number(adv.heading);
+    mission.movementStatus = 'Moving';
+    mission.lastTickAt = nowMs;
+    mission.updatedAt = new Date().toISOString();
+    await publishReturnPoint(mission);
+  }
+
   async function tickOneMission(mission, nowMs) {
-    if (!mission || mission.status === 'Completed' || mission.status === 'Cancelled') return;
+    if (!mission || ['Completed', 'Cancelled', 'ReturnedToBase'].includes(mission.status)) return;
+
+    if (mission.status === 'ReturnToBase') {
+      await tickReturnToBase(mission, nowMs);
+      return;
+    }
 
     // Path cũ đâm V vào cầu tàu → ép lại đúng vạch sông.
     ensureMissionCorridorPath(mission);
@@ -2320,7 +2620,7 @@ export function createTripAutorun(ctx) {
       const nowMs = Date.now();
       const list = [...state.tripMissions.values()];
       for (const mission of list) {
-        if (mission.status === 'Completed' || mission.status === 'Cancelled') continue;
+        if (['Completed', 'Cancelled', 'ReturnedToBase'].includes(mission.status)) continue;
         try {
           await tickOneMission(mission, nowMs);
         } catch (error) {
@@ -2337,7 +2637,7 @@ export function createTripAutorun(ctx) {
     const now = Date.now();
     for (const [id, mission] of state.tripMissions) {
       const st = String(mission.status);
-      if (st !== 'Completed' && st !== 'Cancelled') continue;
+      if (st !== 'Completed' && st !== 'Cancelled' && st !== 'ReturnedToBase') continue;
       const at = parseTimeMs(mission.completedAt)
         || parseTimeMs(mission.cancelledAt)
         || parseTimeMs(mission.updatedAt);
@@ -2356,6 +2656,7 @@ export function createTripAutorun(ctx) {
     tripMissionsPublic,
     startTripMission,
     cancelTripMission,
+    handleTripsReset,
     takeoverTripForReplacement,
     findActiveTripMission,
   };

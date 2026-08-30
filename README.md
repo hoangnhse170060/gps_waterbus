@@ -73,6 +73,22 @@ Health check: `https://YOUR-APP.up.railway.app/api/health`
 - `POST /api/tracking/sessions/start`
 - `POST /api/routes/from-gps`
 
+### Reset trip / đưa tàu về bến
+
+GPS relay kết nối `/hubs/tracking`, gọi `JoinBoat(boatId)` cho từng tàu và nghe event
+`tripsReset`. Mỗi phần tử trong `removedTrips` được gỡ khỏi trip hiện tại rồi điều hướng
+về `endStationCode` theo hành lang sông. Trong lúc quay về GPS gửi `tripId=null`,
+`movementStatus=Moving`; khi đến bến gửi `movementStatus=AtStation` và
+`currentStationCode`.
+
+Trip đang `InProgress`/đã rời bến hoặc payload báo còn hành khách sẽ không tự quay về;
+kết quả ACK trả `requiresAdminConfirmation=true`. `keptActiveTrips` luôn được giữ nguyên.
+
+Mặc định GPS ACK qua hub method `AcknowledgeTripsReset`. Có thể đổi tên method bằng
+`SIGNALR_TRIPS_RESET_ACK_METHOD`; method join group đổi bằng `SIGNALR_JOIN_BOAT_METHOD`.
+BE cũng có thể fallback push cùng payload qua `POST /api/gps/trips/hook` với
+`event="tripsReset"` và header `X-Live-Hook-Secret`.
+
 ## Bảo mật
 
 - Không commit `.env`

@@ -9,6 +9,7 @@ import * as signalR from '@microsoft/signalr';
  *   getHubUrl: () => string,
  *   getAccessToken?: () => string | null | undefined,
  *   events?: Array<{ names: string[], onEvent: (payload: unknown, eventName: string) => void }>,
+ *   onConnected?: (connection: import('@microsoft/signalr').HubConnection) => void | Promise<void>,
  *   onStatus?: (status: object) => void,
  * }} options
  */
@@ -17,6 +18,7 @@ export function createSignalRRelay({
   getHubUrl,
   getAccessToken,
   events = [],
+  onConnected,
   onStatus,
 }) {
   let connection = null;
@@ -39,6 +41,15 @@ export function createSignalRRelay({
     setTimeout(() => {
       start().catch(() => {});
     }, 5000);
+  }
+
+  async function notifyConnected() {
+    if (!connection || typeof onConnected !== 'function') return;
+    try {
+      await onConnected(connection);
+    } catch (error) {
+      console.warn(`[${name}] connected hook failed: ${error?.message || error}`);
+    }
   }
 
   async function start() {
@@ -92,6 +103,7 @@ export function createSignalRRelay({
         status.lastError = null;
         emitStatus();
         console.log(`[${name}] reconnected ${hubUrl}`);
+        notifyConnected().catch(() => {});
       });
       connection.onclose((error) => {
         status.connected = false;
@@ -107,6 +119,7 @@ export function createSignalRRelay({
       status.transport = connection.connection?.transport?.name || null;
       emitStatus();
       console.log(`[${name}] connected ${hubUrl}`);
+      await notifyConnected();
     } catch (error) {
       status.connected = false;
       status.lastError = error?.message || String(error);
@@ -130,5 +143,12 @@ export function createSignalRRelay({
     return conn?.stop?.().catch(() => {});
   }
 
-  return { start, stop, getStatus };
+  async function invoke(methodName, ...args) {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+      throw new Error(`${name} chưa kết nối`);
+    }
+    return connection.invoke(methodName, ...args);
+  }
+
+  return { start, stop, getStatus, invoke };
 }
