@@ -1,0 +1,64 @@
+spec:
+  name: waterbus-gps-live
+  region: sgp
+  alerts:
+    - rule: DEPLOYMENT_FAILED
+    - rule: DOMAIN_FAILED
+  ingress:
+    rules:
+      - component:
+          name: web
+        match:
+          path:
+            prefix: /
+  services:
+    - name: web
+      environment_slug: node-js
+      github:
+        branch: main
+        deploy_on_push: true
+        repo: hoangnhse170060/gps_waterbus
+      source_dir: /
+      build_command: npm ci
+      run_command: npm start
+      http_port: 8080
+      instance_count: 1
+      instance_size_slug: apps-s-1vcpu-0.5gb
+      health_check:
+        http_path: /api/health
+        initial_delay_seconds: 15
+        period_seconds: 10
+        timeout_seconds: 5
+        failure_threshold: 6
+      envs:
+        - key: NODE_ENV
+          value: production
+          scope: RUN_TIME
+        - key: LIVE_AZURE_WRITE
+          value: "true"
+          scope: RUN_TIME
+        - key: SEND_TO_TARGET
+          value: "true"
+          scope: RUN_TIME
+        - key: TRIP_AUTORUN
+          value: "true"
+          scope: RUN_TIME
+        - key: SIGNALR_BROWSER_CONNECT
+          value: "false"
+          scope: RUN_TIME
+        - key: DATABASE_URL
+          scope: RUN_TIME
+          type: SECRET
+        - key: TARGET_GPS_ENDPOINT
+          scope: RUN_TIME
+        - key: TARGET_GPS_API_KEY
+          scope: RUN_TIME
+          type: SECRET
+        - key: LIVE_HOOK_SECRET
+          scope: RUN_TIME
+          type: SECRET
+        - key: AZURE_ADMIN_EMAIL
+          scope: RUN_TIME
+        - key: AZURE_ADMIN_PASSWORD
+          scope: RUN_TIME
+          type: SECRET

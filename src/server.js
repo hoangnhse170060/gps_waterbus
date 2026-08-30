@@ -55,6 +55,10 @@ const osmWaterbusCorridor = await loadOsmWaterbusCorridor();
 console.log('[startup] osm corridor loaded:', osmWaterbusCorridor.length, 'pts');
 
 const clients = new Set();
+const SSE_BROADCAST_MIN_INTERVAL_MS = 200;
+const SSE_BACKPRESSURE_TIMEOUT_MS = 15_000;
+let broadcastTimer = null;
+let broadcastPending = false;
 const state = {
   boats: new Map(),
   routes: new Map(),
@@ -451,7 +455,7 @@ select jsonb_build_object(
     route_id::text
       || ':' || coalesce(route_code, '')
       || ':' || coalesce(status, '')
-      || ':' || coalesce(ST_NPoints(route_geometry)::text, '0')
+      || ':' || coalesce(ST_NPoints(route_geometry::geometry)::text, '0')
       || ':' || coalesce(round(ST_Length(route_geometry::geography))::text, '0'),
     '|' order by route_id
   )), '')
@@ -462,6 +466,7 @@ where route_geometry is not null;
 
 /** Cache GeoJSON routes giữa các lần refreshFromDatabase. */
 let cachedRoutesFingerprint = '';
+let refreshFromDatabaseBusy = false;
 
 const routeStopsSql = `
 select coalesce(jsonb_agg(jsonb_build_object(
@@ -2002,6 +2007,8 @@ async function loadRoutesGeojsonIfChanged({ force = false } = {}) {
 }
 
 async function refreshFromDatabase() {
+  if (refreshFromDatabaseBusy) return;
+  refreshFromDatabaseBusy = true;
   try {
     let [boats, routeLoad, stations, routeStops, gpsDevices] = await Promise.all([
       queryJson(boatsSql),
@@ -2160,11 +2167,11 @@ async function refreshFromDatabase() {
       ensureFallbackData();
       state.dbStatus = {
         ok: true,
-        message: `Loaded ${boats.length} boat(s), ${routes.length} route(s); using demo fallback`,
+        message: `Loaded ${boats.length} boat(s), ${state.routes.size} route(s); using demo fallback`,
         loadedAt: new Date().toISOString(),
       };
     } else {
-      state.dbStatus = { ok: true, message: `Loaded ${boats.length} boat(s), ${routes.length} route(s)`, loadedAt: new Date().toISOString() };
+      state.dbStatus = { ok: true, message: `Loaded ${boats.length} boat(s), ${state.routes.size} route(s)`, loadedAt: new Date().toISOString() };
     }
     // Neon là nguồn truth; bỏ cache Bảo trì/sự cố hook khi DB đã Active.
     reapplyBeBoatStatusesToCatalog();
@@ -2175,6 +2182,8 @@ async function refreshFromDatabase() {
     ensureFallbackData();
     restoreLastPositionsToHub();
     broadcast();
+  } finally {
+    refreshFromDatabaseBusy = false;
   }
 }
 
@@ -2241,6 +2250,63 @@ function publishCollectorToHub() {
     forceAccept: true,
     source: 'survey',
   });
+}
+
+const TARGET_GPS_PAYLOAD_MODE = Object.freeze({
+  FULL: 'full',
+  WITHOUT_TRIP: 'without-trip',
+  POSITION_ONLY: 'position-only',
+});
+let targetGpsPayloadCompatibility = {
+  endpoint: '',
+  mode: TARGET_GPS_PAYLOAD_MODE.FULL,
+  recheckAt: 0,
+};
+
+function stripTripGpsFields(payload, mode) {
+  if (mode === TARGET_GPS_PAYLOAD_MODE.FULL) return payload;
+  const stripped = {
+    ...payload,
+    tripId: null,
+    routeCode: null,
+    routeId: null,
+  };
+  if (mode === TARGET_GPS_PAYLOAD_MODE.POSITION_ONLY) {
+    stripped.nextStationId = null;
+    stripped.nextStationName = null;
+    stripped.remainingDistanceKmToNextStation = null;
+    stripped.remainingMinutesToNextStation = null;
+  }
+  return stripped;
+}
+
+function applyTargetGpsPayloadCompatibility(payload, fromTrip) {
+  if (!fromTrip) return payload;
+  const endpoint = getTargetEndpoint();
+  if (
+    targetGpsPayloadCompatibility.endpoint !== endpoint
+    || Date.now() >= targetGpsPayloadCompatibility.recheckAt
+  ) {
+    targetGpsPayloadCompatibility = {
+      endpoint,
+      mode: TARGET_GPS_PAYLOAD_MODE.FULL,
+      recheckAt: 0,
+    };
+    return payload;
+  }
+  return stripTripGpsFields(payload, targetGpsPayloadCompatibility.mode);
+}
+
+function rememberTargetGpsPayloadCompatibility(mode) {
+  const configuredRecheckMs = Number(env.TARGET_GPS_PAYLOAD_RECHECK_MS || 600_000);
+  const recheckMs = Number.isFinite(configuredRecheckMs)
+    ? Math.max(60_000, configuredRecheckMs)
+    : 600_000;
+  targetGpsPayloadCompatibility = {
+    endpoint: getTargetEndpoint(),
+    mode,
+    recheckAt: Date.now() + recheckMs,
+  };
 }
 
 async function publishGpsPositions() {
@@ -2664,7 +2730,8 @@ async function publishLiveGpsPosition(body = {}) {
   }
 
   try {
-    const azurePayload = sanitizeGpsPayloadForAzure(payload, { keepTrip: fromTrip });
+    const fullAzurePayload = sanitizeGpsPayloadForAzure(payload, { keepTrip: fromTrip });
+    const azurePayload = applyTargetGpsPayloadCompatibility(fullAzurePayload, fromTrip);
     const response = await fetch(getTargetEndpoint(), {
       method: 'POST',
       headers: buildGpsHeaders(azurePayload),
@@ -2731,27 +2798,18 @@ async function publishLiveGpsPosition(body = {}) {
       const retryBodies = [];
       if (azurePayload.tripId || azurePayload.routeCode) {
         retryBodies.push({
-          ...azurePayload,
-          tripId: null,
-          routeCode: null,
-          routeId: null,
+          body: stripTripGpsFields(azurePayload, TARGET_GPS_PAYLOAD_MODE.WITHOUT_TRIP),
           label: 'ETA không tripId',
+          mode: TARGET_GPS_PAYLOAD_MODE.WITHOUT_TRIP,
         });
       }
       retryBodies.push({
-        ...azurePayload,
-        nextStationId: null,
-        nextStationName: null,
-        remainingDistanceKmToNextStation: null,
-        remainingMinutesToNextStation: null,
-        tripId: null,
-        routeCode: null,
-        routeId: null,
+        body: stripTripGpsFields(azurePayload, TARGET_GPS_PAYLOAD_MODE.POSITION_ONLY),
         label: 'chỉ vị trí',
+        mode: TARGET_GPS_PAYLOAD_MODE.POSITION_ONLY,
       });
-      for (const stripped of retryBodies) {
-        const label = stripped.label;
-        delete stripped.label;
+      for (const retry of retryBodies) {
+        const { body: stripped, label, mode } = retry;
         try {
           const retryRes = await fetch(getTargetEndpoint(), {
             method: 'POST',
@@ -2764,6 +2822,7 @@ async function publishLiveGpsPosition(body = {}) {
             try { retryData = JSON.parse(retryText); } catch { retryData = { message: retryText }; }
           }
           if (retryRes.status >= 200 && retryRes.status < 300) {
+            rememberTargetGpsPayloadCompatibility(mode);
             pushApiCallLog({
               method: 'POST',
               url: getTargetEndpoint(),
@@ -8569,7 +8628,55 @@ function maskEndpoint(endpoint) {
   }
 }
 
-function broadcast() {
+function removeSseClient(client) {
+  if (!client || client.closed) return;
+  client.closed = true;
+  client.pending = null;
+  clients.delete(client);
+  if (client.onDrain) {
+    client.res.off('drain', client.onDrain);
+    client.onDrain = null;
+  }
+  if (client.drainTimer) {
+    clearTimeout(client.drainTimer);
+    client.drainTimer = null;
+  }
+}
+
+function writeSseClient(client, data, { queueWhenBlocked = true } = {}) {
+  if (!client || client.closed) return;
+  if (client.draining) {
+    if (queueWhenBlocked) client.pending = data;
+    return;
+  }
+  try {
+    if (client.res.write(data)) return;
+    client.draining = true;
+    client.onDrain = () => {
+      client.onDrain = null;
+      if (client.drainTimer) {
+        clearTimeout(client.drainTimer);
+        client.drainTimer = null;
+      }
+      client.draining = false;
+      const pending = client.pending;
+      client.pending = null;
+      if (pending) writeSseClient(client, pending);
+    };
+    client.res.once('drain', client.onDrain);
+    client.drainTimer = setTimeout(() => {
+      removeSseClient(client);
+      try { client.res.destroy(); } catch { /* ignore */ }
+    }, SSE_BACKPRESSURE_TIMEOUT_MS);
+    if (typeof client.drainTimer.unref === 'function') client.drainTimer.unref();
+  } catch {
+    removeSseClient(client);
+    try { client.res.destroy(); } catch { /* ignore */ }
+  }
+}
+
+function emitBroadcast() {
+  if (!clients.size) return;
   let data;
   try {
     data = `data: ${JSON.stringify(snapshot())}\n\n`;
@@ -8578,13 +8685,25 @@ function broadcast() {
     return;
   }
   for (const client of [...clients]) {
-    try {
-      client.write(data);
-    } catch {
-      clients.delete(client);
-      try { client.end(); } catch { /* ignore */ }
-    }
+    writeSseClient(client, data);
   }
+}
+
+function broadcast() {
+  // GPS/SignalR có thể gọi dồn dập. Giới hạn tần suất stringify snapshot lớn,
+  // đồng thời chỉ giữ snapshot mới nhất cho từng SSE client đang backpressure.
+  if (!clients.size) return;
+  if (broadcastTimer) {
+    broadcastPending = true;
+    return;
+  }
+  emitBroadcast();
+  broadcastTimer = setTimeout(() => {
+    broadcastTimer = null;
+    if (!broadcastPending) return;
+    broadcastPending = false;
+    broadcast();
+  }, SSE_BROADCAST_MIN_INTERVAL_MS);
 }
 
 function handleEvents(req, res) {
@@ -8598,24 +8717,27 @@ function handleEvents(req, res) {
     try { res.flushHeaders(); } catch { /* ignore */ }
   }
   res.write(': connected\n\n');
-  clients.add(res);
+  const client = {
+    res,
+    draining: false,
+    pending: null,
+    onDrain: null,
+    drainTimer: null,
+    closed: false,
+  };
+  clients.add(client);
   try {
-  res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
+    writeSseClient(client, `data: ${JSON.stringify(snapshot())}\n\n`);
   } catch (error) {
     console.error(`[events] initial snapshot failed: ${error.message}`);
   }
   // Railway/proxy cắt SSE nếu lâu không có data — ping thường xuyên.
   const heartbeat = setInterval(() => {
-    try {
-      res.write(`: ping ${Date.now()}\n\n`);
-    } catch {
-      clearInterval(heartbeat);
-      clients.delete(res);
-    }
+    writeSseClient(client, `: ping ${Date.now()}\n\n`, { queueWhenBlocked: false });
   }, 10000);
   const onClose = () => {
     clearInterval(heartbeat);
-    clients.delete(res);
+    removeSseClient(client);
   };
   res.on('close', onClose);
   res.on('error', onClose);

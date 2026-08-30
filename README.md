@@ -36,9 +36,37 @@ App cần:
 - `setInterval` mô phỏng GPS liên tục
 
 **Vercel serverless** không phù hợp (timeout, không giữ process).  
-Deploy chuẩn: **Railway** hoặc **Render** (connect GitHub giống Vercel).
+Deploy production khuyến nghị: **DigitalOcean App Platform**; Railway chỉ giữ làm cấu hình cũ.
 
-## Deploy Railway (khuyến nghị)
+## Deploy DigitalOcean App Platform (khuyến nghị)
+
+[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/hoangnhse170060/gps_waterbus/tree/main)
+
+App này cần process Node chạy liên tục cho SSE, SignalR và các timer GPS, nên không phù hợp
+với Vercel Functions. Cấu hình [`.do/deploy.template.yaml`](.do/deploy.template.yaml) dùng:
+
+- Region Singapore (`sgp`)
+- 1 shared vCPU, 512 MB RAM, khoảng **$5/tháng**
+- Một instance luôn chạy, không sleep
+- Auto HTTPS và health check `GET /api/health`
+- Auto deploy mỗi khi push nhánh `main`
+
+Khi bấm nút deploy, nhập các biến từ `.env` hiện tại. Tối thiểu cần:
+
+| Biến | Giá trị |
+|------|---------|
+| `DATABASE_URL` | Connection string Neon hiện tại |
+| `TARGET_GPS_ENDPOINT` | URL Azure `/api/tracking/locations` |
+| `TARGET_GPS_API_KEY` | API key của GPS device, nếu BE yêu cầu |
+| `LIVE_HOOK_SECRET` | Phải giống secret trên Azure BE |
+| `AZURE_ADMIN_EMAIL` | Tài khoản admin dùng lấy JWT |
+| `AZURE_ADMIN_PASSWORD` | Mật khẩu admin dùng lấy JWT |
+
+Giữ `instance_count=1`: state điều khiển GPS đang nằm trong memory, chạy nhiều instance sẽ
+có thể tick cùng một tàu hai lần. Sau khi deploy, lấy domain `*.ondigitalocean.app` và cấu
+hình BE gửi webhook trip/incident về domain mới.
+
+## Deploy Railway (demo/legacy)
 
 1. Vào [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
 2. Chọn repo `hoangnhse170060/gps_waterbus`
