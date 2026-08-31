@@ -104,10 +104,11 @@ Health check: `https://YOUR-APP.up.railway.app/api/health`
 ### Reset trip / đưa tàu về bến
 
 GPS relay kết nối `/hubs/tracking`, gọi `JoinBoat(boatId)` cho từng tàu và nghe event
-`tripsReset`. Mỗi phần tử trong `removedTrips` được gỡ khỏi trip hiện tại rồi điều hướng
-về `endStationCode` theo hành lang sông. Trong lúc quay về GPS gửi `tripId=null`,
-`movementStatus=Moving`; khi đến bến gửi `movementStatus=AtStation` và
-`currentStationCode`.
+`tripsReset`. Mỗi phần tử trong `removedTrips` được gỡ khỏi trip hiện tại. Nếu payload có
+`AddedTrips`, GPS đặt tàu ngay tại điểm hành lang sông gần bến xuất phát của chuyến mới gần
+nhất theo thời gian, gửi `tripId=null`, `movementStatus=AtStation` và `currentStationCode`.
+Nếu không có chuyến mới hợp lệ, GPS dừng route cũ và đặt tàu ngay tại điểm hành lang sông
+gần bến gần nhất, không tiếp tục chạy route đã bị xóa.
 
 Trip đang `InProgress`/đã rời bến hoặc payload báo còn hành khách sẽ không tự quay về;
 kết quả ACK trả `requiresAdminConfirmation=true`. `keptActiveTrips` luôn được giữ nguyên.

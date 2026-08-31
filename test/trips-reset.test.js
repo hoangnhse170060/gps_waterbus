@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { routeLength } from '../src/geo-distance.js';
-import { pointAtDistance, projectOnPath } from '../src/river-corridor.js';
+import { distanceMeters, routeLength } from '../src/geo-distance.js';
+import { pointAtDistance } from '../src/river-corridor.js';
 import { createTripAutorun } from '../src/trip-autorun.js';
 
 function cleanOptionalText(value) {
@@ -70,7 +70,7 @@ function createFixture({ status = 'Boarding', progressMeters = 0 } = {}) {
   return { autorun, mission, published, state };
 }
 
-test('tripsReset returns a safe removed trip to its end station without tripId', async () => {
+test('tripsReset snaps a boat without a new trip to its nearest station', async () => {
   const { autorun, mission, published } = createFixture();
   const result = await autorun.handleTripsReset({
     boatCode: 'WB_01',
@@ -80,23 +80,17 @@ test('tripsReset returns a safe removed trip to its end station without tripId',
   });
 
   assert.equal(result.ok, true);
-  assert.equal(mission.status, 'ReturnToBase');
-  assert.equal(mission.returnStationCode, 'BD');
-  assert.equal(published[0].tripId, null);
-  assert.equal(published[0].movementStatus, 'Moving');
-  assert.equal(autorun.tripMissionsPublic()[0].tripId, null);
-
-  mission.currentLat = mission.returnLat;
-  mission.currentLng = mission.returnLng;
-  await autorun.tickTripMissions();
-
   assert.equal(mission.status, 'ReturnedToBase');
-  assert.equal(mission.movementStatus, 'AtStation');
+  assert.equal(mission.returnStationCode, 'ST-TT');
+  assert.equal(mission.returnReason, 'NearestAvailableStation');
+  assert.equal(result.results[0].snapped, true);
   assert.equal(published.at(-1).tripId, null);
-  assert.equal(published.at(-1).currentStationCode, 'BD');
+  assert.equal(published.at(-1).movementStatus, 'AtStation');
+  assert.equal(autorun.tripMissionsPublic()[0].tripId, null);
+  assert.equal(published.at(-1).currentStationCode, 'ST-TT');
 });
 
-test('tripsReset defaults to the river corridor instead of the raw station coordinate', async () => {
+test('tripsReset snaps the nearest station position to the river corridor', async () => {
   const { autorun, mission, state } = createFixture();
   state.osmWaterbusCorridor = [
     { lat: 10.7750, lng: 106.7077 },
@@ -109,11 +103,54 @@ test('tripsReset defaults to the river corridor instead of the raw station coord
     removedTrips: [{ tripId: 'trip-1', status: 'Scheduled', endStationCode: 'BD' }],
   });
 
-  const projected = projectOnPath(state.osmWaterbusCorridor, state.stations[0]);
-  assert.ok(projected);
-  assert.ok(Math.abs(mission.returnLat - projected.lat) < 1e-9);
-  assert.ok(Math.abs(mission.returnLng - projected.lng) < 1e-9);
-  assert.notEqual(mission.returnLng, state.stations[0].lng);
+  assert.ok(distanceMeters(
+    { lat: mission.returnLat, lng: mission.returnLng },
+    state.stations[1],
+  ) < 120);
+  assert.equal(mission.returnStationCode, 'ST-TT');
+});
+
+test('tripsReset snaps the boat to the nearest added trip departure station', async () => {
+  const { autorun, mission, state, published } = createFixture();
+  const now = Date.now();
+
+  const result = await autorun.handleTripsReset({
+    boatCode: 'WB_01',
+    removedTrips: [{ tripId: 'trip-1', status: 'Scheduled', endStationCode: 'BD' }],
+    addedTrips: [
+      {
+        tripId: 'trip-later',
+        tripCode: 'TR-LATER',
+        departureTime: new Date(now + 60 * 60_000).toISOString(),
+        startStationCode: 'BD',
+      },
+      {
+        tripId: 'trip-next',
+        tripCode: 'TR-NEXT',
+        departureTime: new Date(now + 15 * 60_000).toISOString(),
+        startStationCode: 'TT',
+      },
+    ],
+  });
+
+  const tt = state.stations.find((station) => station.stationCode === 'ST-TT');
+  assert.equal(mission.returnStationCode, 'TT');
+  assert.equal(mission.relocationTripId, 'trip-next');
+  assert.equal(mission.returnReason, 'NextTripDeparture');
+  assert.equal(mission.status, 'ReturnedToBase');
+  assert.equal(mission.movementStatus, 'AtStation');
+  assert.equal(mission.speedKmh, 0);
+  assert.equal(mission.currentLat, mission.returnLat);
+  assert.equal(mission.currentLng, mission.returnLng);
+  assert.ok(distanceMeters(
+    { lat: mission.returnLat, lng: mission.returnLng },
+    tt,
+  ) < 120);
+  assert.equal(result.results[0].relocationTripId, 'trip-next');
+  assert.equal(result.results[0].snapped, true);
+  assert.equal(published.at(-1).tripId, null);
+  assert.equal(published.at(-1).movementStatus, 'AtStation');
+  assert.equal(published.at(-1).currentStationCode, 'TT');
 });
 
 test('tripsReset requires admin confirmation for an in-progress trip', async () => {

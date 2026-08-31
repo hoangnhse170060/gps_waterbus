@@ -2115,6 +2115,69 @@ export function createTripAutorun(ctx) {
     };
   }
 
+  function nearestAddedTrip(addedTrips, nowMs = Date.now()) {
+    const rows = Array.isArray(addedTrips) ? addedTrips : [];
+    const timed = rows
+      .map((row) => ({
+        row,
+        departureMs: parseTimeMs(row?.departureTime || row?.DepartureTime),
+      }))
+      .filter((item) => Number.isFinite(item.departureMs));
+    if (!timed.length) return rows[0] || null;
+    const future = timed
+      .filter((item) => item.departureMs >= nowMs)
+      .sort((left, right) => left.departureMs - right.departureMs);
+    if (future.length) return future[0].row;
+    timed.sort((left, right) => Math.abs(left.departureMs - nowMs) - Math.abs(right.departureMs - nowMs));
+    return timed[0].row;
+  }
+
+  function findAddedTripStartStation(row) {
+    if (!row || typeof row !== 'object') return null;
+    const stationId = cleanOptionalText(row.startStationId || row.StartStationId);
+    const stationCode = cleanOptionalText(row.startStationCode || row.StartStationCode);
+    const stationName = cleanOptionalText(row.startStationName || row.StartStationName);
+    const keys = new Set([stationId, stationCode, stationName].map(normalizeStationKey).filter(Boolean));
+    const catalog = (state.stations || []).find((station) => (
+      keys.has(normalizeStationKey(station.stationId))
+      || keys.has(normalizeStationKey(station.stationCode || station.code))
+      || keys.has(normalizeStationKey(station.stationName || station.name))
+    ));
+    const explicit = sanitizeLatLng(
+      row.startStationLat ?? row.StartStationLat,
+      row.startStationLng ?? row.StartStationLng,
+    );
+    const point = explicit || sanitizeLatLng(catalog?.lat, catalog?.lng);
+    if (!point) return null;
+    return {
+      ...point,
+      stationId: stationId || catalog?.stationId || null,
+      stationCode: stationCode || catalog?.stationCode || stationId || null,
+      stationName: stationName || catalog?.stationName || stationCode || null,
+    };
+  }
+
+  function findNearestCatalogStation(point) {
+    const origin = sanitizeLatLng(point?.lat, point?.lng);
+    if (!origin) return null;
+    let nearest = null;
+    for (const station of state.stations || []) {
+      const candidate = sanitizeLatLng(station?.lat, station?.lng);
+      if (!candidate) continue;
+      const meters = distanceMetersFn(origin, candidate);
+      if (!nearest || meters < nearest.meters) {
+        nearest = {
+          ...candidate,
+          stationId: cleanOptionalText(station.stationId),
+          stationCode: cleanOptionalText(station.stationCode || station.code),
+          stationName: cleanOptionalText(station.stationName || station.name),
+          meters,
+        };
+      }
+    }
+    return nearest;
+  }
+
   function passengerCountForReset(row, mission) {
     const values = [
       row?.onboardPassengerCount,
@@ -2172,7 +2235,10 @@ export function createTripAutorun(ctx) {
     return result;
   }
 
-  async function startReturnToBase(row, { source = 'signalr:tripsReset' } = {}) {
+  async function startReturnToBase(row, {
+    source = 'signalr:tripsReset',
+    relocationTrip = null,
+  } = {}) {
     const tripId = cleanOptionalText(row?.tripId || row?.TripId || row?.id);
     const boatCode = cleanOptionalText(row?.boatCode || row?.BoatCode);
     let mission = tripId ? state.tripMissions.get(tripId) : null;
@@ -2216,7 +2282,11 @@ export function createTripAutorun(ctx) {
       };
     }
 
-    const station = findReturnStation(row, mission);
+    const nextTripStation = findAddedTripStartStation(relocationTrip);
+    const nearestStation = nextTripStation
+      ? null
+      : findNearestCatalogStation({ lat: mission.currentLat, lng: mission.currentLng });
+    const station = nextTripStation || nearestStation || findReturnStation(row, mission);
     if (!station) {
       return {
         ok: false,
@@ -2267,6 +2337,16 @@ export function createTripAutorun(ctx) {
     mission.returnStationId = station.stationId;
     mission.returnStationCode = station.stationCode;
     mission.returnStationName = station.stationName;
+    mission.relocationTripId = cleanOptionalText(
+      relocationTrip?.tripId || relocationTrip?.TripId || relocationTrip?.id,
+    );
+    mission.relocationTripCode = cleanOptionalText(
+      relocationTrip?.tripCode || relocationTrip?.TripCode,
+    );
+    mission.relocationDepartureTime = cleanOptionalText(
+      relocationTrip?.departureTime || relocationTrip?.DepartureTime,
+    );
+    mission.returnReason = nextTripStation ? 'NextTripDeparture' : 'NearestAvailableStation';
     mission.returnLat = returnTarget.lat;
     mission.returnLng = returnTarget.lng;
     mission.returnPath = returnPath;
@@ -2288,9 +2368,20 @@ export function createTripAutorun(ctx) {
     mission.updatedAt = mission.resetAt;
     mission.requiresAdminConfirmation = false;
 
-    await publishReturnPoint(mission);
+    mission.currentLat = mission.returnLat;
+    mission.currentLng = mission.returnLng;
+    mission.returnProgressMeters = mission.lengthMeters;
+    mission.speedKmh = 0;
+    mission.requiredSpeedKmh = 0;
+    mission.status = 'ReturnedToBase';
+    mission.movementStatus = 'AtStation';
+    mission.currentStationCode = mission.returnStationCode;
+    mission.completedAt = new Date().toISOString();
+    mission.updatedAt = mission.completedAt;
+    await publishReturnPoint(mission, { arrived: true });
     console.log(
-      `[trip-gps] RETURN TO BASE ${mission.boatCode} trip=${mission.resetTripId}`
+      `[trip-gps] ${nextTripStation ? 'SNAP TO NEXT TRIP' : 'SNAP TO NEAREST STATION'} ${mission.boatCode}`
+        + ` trip=${mission.resetTripId}`
         + ` → ${mission.returnStationCode || mission.returnStationName || '?'}`,
     );
     return {
@@ -2299,13 +2390,18 @@ export function createTripAutorun(ctx) {
       boatCode: mission.boatCode,
       status: mission.status,
       endStationCode: mission.returnStationCode,
+      returnReason: mission.returnReason,
+      relocationTripId: mission.relocationTripId,
+      snapped: true,
     };
   }
 
   async function handleTripsReset(payload = {}, { source = 'signalr:tripsReset' } = {}) {
     const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
     const removed = data?.removedTrips || data?.RemovedTrips || [];
+    const added = data?.addedTrips || data?.AddedTrips || [];
     const kept = data?.keptActiveTrips || data?.KeptActiveTrips || [];
+    const relocationTrip = nearestAddedTrip(added);
     const keptIds = new Set(kept.map((row) => cleanOptionalText(row?.tripId || row?.TripId || row?.id)).filter(Boolean));
     const results = [];
     for (const item of Array.isArray(removed) ? removed : []) {
@@ -2317,7 +2413,7 @@ export function createTripAutorun(ctx) {
       results.push(await startReturnToBase({
         ...(item && typeof item === 'object' ? item : {}),
         boatCode: item?.boatCode || item?.BoatCode || data?.boatCode || data?.BoatCode,
-      }, { source }));
+      }, { source, relocationTrip }));
     }
     return {
       ok: results.every((item) => item.ok !== false),
