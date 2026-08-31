@@ -3,8 +3,6 @@ const SNAP_STATION_M = 28;
 const APPROACH_M = 180;
 const SIGNAL_TTL_MS = 120_000;
 const HEARTBEAT_MS = 2000;
-const BOAT_SPIDERFY_COLLISION_PX = 52;
-const BOAT_SPIDERFY_MARKER_GAP_PX = 60;
 /** Giữ pin kéo tay khi hub/Azure chưa kịp (tránh nhảy về chỗ cũ). */
 const USER_PIN_HOLD_MS = 120_000;
 const USER_PIN_HUB_CATCHUP_M = 40;
@@ -132,7 +130,6 @@ const openPopupCode = new Set();
 
 const stationLayers = new Map();
 const hubMarkers = new Map();
-const boatSpiderLegs = new Map();
 const routeLayers = new Map();
 const rescueOverlays = new Map();
 const handoffOverlays = new Map(); // tàu thay → hiện trường (ToHandoff)
@@ -1541,142 +1538,6 @@ function boatMapLatLng(code, hub, index, data = latest) {
   return { ...fb, source: 'fallback' };
 }
 
-function stableSpiderAngle(codes) {
-  let hash = 2166136261;
-  for (const char of codes.join('|')) {
-    hash ^= char.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return ((hash >>> 0) % 360) * (Math.PI / 180) - Math.PI / 2;
-}
-
-/**
- * Tách các marker đang đè nhau trong pixel-space. Chỉ đổi vị trí hiển thị;
- * tọa độ GPS thật vẫn nằm trong basePositions để popup, kéo và POST dùng đúng.
- */
-function spiderfyBoatDisplayPositions(codes, basePositions) {
-  const display = new Map(basePositions);
-  if (codes.length < 2) return display;
-
-  const entries = codes
-    .map((code) => {
-      const pos = basePositions.get(code);
-      if (!pos || !Number.isFinite(pos.lat) || !Number.isFinite(pos.lng)) return null;
-      return {
-        code,
-        pos,
-        point: map.latLngToLayerPoint([pos.lat, pos.lng]),
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => String(a.code).localeCompare(String(b.code)));
-  if (entries.length < 2) return display;
-
-  const parent = entries.map((_, index) => index);
-  const findRoot = (index) => {
-    let root = index;
-    while (parent[root] !== root) root = parent[root];
-    while (parent[index] !== index) {
-      const next = parent[index];
-      parent[index] = root;
-      index = next;
-    }
-    return root;
-  };
-  const union = (left, right) => {
-    const leftRoot = findRoot(left);
-    const rightRoot = findRoot(right);
-    if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot;
-  };
-
-  for (let left = 0; left < entries.length; left += 1) {
-    for (let right = left + 1; right < entries.length; right += 1) {
-      if (entries[left].point.distanceTo(entries[right].point) <= BOAT_SPIDERFY_COLLISION_PX) {
-        union(left, right);
-      }
-    }
-  }
-
-  const groups = new Map();
-  entries.forEach((entry, index) => {
-    const root = findRoot(index);
-    if (!groups.has(root)) groups.set(root, []);
-    groups.get(root).push(entry);
-  });
-
-  for (const group of groups.values()) {
-    if (group.length < 2) continue;
-    group.sort((a, b) => String(a.code).localeCompare(String(b.code)));
-    const anchor = group.find((entry) => entry.code === selectedBoatCode || canDragBoat(entry.code)) || null;
-    const ring = anchor ? group.filter((entry) => entry !== anchor) : group;
-    const center = anchor
-      ? anchor.point
-      : L.point(
-        group.reduce((sum, entry) => sum + entry.point.x, 0) / group.length,
-        group.reduce((sum, entry) => sum + entry.point.y, 0) / group.length,
-      );
-    const ringCount = ring.length;
-    const circleRadius = ringCount > 1
-      ? BOAT_SPIDERFY_MARKER_GAP_PX / (2 * Math.sin(Math.PI / ringCount))
-      : BOAT_SPIDERFY_MARKER_GAP_PX;
-    const radius = Math.max(
-      anchor ? BOAT_SPIDERFY_MARKER_GAP_PX : BOAT_SPIDERFY_MARKER_GAP_PX / 2,
-      circleRadius,
-    );
-    const startAngle = stableSpiderAngle(group.map((entry) => entry.code));
-
-    ring.forEach((entry, index) => {
-      const angle = startAngle + (index * Math.PI * 2) / ringCount;
-      const point = L.point(
-        center.x + Math.cos(angle) * radius,
-        center.y + Math.sin(angle) * radius,
-      );
-      const latLng = map.layerPointToLatLng(point);
-      display.set(entry.code, {
-        lat: latLng.lat,
-        lng: latLng.lng,
-        spiderfied: true,
-        originLat: entry.pos.lat,
-        originLng: entry.pos.lng,
-      });
-    });
-  }
-
-  return display;
-}
-
-function renderBoatSpiderLegs(displayPositions, { freeze = false } = {}) {
-  if (freeze) return;
-  const seen = new Set();
-  for (const [code, pos] of displayPositions) {
-    if (!pos?.spiderfied) continue;
-    seen.add(code);
-    const latLngs = [
-      [pos.originLat, pos.originLng],
-      [pos.lat, pos.lng],
-    ];
-    let leg = boatSpiderLegs.get(code);
-    if (!leg) {
-      leg = L.polyline(latLngs, {
-        color: '#64748b',
-        weight: 1.5,
-        opacity: 0.48,
-        dashArray: '3 4',
-        interactive: false,
-      }).addTo(map);
-      boatSpiderLegs.set(code, leg);
-    } else {
-      leg.setLatLngs(latLngs);
-      if (!map.hasLayer(leg)) leg.addTo(map);
-    }
-  }
-  for (const [code, leg] of boatSpiderLegs) {
-    if (seen.has(code)) continue;
-    leg.remove();
-    boatSpiderLegs.delete(code);
-  }
-}
-
 function buildBoatOptionsSignature(data) {
   return catalogBoats(data).map((boat) => {
     const max = Number(boat.maxSpeedKmh) || '';
@@ -2274,12 +2135,9 @@ function renderHubBoats(hubBoats) {
     displayPos.set(code, { lat: pos.lat, lng: pos.lng });
     index += 1;
   }
-  const spiderDisplayPos = spiderfyBoatDisplayPositions(codes, displayPos);
-
   const seen = new Set();
   const selected = selectedBoatCode;
   const freezeHubMarkerMutations = anyBoatMarkerPointerActive();
-  renderBoatSpiderLegs(spiderDisplayPos, { freeze: freezeHubMarkerMutations });
   index = 0;
 
   for (const code of codes) {
@@ -2288,7 +2146,7 @@ function renderHubBoats(hubBoats) {
     const fixed = displayPos.get(code) || boatMapLatLng(code, hub, index, latest);
     const trueLat = fixed.lat;
     const trueLng = fixed.lng;
-    const show = spiderDisplayPos.get(code) || fixed;
+    const show = fixed;
     seen.add(code);
     index += 1;
 
