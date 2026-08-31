@@ -162,6 +162,10 @@ let lastStationsFingerprint = '';
 let lastRoutesFingerprint = '';
 let lastBoatIds = '';
 let lastLiveBoatIds = '';
+let collectorBoatOptionsPending = false;
+let collectorBoatSelectInteracting = false;
+let collectorBoatOptionsInitialized = false;
+let collectorBoatOptionsFlushTimer = null;
 let renderFrame = null;
 let recordingSession = null;
 let autoSaveInFlight = false;
@@ -537,9 +541,20 @@ toolClearEl?.addEventListener('click', () => {
   renderCaptureState();
 });
 finishDrawEl?.addEventListener('click', finishDraw);
+collectorBoatCodeEl?.addEventListener('pointerdown', beginCollectorBoatInteraction);
+collectorBoatCodeEl?.addEventListener('mousedown', beginCollectorBoatInteraction);
+collectorBoatCodeEl?.addEventListener('touchstart', beginCollectorBoatInteraction, { passive: true });
+collectorBoatCodeEl?.addEventListener('keydown', beginCollectorBoatInteraction);
+collectorBoatCodeEl?.addEventListener('keyup', (event) => {
+  if (event.key === 'Escape') endCollectorBoatInteraction();
+});
+collectorBoatCodeEl?.addEventListener('pointercancel', endCollectorBoatInteraction);
+collectorBoatCodeEl?.addEventListener('touchcancel', endCollectorBoatInteraction);
 collectorBoatCodeEl?.addEventListener('change', () => {
   switchBoatDraft(collectorBoatCodeEl.value.trim());
+  endCollectorBoatInteraction();
 });
+collectorBoatCodeEl?.addEventListener('blur', endCollectorBoatInteraction);
 collectorSpeedEl?.addEventListener('input', () => {
   applyBoatSpeedLimits();
   updateDrawStats();
@@ -664,6 +679,12 @@ function switchBoatDraft(nextBoatCode) {
       return;
     }
   }
+  if (next === prev) {
+    if (collectorBoatCodeEl) collectorBoatCodeEl.value = next;
+    applyBoatSpeedLimits();
+    renderCaptureState();
+    return;
+  }
 
   // Đổi tàu khác → lưu draft tàu cũ.
   if (prev && prev !== next) {
@@ -686,7 +707,7 @@ function switchBoatDraft(nextBoatCode) {
   } else if (existingDraft && (prev || !hasCanvas)) {
     // Có draft sẵn của tàu này → nạp (trừ khi vừa gắn đường hiện tại vào tàu trống).
     applyBoatDraft(existingDraft);
-  } else if (hasCanvas && (!existingDraft || !prev)) {
+  } else if (hasCanvas && !existingDraft) {
     // Vẽ trước / chọn tàu sau, hoặc tàu chưa có draft → giữ đường, gắn vào tàu.
     saveActiveBoatDraft(next);
   } else {
@@ -694,7 +715,7 @@ function switchBoatDraft(nextBoatCode) {
   }
 
   applyBoatSpeedLimits();
-  updateDrawStats();
+  renderCaptureState();
   const pts = captureState.points.length;
   captureStatusEl.textContent = next
     ? (pts ? `Tàu ${next} · ${pts} điểm — sẵn sàng ghi GPS` : `Đã chọn ${next} — vẽ đường rồi bắt đầu ghi GPS`)
@@ -849,6 +870,9 @@ function boatSurveyBlockReason(boatCode, data = latest) {
   if (open) return `đang sự cố · không đi dò`;
 
   const boat = findBoatByCode(code, data);
+  if (Array.isArray(data?.boats) && data.boats.length > 0 && !boat) {
+    return `chưa có trong danh sách tàu · chờ đồng bộ`;
+  }
   const status = String(boat?.beStatus || boat?.effectiveStatus || boat?.dbStatus || '')
     .trim()
     .toLowerCase()
@@ -2558,40 +2582,80 @@ function renderCollectorBoatOptions(boats) {
     const name = boat.boatName ? ` · ${boat.boatName}` : '';
     const block = boatSurveyBlockReason(boat.boatCode);
     const tag = block ? ` · ${block}` : ` · max ${max} km/h`;
-    const isCurrent = String(boat.boatCode) === String(previous);
     return {
       code: boat.boatCode,
       label: `${boat.boatCode}${name}${tag}`,
-      // Giữ tàu đang chọn selectable — tránh browser reset về "Chọn tàu..."
-      disabled: Boolean(block) && !isCurrent,
-      blocked: Boolean(block),
     };
   });
+  const previousInCatalog = options.some((item) => item.code === previous);
+  if (previous && !previousInCatalog) {
+    options.unshift({
+      code: previous,
+      label: `${previous} · chưa có trong snapshot · chờ đồng bộ`,
+    });
+  }
+  const restoreInitialDraft = !collectorBoatOptionsInitialized && (options.length > 0 || Boolean(previous));
+  if (options.length > 0 || previous) collectorBoatOptionsInitialized = true;
   collectorBoatCodeEl.innerHTML = [
     '<option value="">Chọn tàu...</option>',
     ...options.map((item) => (
-      `<option value="${escapeHtml(item.code)}"${item.disabled ? ' disabled' : ''}>${escapeHtml(item.label)}</option>`
+      `<option value="${escapeHtml(item.code)}">${escapeHtml(item.label)}</option>`
     )),
   ].join('');
 
   const stillInList = options.some((item) => item.code === previous);
   const preferred = stillInList ? previous : '';
 
-  // Chỉ bỏ chọn khi tàu biến mất khỏi catalog.
-  if (previous && !stillInList) {
-    selectedCollectorBoatCode = '';
-    localStorage.removeItem('surveyBoatCode');
-  } else if (preferred) {
+  // Snapshot có thể tạm thiếu một tàu; giữ mã + draft để lần chọn tiếp theo không ghi đè nhầm tàu.
+  if (preferred) {
     selectedCollectorBoatCode = preferred;
     localStorage.setItem('surveyBoatCode', preferred);
   }
   collectorBoatCodeEl.value = preferred || '';
-  // Không tự chọn tàu đầu — user phải chọn. Có tàu đã chọn thì nạp bản vẽ của đúng tàu.
-  if (preferred && !captureState.points.length && boatDrafts[preferred]) {
+  // Draft chỉ được khôi phục lúc catalog tải lần đầu; refresh trạng thái không được ghi đè form đang sửa.
+  if (restoreInitialDraft && preferred && !captureState.points.length && boatDrafts[preferred]) {
     applyBoatDraft(boatDrafts[preferred]);
   }
   applyBoatSpeedLimits();
-  updateDrawStats();
+  renderCaptureState();
+}
+
+function collectorBoatOptionsSignature(boats) {
+  return (boats || [])
+    .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.boatName || ''}:${boat.maxSpeedKmh}:${boatSurveyBlockReason(boat.boatCode)}`)
+    .join('|');
+}
+
+function isCollectorBoatSelectInteracting() {
+  return collectorBoatSelectInteracting;
+}
+
+function beginCollectorBoatInteraction() {
+  collectorBoatSelectInteracting = true;
+  if (collectorBoatOptionsFlushTimer) {
+    clearTimeout(collectorBoatOptionsFlushTimer);
+    collectorBoatOptionsFlushTimer = null;
+  }
+}
+
+function endCollectorBoatInteraction() {
+  collectorBoatSelectInteracting = false;
+  if (collectorBoatOptionsFlushTimer) clearTimeout(collectorBoatOptionsFlushTimer);
+  // Chờ event change hoàn tất rồi mới thay option DOM; force vì select thường vẫn còn focus.
+  collectorBoatOptionsFlushTimer = setTimeout(() => {
+    collectorBoatOptionsFlushTimer = null;
+    flushCollectorBoatOptions({ force: true });
+  }, 0);
+}
+
+function flushCollectorBoatOptions({ force = false } = {}) {
+  if (!collectorBoatOptionsPending || (!force && isCollectorBoatSelectInteracting()) || !latest) return;
+  const boats = catalogBoats(latest);
+  const signature = collectorBoatOptionsSignature(boats);
+  collectorBoatOptionsPending = false;
+  if (signature === lastBoatIds) return;
+  lastBoatIds = signature;
+  renderCollectorBoatOptions(boats);
 }
 
 function updateDrawStats() {
@@ -3456,12 +3520,17 @@ function renderPanelLive(data) {
     sentRecorded: data.sentRecorded,
   });
 
-  const catalogFp = catalogBoats(data)
-    .map((boat) => `${boat.boatId}:${boat.boatCode}:${boat.maxSpeedKmh}`)
-    .join('|');
+  const catalog = catalogBoats(data);
+  const catalogFp = collectorBoatOptionsSignature(catalog);
   if (catalogFp !== lastBoatIds) {
-    lastBoatIds = catalogFp;
-    renderCollectorBoatOptions(catalogBoats(data));
+    if (isCollectorBoatSelectInteracting() && collectorBoatCodeEl.options.length > 1) {
+      // Không thay innerHTML khi native select đang mở — Safari/Chrome có thể mất click.
+      collectorBoatOptionsPending = true;
+    } else {
+      lastBoatIds = catalogFp;
+      collectorBoatOptionsPending = false;
+      renderCollectorBoatOptions(catalog);
+    }
   } else {
     applyBoatSpeedLimits();
   }

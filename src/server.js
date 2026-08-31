@@ -3382,6 +3382,12 @@ function pickReplacementBoatCode(src = {}) {
   ).trim() || '';
 }
 
+function configuredRescueSpeedKmh() {
+  const configured = Number(env.RESCUE_SPEED_KMH || 32);
+  const plausibleLimit = Math.max(1, Number(env.RESCUE_SPEED_LIMIT_KMH || 60));
+  return clamp(Number.isFinite(configured) && configured > 0 ? configured : 32, 1, plausibleLimit);
+}
+
 /**
  * Đảm bảo tàu cứu (vd SOS_001) có trong catalog + hub để Live hiện và POST tracking được.
  * Nếu chưa có GPS: seed đúng tọa độ hiện trường/bến — được đè/chồng trong phạm vi chuẩn, không đẩy ~350m ra ngoài.
@@ -3409,7 +3415,7 @@ function ensureRescueBoatOnMap(boatCode, nearLat = null, nearLng = null) {
       dbStatus: 'Active',
       beStatus: 'Active',
       numberOfDecks: 1,
-      maxSpeedKmh: Math.max(1, Number(env.RESCUE_SPEED_KMH || env.DEFAULT_SPEED_KMH || 16)),
+      maxSpeedKmh: configuredRescueSpeedKmh(),
       lat,
       lng,
       heading: 0,
@@ -4768,8 +4774,14 @@ function startRescueAutomation(incident) {
   }
 
   const now = new Date().toISOString();
-  const configuredSpeed = Math.max(1, Number(env.RESCUE_SPEED_KMH || 32));
+  const configuredSpeed = configuredRescueSpeedKmh();
   const rescueMaxSpeed = Number(rescueBoat?.maxSpeedKmh);
+  const isReplacementTransfer = incidentId.endsWith('__xfer');
+  // SOS uses a dedicated emergency speed. A passenger replacement boat still
+  // respects its registered maximum speed while travelling to the handoff.
+  const missionSpeedKmh = isReplacementTransfer && Number.isFinite(rescueMaxSpeed)
+    ? Math.min(configuredSpeed, rescueMaxSpeed)
+    : configuredSpeed;
   const mission = {
     incidentId,
     incidentBoatCode,
@@ -4788,9 +4800,7 @@ function startRescueAutomation(incident) {
     incidentLat: resolvedTargetLat,
     incidentLng: resolvedTargetLng,
     traveledMeters: 0,
-    speedKmh: Number.isFinite(rescueMaxSpeed)
-      ? Math.min(configuredSpeed, rescueMaxSpeed)
-      : configuredSpeed,
+    speedKmh: missionSpeedKmh,
     startedAt: now,
     updatedAt: now,
     lastTickAt: Date.now(),
@@ -4847,7 +4857,7 @@ function startRescueAutomation(incident) {
         { lat: startLat, lng: startLng },
         { lat: resolvedTargetLat, lng: resolvedTargetLng },
       ),
-    )}m)`,
+    )}m, ${mission.speedKmh}km/h)`,
   );
 
   // Publish ngay điểm xuất phát — FE/SSE nhận SOS trước tick 2s (tránh đứng rồi "biến mất").
@@ -8571,6 +8581,7 @@ function publicConfig() {
     targetApiRoot: getTargetApiRoot(),
     hasApiKey: Boolean(state.targetApiKey),
     sendIntervalMs: Number(env.SEND_INTERVAL_MS || 2000),
+    rescueSpeedKmh: configuredRescueSpeedKmh(),
     surveyDeviceId: surveyDeviceId(),
     gpsDevices: Object.fromEntries(state.gpsDevicesByBoatCode.entries()),
     // Trình duyệt Railway bị CORS khi nối thẳng Azure hub → FE dùng SSE relay.
