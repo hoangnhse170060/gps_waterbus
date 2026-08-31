@@ -21,6 +21,10 @@ import { createSignalRRelay } from './signalr-relay.js';
 import { distanceMeters, routeLength } from './geo-distance.js';
 import { createTripAutorun } from './trip-autorun.js';
 import {
+  resolveCatalogBoatPosition,
+  shouldPublishCatalogBoat,
+} from './boat-position-policy.js';
+import {
   advanceAlongCoordinates,
   buildRiverPath,
   projectOnPath,
@@ -391,14 +395,23 @@ async function publishIncidentGpsPosition(boatCode, {
 }
 
 const boatsSql = `
-with default_route as (
-  select route_id from routes where coalesce(status, '') ilike 'active' order by created_at nulls last limit 1
-),
-latest_trip as (
+with active_trip as (
   select distinct on (boat_id) boat_id, trip_id, route_id
   from trips
-  where route_id is not null
-  order by boat_id, departure_time desc nulls last, created_at desc nulls last
+  where boat_id is not null
+    and route_id is not null
+    and lower(coalesce(status, '')) in ('departed', 'boarding', 'delayed')
+    and operating_date between
+      (timezone('Asia/Ho_Chi_Minh', now()))::date - 1
+      and (timezone('Asia/Ho_Chi_Minh', now()))::date
+  order by boat_id,
+    case lower(coalesce(status, ''))
+      when 'departed' then 0
+      when 'boarding' then 1
+      else 2
+    end,
+    departure_time desc nulls last,
+    created_at desc nulls last
 )
 select coalesce(jsonb_agg(jsonb_build_object(
   'boatId', b.boat_id,
@@ -408,10 +421,10 @@ select coalesce(jsonb_agg(jsonb_build_object(
   'maxSpeedKmh', b.max_speed_kmh,
   'numberOfDecks', b.number_of_decks,
   'tripId', t.trip_id,
-  'routeId', coalesce(t.route_id, (select route_id from default_route))
+  'routeId', t.route_id
 )), '[]'::jsonb)
 from boats b
-left join latest_trip t on t.boat_id = b.boat_id
+left join active_trip t on t.boat_id = b.boat_id
 where coalesce(b.status, '') ilike 'active'
    or coalesce(b.status, '') ilike 'undermaintenance'
    or coalesce(b.status, '') ilike 'incident';
@@ -2062,21 +2075,19 @@ async function refreshFromDatabase() {
     }));
     state.routeStops = Array.isArray(routeStops) ? routeStops : [];
 
-    const routeList = [...state.routes.values()];
-    // Vị trí mặc định khi tàu chưa có route (trung tâm sông SG) — vẫn hiện tàu thật.
-    const defaultAnchor = state.stations[0]
-      ? { lat: Number(state.stations[0].lat), lng: Number(state.stations[0].lng) }
-      : { lat: 10.776, lng: 106.705 };
-    let boatIndex = 0;
+    const riverPath = getRescueRiverBasePath();
     for (const dbBoat of boats) {
       const existing = state.boats.get(dbBoat.boatId);
       const hasOwnRoute = Boolean(dbBoat.routeId && state.routes.has(dbBoat.routeId));
-      const route = hasOwnRoute
-        ? state.routes.get(dbBoat.routeId)
-        : (routeList[boatIndex % Math.max(routeList.length, 1)] || null);
-      const idx = boatIndex;
-      boatIndex += 1;
-      const stagger = route ? route.lengthMeters * ((idx * 0.37) % 1) : 0;
+      const route = hasOwnRoute ? state.routes.get(dbBoat.routeId) : null;
+      const code = String(dbBoat.boatCode || '').trim();
+      const safePosition = resolveCatalogBoatPosition({
+        hubPosition: state.hubBoats.get(code),
+        lastPosition: lastPositions[code],
+        existingPosition: existing,
+        stations: state.stations,
+        riverPath,
+      });
       const maxSpeedKmh = Number(dbBoat.maxSpeedKmh || env.DEFAULT_SPEED_KMH || 16);
       const base = {
         boatId: dbBoat.boatId,
@@ -2084,6 +2095,7 @@ async function refreshFromDatabase() {
         boatName: dbBoat.boatName,
         dbStatus: dbBoat.status,
         numberOfDecks: Number(dbBoat.numberOfDecks) || 1,
+        tripId: dbBoat.tripId || null,
         routeId: route ? route.routeId : null,
         routeCode: route ? route.routeCode : null,
         routeName: route ? route.routeName : null,
@@ -2091,7 +2103,6 @@ async function refreshFromDatabase() {
       };
 
       if (existing) {
-        const routeChanged = existing.routeId !== (route ? route.routeId : null);
         Object.assign(existing, base);
         existing.deviceId = deviceIdForBoat(dbBoat);
         if (!existing.manualSpeed) {
@@ -2100,40 +2111,34 @@ async function refreshFromDatabase() {
             maxSpeedKmh || Number(env.DEFAULT_SPEED_KMH || 16),
           );
         }
-        // Spread boats that share a route so many are visible on the map.
-        if (route && !hasOwnRoute && routeChanged) {
-          existing.progressMeters = stagger;
-          existing.direction = idx % 2 === 0 ? 1 : -1;
-          const pos = pointAtDistance(route.coordinates, existing.progressMeters);
-          existing.lat = pos.lat;
-          existing.lng = pos.lng;
-          existing.heading = existing.direction === 1 ? pos.heading : (pos.heading + 180) % 360;
-        }
-        if (!route && (!Number.isFinite(Number(existing.lat)) || !Number.isFinite(Number(existing.lng)))) {
-          existing.lat = defaultAnchor.lat;
-          existing.lng = defaultAnchor.lng;
+        const controlledByMission = tripAutorun.isBoatInActiveTripMission(code)
+          || isBoatInActiveRescueMission(code)
+          || activeSurveyBoatCode() === code;
+        if (!controlledByMission) {
+          existing.progressMeters = 0;
+          existing.direction = 1;
+          existing.lat = safePosition.lat;
+          existing.lng = safePosition.lng;
+          existing.heading = safePosition.heading;
+          existing.speedKmh = 0;
+          existing.status = 'idle';
         }
       } else {
-        const start = route ? pointAtDistance(route.coordinates, stagger) : { ...defaultAnchor, heading: 0 };
         const deviceId = deviceIdForBoat(dbBoat);
         state.boats.set(dbBoat.boatId, {
           ...base,
           deviceId,
-          tripId: dbBoat.tripId || null,
-          progressMeters: stagger,
-          direction: idx % 2 === 0 ? 1 : -1,
+          progressMeters: 0,
+          direction: 1,
           sequence: sequenceState[deviceId] ?? initialSequence(),
           batteryPercent: randomInt(78, 96),
           signalStrength: 4,
           gpsFixQuality: 'good',
-          speedKmh: Math.min(
-            Number(env.DEFAULT_SPEED_KMH || 16),
-            maxSpeedKmh || Number(env.DEFAULT_SPEED_KMH || 16),
-          ),
-          heading: start.heading,
-          lat: start.lat,
-          lng: start.lng,
-          status: route ? 'moving' : 'idle',
+          speedKmh: 0,
+          heading: safePosition.heading,
+          lat: safePosition.lat,
+          lng: safePosition.lng,
+          status: 'idle',
           paused: false,
           manualSpeed: false,
           updatedAt: new Date().toISOString(),
@@ -2315,13 +2320,14 @@ async function publishGpsPositions() {
   if (!parseBool(env.PUBLISH_LIVE_BOATS || 'false')) return;
 
   const surveyCode = activeSurveyBoatCode();
+  const canPublishBoatCode = (boatCode) => shouldPublishCatalogBoat({
+    boatCode,
+    surveyBoatCode: surveyCode,
+    hasActiveTrip: tripAutorun.isBoatInActiveTripMission(boatCode),
+    hasActiveRescue: isBoatInActiveRescueMission(boatCode),
+  });
   const payloads = [...state.boats.values()]
-    .filter((boat) => {
-      const code = String(boat.boatCode || '').trim();
-      // Chỉ loại tàu đang survey — tàu khác vẫn cập nhật GPS.
-      if (surveyCode && code === surveyCode) return false;
-      return true;
-    })
+    .filter((boat) => canPublishBoatCode(boat.boatCode))
     .map(buildTargetPayload);
   state.lastGps = { at: new Date().toISOString(), payloads };
 
@@ -2336,7 +2342,10 @@ async function publishGpsPositions() {
   }
 
   const results = [];
-  const pendingPayloads = [...state.offlineQueue, ...payloads];
+  const pendingPayloads = [
+    ...state.offlineQueue.filter((payload) => canPublishBoatCode(payload.boatCode)),
+    ...payloads,
+  ];
   state.offlineQueue = [];
 
   for (const payload of pendingPayloads) {
@@ -8979,6 +8988,7 @@ function rememberLastPosition(boatCode, boat) {
 /** Seed hub từ vị trí cuối đã ghi — tránh restart/SSE làm tàu nhảy về bến/seed. */
 function restoreLastPositionsToHub() {
   let restored = 0;
+  const riverPath = getRescueRiverBasePath();
   for (const [code, row] of Object.entries(lastPositions || {})) {
     const lat = Number(row?.lat);
     const lng = Number(row?.lng);
@@ -8994,13 +9004,18 @@ function restoreLastPositionsToHub() {
         continue;
       }
     }
+    const safePosition = resolveCatalogBoatPosition({
+      lastPosition: row,
+      stations: state.stations,
+      riverPath,
+    });
     state.hubBoats.set(code, {
       ...(prev || {}),
       boatCode: code,
       boatName: row.boatName || prev?.boatName || null,
       boatId: row.boatId || prev?.boatId || null,
-      lat,
-      lng,
+      lat: safePosition.lat,
+      lng: safePosition.lng,
       heading: Number.isFinite(Number(row.heading)) ? Number(row.heading) : (prev?.heading ?? 0),
       speedKmh: Number.isFinite(Number(row.speedKmh)) ? Number(row.speedKmh) : 0,
       recordedAt: row.recordedAt || null,
@@ -9012,8 +9027,8 @@ function restoreLastPositionsToHub() {
     });
     const boat = boatByIdOrCode(code);
     if (boat) {
-      boat.lat = lat;
-      boat.lng = lng;
+      boat.lat = safePosition.lat;
+      boat.lng = safePosition.lng;
       if (Number.isFinite(Number(row.heading))) boat.heading = Number(row.heading);
     }
     restored += 1;
