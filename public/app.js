@@ -119,6 +119,10 @@ function notifyErr(message, ms) { toast(message, 'err', ms || 4500); }
 function notifyWarn(message, ms) { toast(message, 'warn', ms || 4000); }
 function notifyInfo(message, ms) { toast(message, 'info', ms); }
 
+function setCollectorStatus(text) {
+  if (collectorStatusEl) collectorStatusEl.textContent = String(text || '');
+}
+
 const markers = new Map();
 const routeLayers = new Map();
 const stationLayers = new Map();
@@ -2908,7 +2912,7 @@ async function startRecording() {
     const warn = body.targetSessionWarning ? ` ${body.targetSessionWarning}` : '';
     const startName = startStation?.stationName || startStation?.stationCode || 'điểm đầu đường vẽ';
     captureStatusEl.textContent = `Tàu chạy đúng đường vẽ · ghi GPS mỗi ${sendIntervalMs / 1000}s.${warn}`;
-    collectorStatusEl.textContent = `Đang chạy ${body.boatCode} · ${body.deviceId}`;
+    setCollectorStatus(`Đang chạy ${body.boatCode} · ${body.deviceId}`);
     gpsStatusEl.textContent = 'Đang ghi GPS';
     setGpsCardState('running');
     ensureSurveyPathVisible();
@@ -2940,12 +2944,12 @@ async function stopRecording({ autoSave = true } = {}) {
     const count = recordingSession?.recordedPoints?.length || 0;
     if (!count) {
       captureStatusEl.textContent = 'Đã kết thúc ghi nhưng chưa có điểm GPS.';
-      collectorStatusEl.textContent = 'Không có điểm để lưu.';
+      setCollectorStatus('Không có điểm để lưu.');
       autoCompleteTriggered = false;
       return;
     }
     captureStatusEl.textContent = `Đã lấy xong ${count} điểm GPS. Đang lưu lên DB...`;
-    collectorStatusEl.textContent = `Session sẵn sàng lưu (${count} điểm).`;
+    setCollectorStatus(`Session sẵn sàng lưu (${count} điểm).`);
     gpsStatusEl.textContent = 'Đã lấy GPS xong';
     setGpsCardState('ok');
     if (autoSave) {
@@ -3394,7 +3398,7 @@ function renderCollector(collector, lastCollectorSend, session) {
     // Không xóa hub GPS — bên theo dõi vẫn thấy tàu dừng ở bến đích.
     const count = activeSession?.recordedPoints?.length || activeSession?.recordedCount || 0;
     if (count && !autoSaveInFlight) {
-      collectorStatusEl.textContent = `Đã kết thúc ghi: ${count} điểm GPS · tàu dừng tại bến.`;
+      setCollectorStatus(`Đã kết thúc ghi: ${count} điểm GPS · tàu dừng tại bến.`);
       stopCollectorEl.disabled = true;
       pauseCollectorEl.disabled = true;
       startCollectorEl.disabled = false;
@@ -3403,7 +3407,7 @@ function renderCollector(collector, lastCollectorSend, session) {
       return;
     }
     if (!autoSaveInFlight) {
-      collectorStatusEl.textContent = 'Chưa ghi GPS.';
+      setCollectorStatus('Chưa ghi GPS.');
       pauseCollectorEl.disabled = true;
       stopCollectorEl.disabled = true;
       startCollectorEl.disabled = false;
@@ -3453,7 +3457,7 @@ function renderCollector(collector, lastCollectorSend, session) {
         : `lỗi ${lastCollectorSend.error || lastCollectorSend.status}`
     : 'đang chờ tín hiệu';
   const recordedCount = lastCollectorSend?.recordedCount ?? collector.recordedCount ?? 0;
-  collectorStatusEl.textContent = `Đang ghi: ${recordedCount} điểm / ${collector.sendIntervalMs / 1000}s · ${percent.toFixed(1)}% · ${sendText}`;
+  setCollectorStatus(`Đang ghi: ${recordedCount} điểm / ${collector.sendIntervalMs / 1000}s · ${percent.toFixed(1)}% · ${sendText}`);
   pauseCollectorEl.textContent = collector.paused ? 'Tiếp tục' : 'Tạm dừng';
   pauseCollectorEl.disabled = collector.status === 'completed';
   stopCollectorEl.disabled = collector.status === 'completed';

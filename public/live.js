@@ -1487,13 +1487,39 @@ function fallbackLatLngForBoat(code, index, data = latest) {
   if (pin?.user && recentUserPinHolds(code, null)) {
     return { lat: pin.lat, lng: pin.lng };
   }
+  
+  // Kiểm tra trip: nếu không có trip active → snap về bến gần nhất thay vì dùng hub
+  const hasActiveTrip = activeTripForBoat(code, data);
+  const isRescuing = isBoatInActiveAutomatedRescue(code, data);
+  const hasIncident = Boolean(openIncidentForBoat(code));
+  
   const hub = (data?.hubBoats || []).find((b) => String(b.boatCode) === code);
-  if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
-    return { lat: Number(hub.lat), lng: Number(hub.lng) };
+  
+  // Có trip/rescue/incident → dùng hub như bình thường
+  if (hasActiveTrip || isRescuing || hasIncident) {
+    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+      return { lat: Number(hub.lat), lng: Number(hub.lng) };
+    }
   }
+  
+  // Không có trip → tìm bến gần nhất từ hub hoặc pin
+  if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+    const nearestFromHub = nearestStationAny({ lat: Number(hub.lat), lng: Number(hub.lng) }, data?.stations || []);
+    if (nearestFromHub && nearestFromHub.station) {
+      return { lat: Number(nearestFromHub.station.lat), lng: Number(nearestFromHub.station.lng) };
+    }
+  }
+  
+  // Thử dùng pin cũ nếu có
   if (pin && Number.isFinite(Number(pin.lat)) && Number.isFinite(Number(pin.lng)) && !pin.user) {
+    // Tìm bến gần nhất từ pin
+    const nearestFromPin = nearestStationAny({ lat: Number(pin.lat), lng: Number(pin.lng) }, data?.stations || []);
+    if (nearestFromPin && nearestFromPin.station) {
+      return { lat: Number(nearestFromPin.station.lat), lng: Number(nearestFromPin.station.lng) };
+    }
     return { lat: Number(pin.lat), lng: Number(pin.lng) };
   }
+  
   // Neo tàu về bến đầu tiên (không phân tán) khi không có GPS.
   const corridor = corridorStations(data?.stations);
   if (corridor.length) {
@@ -1531,13 +1557,36 @@ function boatMapLatLng(code, hub, index, data = latest) {
   if (pin?.user && recentUserPinHolds(code, hub)) {
     return { lat: Number(pin.lat), lng: Number(pin.lng), source: 'user-pin' };
   }
+  
+  // Kiểm tra trip: nếu không có trip active hoặc đang rescue → bỏ qua hub, nhảy về bến gần nhất
+  const hasActiveTrip = activeTripForBoat(code, data);
+  const isRescuing = isBoatInActiveAutomatedRescue(code, data);
+  const hasIncident = Boolean(openIncidentForBoat(code));
+  const isDraggingThis = dragging && draggingBoatCode === code;
+  
+  // Nếu có trip/rescue/incident HOẶC đang kéo tay → dùng hub hoặc incident position như bình thường
+  if (hasActiveTrip || isRescuing || hasIncident || isDraggingThis) {
+    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+      return { lat: Number(hub.lat), lng: Number(hub.lng), source: hub.source || 'hub' };
+    }
+    const open = openIncidentForBoat(code);
+    if (open && Number.isFinite(Number(open.lat)) && Number.isFinite(Number(open.lng))) {
+      return { lat: Number(open.lat), lng: Number(open.lng), source: 'incident' };
+    }
+  }
+  
+  // Không có trip + không kéo tay → tìm bến gần nhất từ hub position hoặc fallback
   if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
-    return { lat: Number(hub.lat), lng: Number(hub.lng), source: hub.source || 'hub' };
+    const nearestFromHub = nearestStationAny({ lat: Number(hub.lat), lng: Number(hub.lng) }, data?.stations || []);
+    if (nearestFromHub && nearestFromHub.station) {
+      return { 
+        lat: Number(nearestFromHub.station.lat), 
+        lng: Number(nearestFromHub.station.lng), 
+        source: 'nearest-station-no-trip' 
+      };
+    }
   }
-  const open = openIncidentForBoat(code, data);
-  if (open && Number.isFinite(Number(open.lat)) && Number.isFinite(Number(open.lng))) {
-    return { lat: Number(open.lat), lng: Number(open.lng), source: 'incident' };
-  }
+  
   const fb = fallbackLatLngForBoat(code, index, data);
   return { ...fb, source: 'fallback' };
 }
@@ -3562,6 +3611,39 @@ async function resyncAzurePositions() {
     return false;
   }
 }
+
+// Test helper: kiểm tra logic snap về bến khi không có trip
+window.testSnapToStation = function(boatCode) {
+  console.log('🧪 Testing snap-to-station logic for', boatCode);
+  const hub = (latest?.hubBoats || []).find((b) => String(b.boatCode) === boatCode);
+  const trip = activeTripForBoat(boatCode);
+  const rescue = isBoatInActiveAutomatedRescue(boatCode);
+  const incident = openIncidentForBoat(boatCode);
+  
+  console.log('📊 Status check:');
+  console.log('  - Hub position:', hub ? `${hub.lat}, ${hub.lng}` : 'none');
+  console.log('  - Active trip:', trip ? `${trip.status}` : 'NONE ❌');
+  console.log('  - Rescue mission:', rescue ? 'YES' : 'none');
+  console.log('  - Incident:', incident ? 'YES' : 'none');
+  
+  const result = boatMapLatLng(boatCode, hub, 0, latest);
+  console.log('📍 Result position:', result);
+  
+  if (!trip && !rescue && !incident && hub) {
+    const nearest = nearestStationAny({ lat: hub.lat, lng: hub.lng }, latest?.stations || []);
+    console.log('🎯 Nearest station:', nearest?.station?.stationCode, 
+                `(${nearest?.dist?.toFixed(0)}m away)`);
+    if (result.source === 'nearest-station-no-trip') {
+      console.log('✅ PASS: Tàu đã snap về bến gần nhất!');
+    } else {
+      console.log('❌ FAIL: Tàu vẫn ở hub position!');
+    }
+  } else {
+    console.log('ℹ️  Tàu có trip/rescue/incident → dùng hub là đúng');
+  }
+  
+  return result;
+};
 
 connectEvents();
 startSnapshotPoll();

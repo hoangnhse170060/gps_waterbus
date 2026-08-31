@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Test Snap-to-Station Logic</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .test-card {
+      background: white;
+      padding: 20px;
+      margin: 20px 0;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .test-case {
+      margin: 15px 0;
+      padding: 15px;
+      border-left: 4px solid #3b82f6;
+      background: #eff6ff;
+    }
+    .pass { border-left-color: #10b981; background: #ecfdf5; }
+    .fail { border-left-color: #ef4444; background: #fef2f2; }
+    h1 { color: #1f2937; }
+    h3 { color: #374151; margin-top: 0; }
+    code {
+      background: #1f2937;
+      color: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 0.9em;
+    }
+    .status { font-weight: 600; }
+    .pass .status { color: #059669; }
+    .fail .status { color: #dc2626; }
+  </style>
+</head>
+<body>
+  <h1>🧪 Test: Snap Tàu Về Bến Khi Không Có Trip</h1>
+  
+  <div class="test-card">
+    <h3>Hướng dẫn test:</h3>
+    <ol>
+      <li>Mở trang <strong>Live GPS</strong> trong tab khác</li>
+      <li>Mở <strong>DevTools Console</strong> (F12)</li>
+      <li>Chạy lệnh: <code>testSnapToStation('TÀU_CODE')</code></li>
+      <li>Ví dụ: <code>testSnapToStation('BD')</code></li>
+    </ol>
+  </div>
+
+  <div class="test-card">
+    <h3>📋 Test Cases Cần Kiểm Tra:</h3>
+    
+    <div class="test-case">
+      <h4>Test 1: Tàu không có trip + hub ở giữa sông</h4>
+      <p><strong>Điều kiện:</strong></p>
+      <ul>
+        <li>Tàu không có trip active</li>
+        <li>Hub có tọa độ GPS ở giữa sông</li>
+        <li>Không có rescue mission</li>
+        <li>Không có incident</li>
+      </ul>
+      <p><strong>Kết quả mong đợi:</strong></p>
+      <p class="status">✅ Tàu phải snap về bến gần nhất (source: 'nearest-station-no-trip')</p>
+    </div>
+
+    <div class="test-case">
+      <h4>Test 2: Tàu có trip active</h4>
+      <p><strong>Điều kiện:</strong></p>
+      <ul>
+        <li>Tàu có trip status: Running/Pending/WaitingAtStop</li>
+        <li>Hub có tọa độ GPS</li>
+      </ul>
+      <p><strong>Kết quả mong đợi:</strong></p>
+      <p class="status">✅ Tàu dùng vị trí hub (source: 'hub')</p>
+    </div>
+
+    <div class="test-case">
+      <h4>Test 3: User đang kéo tay</h4>
+      <p><strong>Điều kiện:</strong></p>
+      <ul>
+        <li>User unlock và đang kéo tàu</li>
+        <li>Pin có user flag</li>
+      </ul>
+      <p><strong>Kết quả mong đợi:</strong></p>
+      <p class="status">✅ Tàu giữ vị trí kéo tay (source: 'user-pin')</p>
+    </div>
+
+    <div class="test-case">
+      <h4>Test 4: Tàu có incident</h4>
+      <p><strong>Điều kiện:</strong></p>
+      <ul>
+        <li>Tàu có sự cố mở</li>
+        <li>Không có trip</li>
+      </ul>
+      <p><strong>Kết quả mong đợi:</strong></p>
+      <p class="status">✅ Tàu dùng vị trí incident (source: 'incident')</p>
+    </div>
+
+    <div class="test-case">
+      <h4>Test 5: Tàu đang rescue</h4>
+      <p><strong>Điều kiện:</strong></p>
+      <ul>
+        <li>Tàu đang trong rescue mission (Dispatched/InTransit/Towing)</li>
+        <li>Không có trip</li>
+      </ul>
+      <p><strong>Kết quả mong đợi:</strong></p>
+      <p class="status">✅ Tàu dùng vị trí hub (source: 'hub')</p>
+    </div>
+  </div>
+
+  <div class="test-card">
+    <h3>🔍 Kiểm tra kết quả trong Console:</h3>
+    <p>Sau khi chạy <code>testSnapToStation('CODE')</code>, console sẽ hiển thị:</p>
+    <ul>
+      <li>📊 Status check: trip, rescue, incident</li>
+      <li>📍 Result position: lat, lng, source</li>
+      <li>🎯 Nearest station: bến gần nhất</li>
+      <li>✅ PASS hoặc ❌ FAIL</li>
+    </ul>
+  </div>
+
+  <div class="test-card">
+    <h3>📝 Ghi chú quan trọng:</h3>
+    <ul>
+      <li><strong>Thứ tự ưu tiên:</strong> user-pin → trip/rescue/incident (hub) → snap về bến gần nhất</li>
+      <li><strong>Source types:</strong>
+        <ul>
+          <li><code>user-pin</code>: vị trí kéo tay</li>
+          <li><code>hub</code>: GPS từ Azure/hub</li>
+          <li><code>incident</code>: vị trí sự cố</li>
+          <li><code>nearest-station-no-trip</code>: snap về bến (không có trip) ✨</li>
+          <li><code>fallback</code>: fallback về bến đầu corridor</li>
+        </ul>
+      </li>
+    </ul>
+  </div>
+</body>
+</html>

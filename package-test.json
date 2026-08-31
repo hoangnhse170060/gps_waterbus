@@ -1,0 +1,12 @@
+{
+  "name": "test-snap-with-db",
+  "version": "1.0.0",
+  "description": "Test snap-to-station logic with real database",
+  "type": "module",
+  "scripts": {
+    "test": "node test-snap-with-db.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  }
+}
