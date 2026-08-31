@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { pointAtDistance } from '../src/river-corridor.js';
+import { pointAtDistance, projectOnPath } from '../src/river-corridor.js';
 import { createTripAutorun } from '../src/trip-autorun.js';
 
 function cleanOptionalText(value) {
@@ -66,7 +66,7 @@ function createFixture({ status = 'Boarding', progressMeters = 0 } = {}) {
     effectiveBoatStatus: () => 'Active',
     formatRecordedAt: (date) => date.toISOString(),
   });
-  return { autorun, mission, published };
+  return { autorun, mission, published, state };
 }
 
 test('tripsReset returns a safe removed trip to its end station without tripId', async () => {
@@ -93,6 +93,26 @@ test('tripsReset returns a safe removed trip to its end station without tripId',
   assert.equal(mission.movementStatus, 'AtStation');
   assert.equal(published.at(-1).tripId, null);
   assert.equal(published.at(-1).currentStationCode, 'BD');
+});
+
+test('tripsReset defaults to the river corridor instead of the raw station coordinate', async () => {
+  const { autorun, mission, state } = createFixture();
+  state.osmWaterbusCorridor = [
+    { lat: 10.7750, lng: 106.7077 },
+    { lat: 10.7768, lng: 106.7096 },
+    { lat: 10.7760, lng: 106.7100 },
+  ];
+
+  await autorun.handleTripsReset({
+    boatCode: 'WB_01',
+    removedTrips: [{ tripId: 'trip-1', status: 'Scheduled', endStationCode: 'BD' }],
+  });
+
+  const projected = projectOnPath(state.osmWaterbusCorridor, state.stations[0]);
+  assert.ok(projected);
+  assert.ok(Math.abs(mission.returnLat - projected.lat) < 1e-9);
+  assert.ok(Math.abs(mission.returnLng - projected.lng) < 1e-9);
+  assert.notEqual(mission.returnLng, state.stations[0].lng);
 });
 
 test('tripsReset requires admin confirmation for an in-progress trip', async () => {

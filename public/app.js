@@ -4207,7 +4207,7 @@ function hubStateFromData(data) {
     : '—';
   const lastState = !last.ok && last.error && /sequence|409/i.test(String(last.error || last.status)) ? 'warn' : !last.ok ? 'error' : (lastAt ? 'ok' : 'idle');
   let note = data.config?.senderEnabled
-    ? `Live ghi GPS liên tục, không lưu Neon; chỉ đẩy Azure + SignalR theo hub.`
+    ? `Sender đang hoạt động — gửi GPS theo hub.`
     : `Sender tạm dừng — chỉ giữ tại Live hub.`;
   if (last.soft || /sequence|409/i.test(String(last.error || last.status))) note = `Cảnh báo sequence — điểm vẫn ghi local.`;
   else if (last.error && !last.ok) note = `Lỗi gửi GPS: ${last.error}`;
@@ -4245,7 +4245,7 @@ function renderHubStatus(data) {
   apply(hubStatusSignalrEl, view.signalr, view.signalrState);
   apply(hubStatusLastSendEl, view.lastSend, view.lastState);
   if (hubStatusPointsEl) hubStatusPointsEl.textContent = view.points;
-  if (hubStatusNoteEl) hubStatusNoteEl.textContent = view.note;
+  if (hubStatusNoteEl) hubStatusNoteEl.hidden = true;
 }
 
 function escapeHtml(value) {

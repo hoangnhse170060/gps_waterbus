@@ -433,8 +433,9 @@ export function createTripAutorun(ctx) {
   }
 
   function tripSnapToRiverEnabled() {
-    // Mặc định OFF — tàu phải bám đúng đường đã vẽ (routeGeometry / Neon), không ép OSM corridor.
-    return String(env.TRIP_SNAP_TO_RIVER || '').trim().toLowerCase() === 'true';
+    // Mặc định ON để mọi trip bám hành lang sông. Chỉ tắt khi cấu hình rõ ràng.
+    const configured = String(env.TRIP_SNAP_TO_RIVER ?? '').trim().toLowerCase();
+    return !['false', '0', 'off', 'no'].includes(configured);
   }
 
   function resolveCoordinatesForTrip(row) {
@@ -471,7 +472,7 @@ export function createTripAutorun(ctx) {
     return snapTripPathToRiver(coordinates, stops);
   }
 
-  /** Optional: ép tuyến trip lên vạch sông (TRIP_SNAP_TO_RIVER=true). Mặc định giữ path vẽ. */
+  /** Ép tuyến trip lên vạch sông; có thể tắt bằng TRIP_SNAP_TO_RIVER=false. */
   function snapTripPathToRiver(coordinates, stops = []) {
     const base = resolveRiverBasePath({
       stations: state.stations || [],
@@ -515,7 +516,7 @@ export function createTripAutorun(ctx) {
     return out;
   }
 
-  /** Mission cũ: chỉ snap corridor khi bật TRIP_SNAP_TO_RIVER. */
+  /** Mission đang chạy cũng được đưa về corridor khi chế độ bám sông bật. */
   function ensureMissionCorridorPath(mission) {
     if (!mission || mission.corridorSnapped) return;
     if (!tripSnapToRiverEnabled()) {
@@ -791,6 +792,19 @@ export function createTripAutorun(ctx) {
       Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
     ));
     if (firstStop) {
+      const projected = Array.isArray(coordinates) && coordinates.length >= 2
+        ? projectOnPath(coordinates, { lat: Number(firstStop.lat), lng: Number(firstStop.lng) })
+        : null;
+      if (projected && Number.isFinite(Number(projected.alongMeters))) {
+        const point = pointAtDistance(coordinates, projected.alongMeters);
+        return {
+          lat: point.lat,
+          lng: point.lng,
+          heading: point.heading || 0,
+          stop: firstStop,
+          source: 'stop-projected-on-path',
+        };
+      }
       return {
         lat: Number(firstStop.lat),
         lng: Number(firstStop.lng),
@@ -905,7 +919,10 @@ export function createTripAutorun(ctx) {
         routes: [...state.routes.values()],
         osmCorridor: state.osmWaterbusCorridor || [],
       });
-      const built = buildRiverPath(from, target, base, { joinMeters: 90 });
+      const built = buildRiverPath(from, target, base, {
+        joinMeters: 90,
+        corridorOnly: tripSnapToRiverEnabled(),
+      });
       mission.approachPath = built.coordinates;
       mission.approachProgress = 0;
     }
@@ -1039,14 +1056,19 @@ export function createTripAutorun(ctx) {
       const stop = mission.stops?.[stopIndex];
       mission.stopIndex = stopIndex;
       if (stop && Number.isFinite(Number(stop.lat))) {
-        mission.currentLat = Number(stop.lat);
-        mission.currentLng = Number(stop.lng);
         const along = alongMetersToStop(
           { ...mission, progressMeters: 0 },
           stop,
         );
         if (Number.isFinite(along)) {
           mission.progressMeters = Math.min(Number(mission.lengthMeters) || along, along);
+          const point = pointAtDistance(coords, mission.progressMeters);
+          mission.currentLat = point.lat;
+          mission.currentLng = point.lng;
+          if (point.heading) mission.lastHeading = point.heading;
+        } else {
+          mission.currentLat = Number(stop.lat);
+          mission.currentLng = Number(stop.lng);
         }
       }
       return;
@@ -2196,13 +2218,24 @@ export function createTripAutorun(ctx) {
       routes: [...state.routes.values()],
       osmCorridor: state.osmWaterbusCorridor || [],
     });
-    const built = buildRiverPath(from, station, base, { joinMeters: 90 });
+    const keepOnRiver = tripSnapToRiverEnabled();
+    const built = buildRiverPath(from, station, base, {
+      joinMeters: 90,
+      corridorOnly: keepOnRiver,
+    });
     if (!Array.isArray(built.coordinates) || built.coordinates.length < 2) {
       return { ok: false, tripId: mission.tripId, boatCode: mission.boatCode, error: 'Không dựng được đường về bến' };
     }
     const returnPath = [...built.coordinates];
     const pathEnd = returnPath[returnPath.length - 1];
-    if (distanceMetersFn(pathEnd, station) > 3) returnPath.push({ lat: station.lat, lng: station.lng });
+    if (!keepOnRiver && distanceMetersFn(pathEnd, station) > 3) {
+      returnPath.push({ lat: station.lat, lng: station.lng });
+    }
+    const returnTarget = returnPath[returnPath.length - 1];
+    if (keepOnRiver) {
+      mission.currentLat = returnPath[0].lat;
+      mission.currentLng = returnPath[0].lng;
+    }
 
     mission.resetTripId = mission.tripId;
     mission.resetAt = new Date().toISOString();
@@ -2217,8 +2250,8 @@ export function createTripAutorun(ctx) {
     mission.returnStationId = station.stationId;
     mission.returnStationCode = station.stationCode;
     mission.returnStationName = station.stationName;
-    mission.returnLat = station.lat;
-    mission.returnLng = station.lng;
+    mission.returnLat = returnTarget.lat;
+    mission.returnLng = returnTarget.lng;
     mission.returnPath = returnPath;
     mission.returnProgressMeters = 0;
     mission.lengthMeters = routeLengthFn(returnPath);
