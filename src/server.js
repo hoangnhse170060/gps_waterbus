@@ -2168,23 +2168,23 @@ async function refreshFromDatabase() {
 
     // Chỉ dùng tàu demo khi DB thật sự KHÔNG có tàu nào.
     // Route trống không được xóa tàu thật (tránh hiện WB_01 giả).
-    if (!state.boats.size && parseBool(env.USE_FALLBACK_WHEN_EMPTY ?? 'true')) {
-      ensureFallbackData();
-      state.dbStatus = {
-        ok: true,
-        message: `Loaded ${boats.length} boat(s), ${state.routes.size} route(s); using demo fallback`,
-        loadedAt: new Date().toISOString(),
-      };
-    } else {
+    // if (!state.boats.size && parseBool(env.USE_FALLBACK_WHEN_EMPTY ?? 'true')) {
+    //   ensureFallbackData();
+    //   state.dbStatus = {
+    //     ok: true,
+    //     message: `Loaded ${boats.length} boat(s), ${state.routes.size} route(s); using demo fallback`,
+    //     loadedAt: new Date().toISOString(),
+    //   };
+    // } else {
       state.dbStatus = { ok: true, message: `Loaded ${boats.length} boat(s), ${state.routes.size} route(s)`, loadedAt: new Date().toISOString() };
-    }
+    // }
     // Neon là nguồn truth; bỏ cache Bảo trì/sự cố hook khi DB đã Active.
     reapplyBeBoatStatusesToCatalog();
     restoreLastPositionsToHub();
     broadcast();
   } catch (error) {
     state.dbStatus = { ok: false, message: error.message, loadedAt: new Date().toISOString() };
-    ensureFallbackData();
+    // ensureFallbackData();
     restoreLastPositionsToHub();
     broadcast();
   } finally {

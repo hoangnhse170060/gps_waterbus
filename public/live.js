@@ -1,56 +1,6 @@
 /**
- * Live GPS Map - FE Implementation
- * 
- * KIẾN TRÚC THEO SPEC BE:
- * ======================
- * 
- * 1. HIỂN THỊ TUYẾN (Routes):
- *    - FE chỉ vẽ routeGeometry từ BE (route.coordinates)
- *    - KHÔNG tự nối trackPoints/raw GPS thành tuyến
- *    - Raw GPS chỉ dùng để vẽ marker tàu (vị trí hiện tại)
- * 
- * 2. VỊ TRÍ TÀU (Boat Position):
- *    - Marker tàu: dùng GPS position hiện tại từ hub/Azure
- *    - Lịch sử di chuyển: nếu cần vẽ thì vẽ riêng, KHÔNG gọi là tuyến chuẩn
- * 
- * 3. GỬI DỮ LIỆU GPS (Tracking API):
- *    - Endpoint: POST /api/tracking/locations
- *    - Headers: X-Device-Id (từ BE register, không random), X-Tracking-Source: live
- *    - Body: messageId (random UUID OK), deviceId, boatCode, tripId, lat, lng, speedKmh, status, recordedAt, sequence
- *    - Format tọa độ: lat/lng riêng biệt (KHÔNG dùng [lng, lat] array)
- *    - sequence: tăng dần mỗi lần gửi cho cùng 1 boatCode
- * 
- * 4. DEVICE REGISTRATION (per boat):
- *    - GET /api/tracking/devices/{deviceId}/status → check active
- *    - POST /api/tracking/devices/register với body: { boatCode }
- *    - Headers: X-Live-Hook-Secret (lấy từ server config, KHÔNG nhúng trong JS public)
- *    - deviceId lưu trong localStorage theo boatCode: live_device_id_{boatCode}
- *    - Nếu POST locations trả 404 → clear deviceId local → re-register → retry
- * 
- * 5. AUTHENTICATION:
- *    - X-Live-Hook-Secret: lấy từ window.LIVE_CONFIG.hookSecret (BE inject vào HTML khi serve)
- *    - KHÔNG nhúng secret trực tiếp trong file JS public
- *    - Fallback: endpoint /api/live/hook-config (chỉ cho authenticated requests)
- * 
- * 6. NGUỒN DỮ LIỆU:
- *    - Hub/Azure là Single Source of Truth
- *    - FE/GPS chỉ parse đúng format từ BE
- * 
- * 7. PERSISTENCE (Lưu trữ vị trí):
- *    - Khi DEPLOY/KHỞI ĐỘNG: fetchAllBoatsSnapshot() lấy last known position từ DB
- *    - Khi TÀU DI CHUYỂN: sendLiveGps() → POST /api/tracking/locations
- *    - BE tự động persist vào DB, tính ETA, đếm hành khách
- *    - SignalR broadcast real-time updates về admin FE (GPS không cần nghe)
- *    - Đảm bảo tàu không mất vị trí khi restart/redeploy
- * 
- * 8. LẤY VỊ TRÍ CUỐI CÙNG:
- *    - GET /api/tracking/boats/{boatCode}/latest
- *    - Response: { lat, lng, speedKmh, heading, status, recordedAt, eta, passengerCount }
- * 
- * 9. REAL-TIME UPDATES (Admin FE only):
- *    - SignalR Hub: /hubs/tracking
- *    - GPS không cần kết nối SignalR (chỉ POST data)
- *    - Admin map view nghe SignalR để update UI realtime
+ * Live map reads the Node relay snapshot/SSE stream. The relay owns Azure
+ * authentication, GPS device lookup and sequence generation.
  */
 
 // Chỉ coi "đã cập bến" khi sát marker bến (trước 60m báo sớm khi còn ngoài sông).
@@ -64,115 +14,6 @@ const USER_PIN_HUB_CATCHUP_M = 40;
 /** Khi kéo tay: gửi GPS lên Azure tối thiểu mỗi khoảng này để FE bám kịp. */
 const DRAG_SEND_MS = 350;
 
-// ============================================================
-// DEVICE REGISTRATION & AUTH
-// ============================================================
-
-// Lấy hook secret từ server config (BE inject vào HTML, không nhúng trong JS public)
-// Pattern: BE serve HTML với <script>window.LIVE_CONFIG={hookSecret:'...'}</script>
-// hoặc endpoint /api/live/hook-config trả về secret (chỉ cho authenticated requests)
-async function getHookSecret() {
-  // Option 1: Server inject vào window (preferred - secret không xuất hiện trong file JS)
-  if (typeof window !== 'undefined' && window.LIVE_CONFIG && window.LIVE_CONFIG.hookSecret) {
-    return window.LIVE_CONFIG.hookSecret;
-  }
-  
-  // Option 2: Fallback - endpoint BE bảo vệ
-  try {
-    const response = await fetch('/api/live/hook-config', { cache: 'no-store' });
-    if (response.ok) {
-      const data = await response.json();
-      return data.hookSecret || null;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-// Lấy deviceId cho boatCode từ localStorage
-function getStoredDeviceId(boatCode) {
-  return localStorage.getItem(`live_device_id_${boatCode}`);
-}
-
-// Lưu deviceId cho boatCode vào localStorage
-function setStoredDeviceId(boatCode, deviceId) {
-  localStorage.setItem(`live_device_id_${boatCode}`, deviceId);
-}
-
-// Xoá deviceId cho boatCode (khi 404, expired, hoặc revoked)
-function clearStoredDeviceId(boatCode) {
-  localStorage.removeItem(`live_device_id_${boatCode}`);
-}
-
-/**
- * Đăng ký/verify device với BE.
- * 
- * Flow:
- * 1. Check localStorage có deviceId cho boatCode này không
- * 2. Nếu có: GET /api/tracking/devices/{deviceId}/status
- *    - Nếu active=true: dùng deviceId này
- *    - Nếu active=false/404: xoá, đăng ký mới
- * 3. Nếu không có: POST /api/tracking/devices/register với { boatCode }
- * 
- * Headers: X-Live-Hook-Secret (lấy từ server config, không hardcode)
- */
-async function ensureDeviceRegistered(boatCode) {
-  const secret = await getHookSecret();
-  const authHeaders = {
-    'Content-Type': 'application/json',
-    ...(secret && { 'X-Live-Hook-Secret': secret }),
-  };
-  
-  // 1. Check existing deviceId
-  const stored = getStoredDeviceId(boatCode);
-  if (stored) {
-    try {
-      const response = await fetch(`/api/tracking/devices/${encodeURIComponent(stored)}/status`, {
-        headers: authHeaders,
-        cache: 'no-store',
-      });
-      if (response.ok) {
-        const data = await response.json();
-        if (data.active !== false) {
-          return stored; // Device vẫn active
-        }
-      }
-      // Device không active hoặc bị xoá → xoá local và đăng ký lại
-      clearStoredDeviceId(boatCode);
-    } catch {
-      // Network error → vẫn dùng deviceId cũ, sẽ retry khi POST locations
-    }
-  }
-  
-  // 2. Đăng ký device mới cho boatCode này
-  try {
-    const response = await fetch('/api/tracking/devices/register', {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({ boatCode }),
-    });
-    
-    if (!response.ok) {
-      throw new Error(`Cannot register device: HTTP ${response.status}`);
-    }
-    
-    const data = await response.json();
-    const deviceId = data.deviceId;
-    if (!deviceId) {
-      throw new Error('No deviceId in response');
-    }
-    
-    setStoredDeviceId(boatCode, deviceId);
-    return deviceId;
-  } catch (error) {
-    console.error(`Device registration failed for ${boatCode}:`, error);
-    throw error;
-  }
-}
-
-// Sequence counter cho mỗi boatCode (tăng dần trong session)
-const gpsSequenceByBoat = new Map();
 const ROUTE_STYLE = {
   color: '#0f766e',
   weight: 2.5,
@@ -2730,75 +2571,23 @@ async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = 
   const sendToTarget = sendAzureSelectEl.value === 'on';
   const authority = holdAuthority == null ? !quiet : Boolean(holdAuthority);
   
-  // Increment sequence cho boatCode này
-  const currentSeq = gpsSequenceByBoat.get(boatCode) || 0;
-  const sequence = currentSeq + 1;
-  gpsSequenceByBoat.set(boatCode, sequence);
-  
-  // Lấy deviceId đã đăng ký cho boatCode này (phải await vì async)
-  let deviceId;
   try {
-    deviceId = await ensureDeviceRegistered(boatCode);
-  } catch (error) {
-    if (!quiet) {
-      sendStatusEl.textContent = 'Lỗi đăng ký device';
-      toast(`Không thể đăng ký device cho ${boatCode}`, 'err');
-    }
-    return { ok: false, skipped: false, reason: 'device_registration_failed', error: String(error) };
-  }
-  
-  const messageId = crypto.randomUUID(); // messageId CÓ THỂ dùng random UUID (khác với deviceId)
-  const recordedAt = new Date().toISOString();
-  const tripId = trip ? String(trip.id || trip.tripId || '') : null;
-  
-  // SPEC BE: POST /api/tracking/locations
-  // - Headers: X-Device-Id (từ BE, không random), X-Tracking-Source: live
-  // - Body: messageId (random UUID OK), deviceId, boatCode, tripId, lat, lng, speedKmh, status, recordedAt, sequence
-  // - BE tự động persist vào DB, tính ETA, đếm hành khách
-  // - Nếu 404: device không tồn tại/locked → xoá local deviceId → retry
-  try {
-    const response = await fetch('/api/tracking/locations', {
+    // Node relay owns device lookup, sequence and Azure authentication.
+    const response = await fetch('/api/live/gps', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Device-Id': deviceId,
-        'X-Tracking-Source': 'live',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messageId,
-        deviceId,
         boatCode,
-        tripId,
         lat,
         lng,
         speedKmh,
         heading: getBoatHeading(boatCode),
         status,
-        recordedAt,
-        sequence,
-        // Legacy fields cho compatibility (nếu BE cần)
         sendToTarget,
         quiet,
         holdAuthority: authority,
       }),
     });
-    
-    // Handle 404: device không tồn tại hoặc bị khoá
-    if (response.status === 404) {
-      clearStoredDeviceId(boatCode);
-      console.warn(`Device 404 for ${boatCode}, re-registering...`);
-      
-      // Retry once (sẽ đăng ký device mới)
-      if (!options._retry) {
-        return sendLiveGps(boatCode, lat, lng, { ...options, _retry: true });
-      } else {
-        if (!quiet) {
-          sendStatusEl.textContent = 'Device bị khoá';
-          toast(`Device cho ${boatCode} không khả dụng`, 'err');
-        }
-        return { ok: false, skipped: false, reason: 'device_locked', status: 404 };
-      }
-    }
     const body = await response.json();
     if (body?.skipped) {
       if (!quiet && sendStatusEl) {
@@ -3460,15 +3249,10 @@ async function fetchBoatLatestPosition(boatCode) {
   }
 }
 
-/**
- * Lấy snapshot tất cả tàu từ tracking API.
- * Thay thế luồng cũ GET /api/snapshot.
- */
+/** Lấy catalog, trạng thái và vị trí tàu đã được Node relay hợp nhất. */
 async function fetchAllBoatsSnapshot() {
   try {
-    // BE cần cung cấp endpoint lấy tất cả boats
-    // Hoặc FE gọi /api/tracking/boats/{code}/latest cho từng tàu
-    const response = await fetch('/api/tracking/boats/snapshot', {
+    const response = await fetch(`/api/snapshot?t=${Date.now()}`, {
       cache: 'no-store',
     });
     if (!response.ok) return null;
@@ -3569,34 +3353,89 @@ async function connectSignalR() {
   }
 }
 
-// DEPRECATED: Luồng cũ dùng /api/snapshot (đã xoá theo spec BE mới)
 async function pullSnapshot({ force = false } = {}) {
-  console.warn('pullSnapshot() is deprecated. Use fetchAllBoatsSnapshot() instead.');
-  return fetchAllBoatsSnapshot();
+  if (snapshotPollBusy) return;
+  // SSE đang sống và mới nhận data → không cần poll (trừ force).
+  if (!force && sseAlive && lastEventsAt && (Date.now() - lastEventsAt) < 4000) return;
+  snapshotPollBusy = true;
+  try {
+    const data = await fetchAllBoatsSnapshot();
+    if (data && typeof data === 'object' && !data.error) {
+      lastEventsAt = Date.now();
+      render(data);
+    }
+  } finally {
+    snapshotPollBusy = false;
+  }
 }
 
-// DEPRECATED: Luồng cũ dùng SSE (đã thay bằng SignalR theo spec BE mới)
 function startSnapshotPoll() {
-  console.warn('startSnapshotPoll() is deprecated. SignalR provides real-time updates.');
+  if (snapshotPollTimer) clearInterval(snapshotPollTimer);
+  snapshotPollTimer = setInterval(() => {
+    pullSnapshot().catch(() => {});
+  }, 2000);
+  pullSnapshot({ force: true }).catch(() => {});
 }
 
 function scheduleEventsReconnect() {
-  console.warn('scheduleEventsReconnect() is deprecated. Use SignalR with automatic reconnect.');
+  if (eventsReconnectTimer) return;
+  const delay = eventsBackoffMs;
+  eventsBackoffMs = Math.min(15000, Math.round(eventsBackoffMs * 1.6));
+  eventsReconnectTimer = setTimeout(() => {
+    eventsReconnectTimer = null;
+    connectEvents();
+  }, delay);
 }
 
 function connectEvents() {
-  console.warn('connectEvents() is deprecated. Use connectSignalR() instead.');
+  if (eventsSource) {
+    eventsSource.onmessage = null;
+    eventsSource.onerror = null;
+    try { eventsSource.close(); } catch { /* ignore */ }
+    eventsSource = null;
+  }
+  sseAlive = false;
+  try {
+    eventsSource = new EventSource(`/events?t=${Date.now()}`);
+  } catch {
+    scheduleEventsReconnect();
+    return;
+  }
+  eventsSource.onopen = () => {
+    sseAlive = true;
+    eventsBackoffMs = 1000;
+  };
+  eventsSource.onmessage = (message) => {
+    try {
+      const data = JSON.parse(message.data);
+      lastEventsAt = Date.now();
+      sseAlive = true;
+      eventsBackoffMs = 1000;
+      render(data);
+    } catch {
+      // Snapshot polling remains available for malformed events.
+    }
+  };
+  eventsSource.onerror = () => {
+    sseAlive = false;
+    try { eventsSource?.close(); } catch { /* ignore */ }
+    eventsSource = null;
+    pullSnapshot({ force: true }).catch(() => {});
+    scheduleEventsReconnect();
+  };
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
-  // Tab tỉnh lại sau ERR_NETWORK_IO_SUSPENDED — SignalR auto-reconnect sẽ xử lý
-  console.log('Tab visible - SignalR will auto-reconnect if needed');
+  eventsBackoffMs = 1000;
+  pullSnapshot({ force: true }).catch(() => {});
+  if (!sseAlive) connectEvents();
 });
 
 window.addEventListener('online', () => {
-  // Network online — SignalR auto-reconnect sẽ xử lý
-  console.log('Network online - SignalR will auto-reconnect if needed');
+  eventsBackoffMs = 1000;
+  pullSnapshot({ force: true }).catch(() => {});
+  connectEvents();
 });
 
 boatSelectEl?.addEventListener('blur', () => {
@@ -3889,33 +3728,11 @@ async function resyncAzurePositions() {
   }
 }
 
-// Khởi động ứng dụng
-// GPS: chỉ cần POST /api/tracking/locations (device register khi cần)
-// Admin FE: có thể dùng SignalR cho realtime updates (optional)
-(async () => {
-  try {
-    // 1. Lấy snapshot ban đầu (nếu có endpoint)
-    const snapshot = await fetchAllBoatsSnapshot();
-    if (snapshot) {
-      render(snapshot);
-    }
-    
-    // 2. Resync Azure positions
-    await resyncAzurePositions();
-    
-    // 3. Start heartbeat (sẽ register device khi gửi GPS lần đầu)
-    startHeartbeat();
-    
-    // 4. Optional: Kết nối SignalR cho real-time updates (admin view)
-    // GPS không cần SignalR - chỉ POST data
-    // Nếu đây là admin map view, uncomment dòng sau:
-    // await connectSignalR();
-  } catch (error) {
-    console.error('App initialization failed:', error);
-    // Fallback: vẫn start heartbeat để user có thể kéo tàu
-    startHeartbeat();
-  }
-})();
+connectEvents();
+startSnapshotPoll();
+resyncAzurePositions().finally(() => {
+  startHeartbeat();
+});
 
 /** Đếm ngược xuất bến (mm:ss) cập nhật mỗi giây khi tàu đang WaitingAtStop. */
 setInterval(() => {
