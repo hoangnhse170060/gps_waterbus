@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { routeLength } from '../src/geo-distance.js';
 import { pointAtDistance, projectOnPath } from '../src/river-corridor.js';
 import { createTripAutorun } from '../src/trip-autorun.js';
 
@@ -157,4 +158,28 @@ test('tripsReset never removes a trip listed in keptActiveTrips', async () => {
   assert.equal(result.results[0].skipped, true);
   assert.equal(mission.status, 'Boarding');
   assert.equal(published.length, 0);
+});
+
+test('completed trip publishes a final idle position without tripId', async () => {
+  const { autorun, mission, published } = createFixture({ status: 'Running' });
+  mission.coordinates = [
+    { lat: 10.7752, lng: 106.7073 },
+    { lat: 10.7768, lng: 106.7096 },
+  ];
+  mission.lengthMeters = routeLength(mission.coordinates);
+  mission.progressMeters = mission.lengthMeters - 1;
+  mission.currentLat = mission.coordinates[1].lat;
+  mission.currentLng = mission.coordinates[1].lng;
+  mission.stopIndex = mission.stops.length;
+  mission.departureTime = new Date(Date.now() - 60_000).toISOString();
+  mission.arrivalTime = new Date(Date.now() + 60_000).toISOString();
+  mission.lastTickAt = Date.now() - 1000;
+
+  await autorun.tickTripMissions();
+
+  assert.equal(mission.status, 'Completed');
+  assert.equal(published.at(-1).tripId, null);
+  assert.equal(published.at(-1).routeCode, null);
+  assert.equal(published.at(-1).fromTrip, false);
+  assert.equal(published.at(-1).status, 'idle');
 });

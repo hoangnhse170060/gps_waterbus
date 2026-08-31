@@ -1980,7 +1980,6 @@ export function createTripAutorun(ctx) {
     mission.movementStatus = 'Completed';
     mission.completedAt = new Date().toISOString();
     mission.updatedAt = mission.completedAt;
-    await publishTripPoint(mission, { speedKmh: 0, status: 'idle' });
     const complete = await completeTripOnBe(mission.tripId, {
       boatCode: mission.boatCode,
       completedAt: formatRecordedAt ? formatRecordedAt(new Date()) : new Date().toISOString(),
@@ -1991,6 +1990,24 @@ export function createTripAutorun(ctx) {
       console.warn(`[trip-gps] complete FAIL ${mission.tripId}: ${mission.lastError}`);
     } else {
       console.log(`[trip-gps] COMPLETE ${mission.boatCode} trip=${mission.tripId}`);
+    }
+    // Điểm cuối trước đó đã được gửi kèm trip. Sau complete phải gửi thêm idle
+    // không có trip để Azure, hub và catalog cùng nhả liên kết chuyến.
+    const detached = await publishLiveGpsPosition({
+      boatCode: mission.boatCode,
+      lat: mission.currentLat,
+      lng: mission.currentLng,
+      heading: mission.lastHeading,
+      speedKmh: 0,
+      status: 'idle',
+      tripId: null,
+      routeCode: null,
+      sendToTarget: true,
+      fromTrip: false,
+      holdAuthority: true,
+    });
+    if (!(detached.ok || detached.skipped || detached.soft)) {
+      mission.lastError = detached.error || detached.warning || 'detach trip publish failed';
     }
   }
 

@@ -1058,9 +1058,13 @@ function nextStationAlongCorridor(latlng, stations = latest?.stations) {
 }
 
 function routeLabelForBoat(code) {
-  const boat = (latest?.boats || []).find((b) => String(b.boatCode) === String(code));
-  const name = String(boat?.routeName || '').trim();
-  const routeCode = String(boat?.routeCode || '').trim();
+  const trip = activeTripForBoat(code);
+  if (!trip) return '';
+  const routeCode = String(trip.routeCode || '').trim();
+  const route = (latest?.routes || []).find((row) => (
+    String(row.routeCode || '').trim().toLowerCase() === routeCode.toLowerCase()
+  ));
+  const name = String(route?.routeName || '').trim();
   if (name && routeCode) return `${routeCode} · ${name}`;
   if (name) return name;
   if (routeCode) return routeCode;
@@ -1959,7 +1963,7 @@ const LIVE_FOCUS_ROUTE_STYLE = {
   dashArray: null,
 };
 
-/** Mã tuyến đang gắn với tàu (trip ưu tiên, rồi catalog boat). */
+/** Chỉ focus tuyến khi tàu thực sự có trip mission đang hoạt động. */
 function routeCodesForBoat(code, data = latest) {
   const key = String(code || '').trim();
   if (!key) return new Set();
@@ -1967,14 +1971,11 @@ function routeCodesForBoat(code, data = latest) {
   const trip = activeTripForBoat(key, data);
   const tripRoute = String(trip?.routeCode || '').trim();
   if (tripRoute) codes.add(tripRoute.toLowerCase());
-  const boat = (data?.boats || []).find((b) => String(b.boatCode) === key);
-  const boatRoute = String(boat?.routeCode || '').trim();
-  if (boatRoute) codes.add(boatRoute.toLowerCase());
   return codes;
 }
 
 function routeMatchesBoatFocus(route, focusCodes) {
-  if (!focusCodes?.size) return true;
+  if (!focusCodes?.size) return false;
   const code = String(route?.routeCode || '').trim().toLowerCase();
   return Boolean(code && focusCodes.has(code));
 }
