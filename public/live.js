@@ -1493,16 +1493,17 @@ function fallbackLatLngForBoat(code, index, data = latest) {
   if (pin && Number.isFinite(Number(pin.lat)) && Number.isFinite(Number(pin.lng)) && !pin.user) {
     return { lat: Number(pin.lat), lng: Number(pin.lng) };
   }
+  // Neo tàu về bến đầu tiên (không phân tán) khi không có GPS.
   const corridor = corridorStations(data?.stations);
   if (corridor.length) {
-    const s = corridor[index % corridor.length];
+    const s = corridor[0];
     return { lat: Number(s.lat), lng: Number(s.lng) };
   }
   const stations = (data?.stations || []).filter((s) => (
     Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
   ));
   if (stations.length) {
-    const s = stations[index % stations.length];
+    const s = stations[0];
     return { lat: Number(s.lat), lng: Number(s.lng) };
   }
   return { lat: 10.776, lng: 106.708 };
