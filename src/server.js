@@ -20,6 +20,7 @@ import { waterbusSchedulePublic } from './waterbus-schedule.js';
 import { createSignalRRelay } from './signalr-relay.js';
 import { distanceMeters, routeLength } from './geo-distance.js';
 import { createTripAutorun } from './trip-autorun.js';
+import { liveGpsOwnerMode } from './live-gps-ownership.js';
 import {
   advanceAlongCoordinates,
   buildRiverPath,
@@ -2251,7 +2252,7 @@ function stripTripGpsFields(payload, mode) {
 }
 
 function applyTargetGpsPayloadCompatibility(payload, fromTrip) {
-  if (!fromTrip) return payload;
+  if (!fromTrip || !parseBool(env.TARGET_GPS_ALLOW_TRIP_FIELD_FALLBACK || 'false')) return payload;
   const endpoint = getTargetEndpoint();
   if (
     targetGpsPayloadCompatibility.endpoint !== endpoint
@@ -2537,10 +2538,27 @@ async function publishLiveGpsPosition(body = {}) {
     };
   }
 
-  // Chỉ tạm dừng Live GPS khi đang vẽ/survey. Trip + cứu hộ vẫn phải gửi liên tục
-  // để FE (LIVE TRACKING) luôn thấy tàu — heartbeat/rescue/trip cùng publish.
+  // Trip/cứu hộ tự publish GPS; các request Live thường không được ghi đè mission.
   const fromRescue = body.fromRescue === true || body._fromRescue === true;
   const fromTrip = body.fromTrip === true || body._fromTrip === true;
+
+  const ownerMode = liveGpsOwnerMode({
+    fromTrip,
+    fromRescue,
+    tripOwned: tripAutorun.isBoatInActiveTripMission(boatCode),
+    rescueOwned: isBoatInActiveRescueMission(boatCode),
+  });
+  if (ownerMode) {
+    return {
+      ok: true,
+      skipped: true,
+      status: 200,
+      mode: ownerMode,
+      error: ownerMode === 'trip-owned'
+        ? `Tàu ${boatCode} đang chạy trip — bỏ qua GPS Live không có quyền trip.`
+        : `Tàu ${boatCode} đang cứu hộ — bỏ qua GPS Live không có quyền cứu hộ.`,
+    };
+  }
 
   // Trip không được đẩy tàu sự cố / bảo trì / inactive (chỉ chặn khi còn di chuyển).
   if (
@@ -2754,14 +2772,20 @@ async function publishLiveGpsPosition(body = {}) {
         };
       }
     }
-    // 400: thử bỏ tripId trước (giữ ETA), rồi mới chỉ vị trí — contract muốn tripId nhưng BE từng reject.
-    if (!ok && statusCode === 400 && fromTrip && (
+    // Chỉ tương thích BE cũ khi được bật rõ ràng; mặc định phải giữ metadata của trip.
+    if (
+      parseBool(env.TARGET_GPS_ALLOW_TRIP_FIELD_FALLBACK || 'false')
+      && !ok
+      && statusCode === 400
+      && fromTrip
+      && (
       azurePayload.tripId
       || azurePayload.routeCode
       || azurePayload.nextStationId
       || azurePayload.remainingDistanceKmToNextStation != null
       || azurePayload.remainingMinutesToNextStation != null
-    )) {
+      )
+    ) {
       const retryBodies = [];
       if (azurePayload.tripId || azurePayload.routeCode) {
         retryBodies.push({

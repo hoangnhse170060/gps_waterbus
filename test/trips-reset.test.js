@@ -13,6 +13,7 @@ function createFixture({ status = 'Boarding', progressMeters = 0 } = {}) {
   const published = [];
   const mission = {
     tripId: 'trip-1',
+    routeCode: 'RT-01',
     boatCode: 'WB_01',
     status,
     movementStatus: status === 'Running' ? 'Moving' : 'Boarding',
@@ -28,6 +29,8 @@ function createFixture({ status = 'Boarding', progressMeters = 0 } = {}) {
       { stationId: 'st-tt', stationCode: 'ST-TT', stationName: 'Thu Thiem', lat: 10.7768, lng: 106.7096 },
       { stationId: 'st-bd', stationCode: 'ST-BD', stationName: 'Bach Dang', lat: 10.7752, lng: 106.7073 },
     ],
+    nextStationId: 'st-tt',
+    nextStopName: 'Thu Thiem',
     updatedAt: new Date().toISOString(),
   };
   const state = {
@@ -101,6 +104,7 @@ test('tripsReset snaps a boat without a new trip to its nearest station', async 
   assert.equal(mission.returnReason, 'NearestAvailableStation');
   assert.equal(result.results[0].snapped, true);
   assert.equal(published.at(-1).tripId, null);
+  assert.equal(published.at(-1).fromTrip, true);
   assert.equal(published.at(-1).movementStatus, 'AtStation');
   assert.equal(autorun.tripMissionsPublic()[0].tripId, null);
   assert.equal(published.at(-1).currentStationCode, 'ST-TT');
@@ -325,5 +329,8 @@ test('active trip keeps GPS on its received route geometry', async () => {
   assert.ok(Math.abs(gps.lat - 10.7700) < 1e-9);
   assert.deepEqual(mission.coordinates, receivedRoute);
   assert.equal(gps.tripId, mission.tripId);
+  assert.equal(gps.routeCode, mission.routeCode);
+  assert.equal(gps.nextStationId, mission.nextStationId);
+  assert.equal(gps.nextStationName, mission.nextStopName);
   assert.equal(gps.fromTrip, true);
 });

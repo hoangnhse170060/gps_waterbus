@@ -2571,10 +2571,16 @@ async function sendDragGpsThrottled(code, lat, lng) {
 
 async function sendLiveGps(boatCode, lat, lng, { quiet = false, holdAuthority = null } = {}) {
   if (!quiet && sending) return { ok: false, skipped: true, reason: 'busy' };
-  // Kéo/gửi tay: không đè trip/rescue. Heartbeat (quiet) vẫn gửi liên tục.
-  if (!quiet && (activeTripForBoat(boatCode) || isBoatInActiveAutomatedRescue(boatCode))) {
-    toast(dragLockReason(boatCode) || 'GPS đang tự chạy — không gửi tay', 'warn');
-    return { ok: false, skipped: true, reason: 'locked' };
+  const tripOwned = Boolean(activeTripForBoat(boatCode));
+  const rescueOwned = isBoatInActiveAutomatedRescue(boatCode);
+  // Trip/rescue autorun là nguồn GPS duy nhất khi mission đang chạy.
+  if (tripOwned || rescueOwned) {
+    if (!quiet) toast(dragLockReason(boatCode) || 'GPS đang tự chạy — không gửi tay', 'warn');
+    return {
+      ok: true,
+      skipped: true,
+      reason: rescueOwned ? 'rescue' : 'trip',
+    };
   }
   if (!quiet) {
     sending = true;
@@ -2788,6 +2794,20 @@ async function heartbeatAllBoats() {
     }
     for (let i = 0; i < codes.length; i += 1) {
       const code = codes[i];
+      const ownerReason = isBoatInActiveAutomatedRescue(code)
+        ? 'rescue'
+        : (activeTripForBoat(code) ? 'trip' : null);
+      if (ownerReason) {
+        results.push({
+          boatCode: code,
+          ok: true,
+          skipped: true,
+          reason: ownerReason,
+          status: 200,
+          error: null,
+        });
+        continue;
+      }
       // Đang kéo đúng tàu này: drag throttle lo gửi — skip heartbeat trùng.
       if (dragging && draggingBoatCode === code) {
         results.push({

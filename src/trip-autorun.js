@@ -2203,7 +2203,8 @@ export function createTripAutorun(ctx) {
       tripId: null,
       routeCode: null,
       sendToTarget: true,
-      fromTrip: false,
+      // ReturnToBase vẫn do trip autorun sở hữu, nhưng đã gỡ metadata của trip bị xóa.
+      fromTrip: true,
       holdAuthority: true,
     });
     mission.lastError = result.ok || result.skipped || result.soft
