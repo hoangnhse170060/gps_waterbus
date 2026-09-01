@@ -1540,6 +1540,11 @@ function recentUserPinHolds(code, hub) {
  * Không tự nối trackPoints thành tuyến.
  */
 function boatMapLatLng(code, hub, index, data = latest) {
+  // Khi trip xác nhận đang ở bến, vị trí bến là authoritative. Hub/Azure hoặc
+  // pin kéo tay cũ có thể đến trễ và không được giữ marker ngoài sông.
+  const tripStation = tripStationLatLng(code, data);
+  if (tripStation) return tripStation;
+
   const pin = pinnedFor(code);
   // Pin user đang kéo tay
   if (pin?.user && recentUserPinHolds(code, hub)) {
@@ -1674,6 +1679,38 @@ function activeTripForBoat(code, data = latest) {
     if (String(row.boatCode || '').trim() !== key) return false;
     return ['Pending', 'ToDeparture', 'ToHandoff', 'Boarding', 'Running', 'WaitingAtStop', 'Paused'].includes(String(row.status || ''));
   }) || null;
+}
+
+function normalizedStationKey(value) {
+  return String(value || '').trim().toUpperCase().replace(/^ST[-_]?/, '');
+}
+
+function tripStationLatLng(code, data = latest) {
+  const trip = activeTripForBoat(code, data);
+  if (!trip) return null;
+  const status = String(trip.status || '');
+  const movementStatus = String(trip.movementStatus || '').toLowerCase();
+  if (!['Boarding', 'WaitingAtStop'].includes(status) && movementStatus !== 'atstation') {
+    return null;
+  }
+
+  const stationRef = trip.currentStationCode
+    || trip.waitingStationCode
+    || trip.nextStopCode
+    || trip.nextStationId;
+  const stationKey = normalizedStationKey(stationRef);
+  const station = (data?.stations || []).find((row) => {
+    if (stationRef && String(row.stationId || '').trim() === String(stationRef).trim()) return true;
+    return stationKey && normalizedStationKey(row.stationCode) === stationKey;
+  });
+  if (station && Number.isFinite(Number(station.lat)) && Number.isFinite(Number(station.lng))) {
+    return { lat: Number(station.lat), lng: Number(station.lng), source: 'trip-station' };
+  }
+
+  const lat = Number(trip.currentLat);
+  const lng = Number(trip.currentLng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat, lng, source: 'trip-station-mission' };
 }
 
 /** Ưu tiên tốc độ trip GPS / hub; fallback tốc độ kéo tay local. */
@@ -2150,8 +2187,11 @@ function renderHubBoats(hubBoats) {
   for (const code of codes) {
     const hub = hubByCode.get(code);
     const open = openIncidentForBoat(code);
+    const tripStation = tripStationLatLng(code, latest);
     let seed;
-    if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
+    if (tripStation) {
+      seed = tripStation;
+    } else if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
       seed = { lat: Number(hub.lat), lng: Number(hub.lng) };
     } else if (open && Number.isFinite(Number(open.lat)) && Number.isFinite(Number(open.lng))) {
       seed = { lat: Number(open.lat), lng: Number(open.lng) };

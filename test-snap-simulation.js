@@ -34,7 +34,8 @@ function nearestStationAny(latlng, stations) {
 // Mock data - BẠN CẦN ĐIỀN DATA THẬT VÀO ĐÂY
 const mockStations = [
   { stationCode: 'TNC', stationName: 'Thanh Niên Center', lat: 10.7756, lng: 106.7012 },
-  { stationCode: 'BS', stationName: 'Bạch Đằng', lat: 10.7712, lng: 106.7056 },
+  { stationCode: 'ST-BD', stationName: 'Bạch Đằng', lat: 10.7712, lng: 106.7056 },
+  { stationCode: 'ST-BS', stationName: 'Ba Son', lat: 10.7820162, lng: 106.7092747 },
   { stationCode: 'BD', stationName: 'Bình Đông', lat: 10.7489, lng: 106.6823 },
   { stationCode: 'T1', stationName: 'Terminal 1', lat: 10.7234, lng: 106.6891 },
 ];
@@ -93,12 +94,35 @@ const testScenarios = [
     hasRescue: true,
     hasIncident: false,
     expectedBehavior: 'use-hub-position'
+  },
+  {
+    name: 'Test 5: Tàu WaitingAtStop - bỏ hub ngoài sông và nhảy đúng bến',
+    boatCode: 'BS',
+    hubPosition: { lat: 10.7702, lng: 106.7068 },
+    hasTrip: true,
+    tripStatus: 'WaitingAtStop',
+    movementStatus: 'AtStation',
+    currentStationCode: 'ST-BS',
+    tripPosition: { lat: 10.7756, lng: 106.7012 },
+    hasRescue: false,
+    hasIncident: false,
+    expectedBehavior: 'snap-to-trip-station'
   }
 ];
 
 // Simulate logic từ boatMapLatLng
 function simulateBoatPosition(scenario, stations) {
-  const { boatCode, hubPosition, hasTrip, hasRescue, hasIncident } = scenario;
+  const {
+    boatCode,
+    hubPosition,
+    hasTrip,
+    hasRescue,
+    hasIncident,
+    tripStatus,
+    movementStatus,
+    currentStationCode,
+    tripPosition,
+  } = scenario;
   
   console.log('\n' + '='.repeat(70));
   console.log(`🧪 ${scenario.name}`);
@@ -112,8 +136,22 @@ function simulateBoatPosition(scenario, stations) {
   // Logic từ boatMapLatLng
   let result;
   let source;
-  
-  if (hasTrip || hasRescue || hasIncident) {
+
+  const tripIsAtStation = hasTrip && (
+    ['Boarding', 'WaitingAtStop'].includes(String(tripStatus || ''))
+    || String(movementStatus || '').toLowerCase() === 'atstation'
+  );
+  if (tripIsAtStation) {
+    const stationKey = String(currentStationCode || '').replace(/^ST[-_]?/i, '').toUpperCase();
+    const station = stations.find((row) => (
+      String(row.stationCode || '').replace(/^ST[-_]?/i, '').toUpperCase() === stationKey
+    ));
+    result = station
+      ? { lat: station.lat, lng: station.lng }
+      : { lat: tripPosition.lat, lng: tripPosition.lng };
+    source = station ? 'trip-station' : 'trip-station-mission';
+    console.log(`\n📍 Kết quả: Trip đang ở bến → dùng đúng tọa độ bến`);
+  } else if (hasTrip || hasRescue || hasIncident) {
     // Có trip/rescue/incident → dùng hub
     result = { lat: hubPosition.lat, lng: hubPosition.lng };
     source = 'hub';
@@ -142,9 +180,9 @@ function simulateBoatPosition(scenario, stations) {
   
   // Verify kết quả
   const expected = scenario.expectedBehavior;
-  const actualBehavior = source === 'nearest-station-no-trip' 
-    ? 'snap-to-nearest-station' 
-    : 'use-hub-position';
+  const actualBehavior = source === 'nearest-station-no-trip'
+    ? 'snap-to-nearest-station'
+    : (source.startsWith('trip-station') ? 'snap-to-trip-station' : 'use-hub-position');
   
   if (expected === actualBehavior) {
     console.log(`\n✅ PASS: Kết quả đúng như mong đợi!`);
@@ -180,4 +218,5 @@ if (passed === total) {
   console.log(`\n🎉 TẤT CẢ TEST ĐỀU PASS! Logic hoạt động chính xác!`);
 } else {
   console.log(`\n⚠️  Có ${total - passed} test bị fail. Cần kiểm tra lại logic.`);
+  throw new Error(`${total - passed} snap simulation test(s) failed`);
 }
