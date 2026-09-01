@@ -1077,8 +1077,11 @@ input.is-invalid {
 
 .station-flag {
   position: relative;
+  left: 5px;
+  top: 4px;
   width: 28px;
   height: 36px;
+  cursor: pointer;
 }
 
 .station-flag-pole {

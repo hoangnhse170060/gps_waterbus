@@ -1815,14 +1815,14 @@ function closeAsEndStation(station) {
   seedToEndStation();
 }
 
-function seedFromStation() {
-  const station = getSelectedStation();
+function seedFromStation(stationOverride = null, { preserveEnd = false } = {}) {
+  const station = stationOverride || getSelectedStation();
   if (!station) {
     captureStatusEl.textContent = 'Chọn bến xuất phát trước.';
     return;
   }
   clearCapturePoints();
-  setStationComboValue('end', '', { emitChange: false });
+  if (!preserveEnd) setStationComboValue('end', '', { emitChange: false });
   addCapturePoint({ lat: station.lat, lng: station.lng }, {
     source: 'station',
     label: station.stationName,
@@ -2287,6 +2287,18 @@ function syncControlMarkers() {
 function bindCaptureMarkerEvents(marker, index) {
   marker.on('click', (event) => {
     if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+    const point = captureState.points[index];
+    if (point?.stationId) {
+      const station = findStationInCatalog(point.stationId) || {
+        stationId: point.stationId,
+        stationName: point.label,
+        stationCode: null,
+        lat: point.lat,
+        lng: point.lng,
+      };
+      handleStationClick(station);
+      return;
+    }
     captureState.selectedWaypointIndex = index;
     captureState.selectedSegmentIndex = index > 0 ? index : (captureState.points.length > 1 ? 1 : null);
     if (captureState.selectedSegmentIndex > 0) {
@@ -3944,6 +3956,8 @@ function showSelectedRouteStops(routeId) {
         isLast: index === stops.length - 1,
       }),
       zIndexOffset: 500,
+      interactive: false,
+      keyboard: false,
     });
     marker.bindTooltip(
       `#${order} · ${stop.stationName || stop.stationCode || stop.stationId}`,
@@ -4012,23 +4026,25 @@ function renderStations(stations) {
     let layer = stationLayers.get(station.stationId);
     if (!layer) {
       layer = L.marker([station.lat, station.lng], { icon, zIndexOffset: 400 }).addTo(map);
+      layer._surveyStation = station;
       layer.bindTooltip(`${station.stationName} (${station.stationCode})`, {
         direction: 'top',
         offset: [0, -28],
       });
       layer.on('click', (event) => {
         if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
-        handleStationClick(station);
+        handleStationClick(layer._surveyStation);
       });
       layer.on('dblclick', (event) => {
         if (event.originalEvent) {
           L.DomEvent.stopPropagation(event.originalEvent);
           L.DomEvent.preventDefault(event.originalEvent);
         }
-        handleStationDoubleClick(station);
+        handleStationDoubleClick(layer._surveyStation);
       });
       stationLayers.set(station.stationId, layer);
     } else {
+      layer._surveyStation = station;
       layer.setIcon(icon);
       layer.setLatLng([station.lat, station.lng]);
       if (!map.hasLayer(layer)) layer.addTo(map);
@@ -4048,7 +4064,7 @@ function stationFlagIcon(station, role = '', order = null) {
     .slice(0, 3)
     .toUpperCase() || '•';
   const label = order ? `${order}·${code}` : code;
-  const width = order ? 40 : 28;
+  const width = order ? 48 : 40;
   return L.divIcon({
     className: '',
     html: `
@@ -4057,8 +4073,8 @@ function stationFlagIcon(station, role = '', order = null) {
         <div class="station-flag-cloth">${escapeHtml(label)}</div>
       </div>
     `,
-    iconSize: [width, 36],
-    iconAnchor: [5, 36],
+    iconSize: [width, 44],
+    iconAnchor: [10, 40],
   });
 }
 
@@ -4068,7 +4084,9 @@ function handleStationClick(station) {
     return;
   }
   if (!captureState.points.length || captureState.points[0]?.source !== 'station') {
-    setStationComboValue('start', station.stationId);
+    // Luôn seed lại, kể cả form đã có sẵn đúng stationId nên không phát sinh change.
+    setStationComboValue('start', station.stationId, { emitChange: false });
+    seedFromStation(station, { preserveEnd: Boolean(activeCharterLeg) });
     return;
   }
 
@@ -4436,6 +4454,17 @@ function renderCharterStopPins(stops) {
         `#${stop.stopOrder} ${stop.stationName || stop.stationCode || stop.stationId}${stay}`,
         { direction: 'top', offset: [0, -32] },
       );
+      marker.on('click', (event) => {
+        if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+        handleStationClick(stop);
+      });
+      marker.on('dblclick', (event) => {
+        if (event.originalEvent) {
+          L.DomEvent.stopPropagation(event.originalEvent);
+          L.DomEvent.preventDefault(event.originalEvent);
+        }
+        handleStationDoubleClick(stop);
+      });
       charterStopLayer.addLayer(marker);
     });
   }
