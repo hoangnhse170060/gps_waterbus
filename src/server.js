@@ -1583,11 +1583,26 @@ function shouldAcceptHubJump(prev, next) {
   return { ok: true, moved };
 }
 
+function idleNoTripStationForHub(boatCode, payload, point) {
+  const code = String(boatCode || '').trim();
+  if (!code || payload?.tripId || payload?.tripCode) return null;
+  if (activeSurveyBoatCode() === code) return null;
+  if (isBoatInActiveRescueMission(code) || boatNeedsIncidentFreeze(code)) return null;
+
+  const speedKmh = Number(payload?.speedKmh);
+  const gpsStatus = String(payload?.status || '').trim().toLowerCase();
+  const moving = Number.isFinite(speedKmh)
+    ? speedKmh > 0.5
+    : ['moving', 'enroute', 'departing'].includes(gpsStatus);
+  if (moving) return null;
+  return nearestStationTo(point);
+}
+
 function upsertHubBoat(payload) {
   if (!payload || typeof payload !== 'object') return;
   const code = String(payload.boatCode || '').trim();
-  const lat = Number(payload.lat);
-  const lng = Number(payload.lng);
+  let lat = Number(payload.lat);
+  let lng = Number(payload.lng);
   if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
   // Không hiện / giữ hub cho tàu không thuộc Live map (Active / UnderMaintenance / đang sự cố).
   if (!isLiveMapBoatCode(code)) {
@@ -1635,9 +1650,16 @@ function upsertHubBoat(payload) {
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (!forceAccept && liveAuthUntil > Date.now()) return;
 
-  // Gate no-trip: tàu không có trip/rescue/survey → KHÔNG nhảy tọa độ, giữ vị trí cũ.
-  // Lý do: tàu đậu bến/đợi khách vẫn có thể nhận POST locations từ device (heartbeat/noise) —
-  // nếu cho ghi đè, marker nhảy lung tung dù đáng lẽ đứng yên.
+  // Tàu rảnh đã dừng không được neo giữa sông. Chỉ sự cố hoặc mission chuyên biệt
+  // (trip/rescue/survey) được sở hữu vị trí ngoài bến.
+  const idleStation = idleNoTripStationForHub(code, payload, { lat, lng });
+  if (idleStation) {
+    lat = idleStation.lat;
+    lng = idleStation.lng;
+  }
+
+  // Gate no-trip: điểm idle đã được đưa về bến ở trên; các nguồn không có thẩm quyền
+  // còn lại chỉ cập nhật trạng thái, không được kéo marker khỏi vị trí đang giữ.
   // Vẫn update heading/speed cho FE biết trạng thái (idle), và vẫn gửi Azure nếu BE chấp nhận.
   const incomingHasTrip = Boolean(payload.tripId || payload.tripCode);
   const allowMoveBySource = (
@@ -1645,6 +1667,7 @@ function upsertHubBoat(payload) {
     || String(payload.source || '') === 'survey'
     || payload._fromRescue === true
     || payload._skipNoTripFreeze === true
+    || Boolean(idleStation)
   );
   if (!forceAccept && !incomingHasTrip && !allowMoveBySource) {
     const prevForFreeze = state.hubBoats.get(code);
@@ -1723,6 +1746,10 @@ function upsertHubBoat(payload) {
     routeCode: payload.routeCode || null,
     tripId: payload.tripId || null,
     tripCode: payload.tripCode || null,
+    currentStationCode: idleStation?.station?.stationCode
+      || payload.currentStationCode
+      || null,
+    movementStatus: idleStation ? 'AtStation' : (payload.movementStatus || null),
     lat,
     lng,
     speedKmh: incoming.speedKmh,
@@ -1731,7 +1758,9 @@ function upsertHubBoat(payload) {
     receivedAt: incoming.receivedAt || new Date().toISOString(),
     sequence: incoming.sequence,
     isOnline: payload.isOnline !== false,
-    source: payload.source || (payload.fromAzure ? 'azure' : (prev?.source || null)),
+    source: idleStation
+      ? 'nearest-station-no-trip'
+      : (payload.source || (payload.fromAzure ? 'azure' : (prev?.source || null))),
     updatedAt: new Date().toISOString(),
   });
   // Chỉ giữ quyền Live khi user kéo / trip / rescue / heartbeat giữ pin kéo.

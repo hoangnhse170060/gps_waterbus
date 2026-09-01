@@ -1545,6 +1545,9 @@ function boatMapLatLng(code, hub, index, data = latest) {
   const tripStation = tripStationLatLng(code, data);
   if (tripStation) return tripStation;
 
+  const idleStation = idleBoatStationLatLng(code, hub, data);
+  if (idleStation) return idleStation;
+
   const pin = pinnedFor(code);
   // Pin user đang kéo tay
   if (pin?.user && recentUserPinHolds(code, hub)) {
@@ -1711,6 +1714,32 @@ function tripStationLatLng(code, data = latest) {
   const lng = Number(trip.currentLng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   return { lat, lng, source: 'trip-station-mission' };
+}
+
+function idleBoatStationLatLng(code, hub, data = latest) {
+  const key = String(code || '').trim();
+  if (!key || activeTripForBoat(key, data)) return null;
+  if (isBoatInActiveAutomatedRescue(key, data) || openIncidentForBoat(key)) return null;
+  if (activeSurveyBoatCode(data) === key) return null;
+
+  const speedKmh = Number(hub?.speedKmh);
+  const gpsStatus = String(hub?.status || '').trim().toLowerCase();
+  const gpsIsMoving = Number.isFinite(speedKmh)
+    ? speedKmh > 0.5
+    : ['moving', 'enroute', 'departing'].includes(gpsStatus);
+  if (gpsIsMoving) return null;
+
+  const pin = pinnedFor(key);
+  const lat = Number(hub?.lat ?? pin?.lat);
+  const lng = Number(hub?.lng ?? pin?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const nearest = nearestStationAny({ lat, lng }, data?.stations || []);
+  if (!nearest?.station) return null;
+  return {
+    lat: Number(nearest.station.lat),
+    lng: Number(nearest.station.lng),
+    source: 'nearest-station-no-trip',
+  };
 }
 
 /** Ưu tiên tốc độ trip GPS / hub; fallback tốc độ kéo tay local. */
@@ -2188,9 +2217,12 @@ function renderHubBoats(hubBoats) {
     const hub = hubByCode.get(code);
     const open = openIncidentForBoat(code);
     const tripStation = tripStationLatLng(code, latest);
+    const idleStation = idleBoatStationLatLng(code, hub, latest);
     let seed;
     if (tripStation) {
       seed = tripStation;
+    } else if (idleStation) {
+      seed = idleStation;
     } else if (hub && Number.isFinite(Number(hub.lat)) && Number.isFinite(Number(hub.lng))) {
       seed = { lat: Number(hub.lat), lng: Number(hub.lng) };
     } else if (open && Number.isFinite(Number(open.lat)) && Number.isFinite(Number(open.lng))) {

@@ -107,6 +107,37 @@ const testScenarios = [
     hasRescue: false,
     hasIncident: false,
     expectedBehavior: 'snap-to-trip-station'
+  },
+  {
+    name: 'Test 6: Tàu không có trip nhưng GPS đang chạy - giữ vị trí hub',
+    boatCode: 'FREE-MOVING',
+    hubPosition: { lat: 10.7600, lng: 106.6900 },
+    speedKmh: 12,
+    hasTrip: false,
+    hasRescue: false,
+    hasIncident: false,
+    expectedBehavior: 'use-hub-position'
+  },
+  {
+    name: 'Test 7: Tàu báo sự cố được phép dừng giữa sông',
+    boatCode: 'INCIDENT-01',
+    hubPosition: { lat: 10.7600, lng: 106.6900 },
+    speedKmh: 0,
+    hasTrip: false,
+    hasRescue: false,
+    hasIncident: true,
+    expectedBehavior: 'use-hub-position'
+  },
+  {
+    name: 'Test 8: GPS còn status moving nhưng tốc độ 0 - vẫn về bến',
+    boatCode: 'STALE-MOVING',
+    hubPosition: { lat: 10.7600, lng: 106.6900 },
+    speedKmh: 0,
+    gpsStatus: 'moving',
+    hasTrip: false,
+    hasRescue: false,
+    hasIncident: false,
+    expectedBehavior: 'snap-to-nearest-station'
   }
 ];
 
@@ -122,6 +153,7 @@ function simulateBoatPosition(scenario, stations) {
     movementStatus,
     currentStationCode,
     tripPosition,
+    speedKmh,
   } = scenario;
   
   console.log('\n' + '='.repeat(70));
@@ -151,7 +183,7 @@ function simulateBoatPosition(scenario, stations) {
       : { lat: tripPosition.lat, lng: tripPosition.lng };
     source = station ? 'trip-station' : 'trip-station-mission';
     console.log(`\n📍 Kết quả: Trip đang ở bến → dùng đúng tọa độ bến`);
-  } else if (hasTrip || hasRescue || hasIncident) {
+  } else if (hasTrip || hasRescue || hasIncident || Number(speedKmh) > 0.5) {
     // Có trip/rescue/incident → dùng hub
     result = { lat: hubPosition.lat, lng: hubPosition.lng };
     source = 'hub';
