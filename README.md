@@ -110,6 +110,16 @@ nhất theo thời gian, gửi `tripId=null`, `movementStatus=AtStation` và `cu
 Nếu không có chuyến mới hợp lệ, GPS dừng route cũ và đặt tàu ngay tại điểm hành lang sông
 gần bến gần nhất, không tiếp tục chạy route đã bị xóa.
 
+Ngoài event `tripsReset`, mỗi lần poll `/api/gps/trips/due` thành công mà tàu không còn
+trip active/due, GPS cũng đưa tàu về bến gần nhất và publish `tripId=null`,
+`movementStatus=AtStation` lên Azure một lần. Khi tàu có trip trở lại, lần chuyển no-trip
+tiếp theo sẽ được đồng bộ lại.
+
+Khi trip đang active, GPS chạy trực tiếp trên `routeGeometry` đã nhận (fallback sang geometry
+của `routeCode` trong Neon nếu payload không có geometry hợp lệ). OSM river corridor không
+được dùng để biến đổi route active; corridor chỉ dùng để dựng đường đi về bến hoặc tới bến
+xuất phát ngoài trip.
+
 Trip đang `InProgress`/đã rời bến hoặc payload báo còn hành khách sẽ không tự quay về;
 kết quả ACK trả `requiresAdminConfirmation=true`. `keptActiveTrips` luôn được giữ nguyên.
 

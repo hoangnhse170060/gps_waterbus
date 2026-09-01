@@ -9,7 +9,6 @@ import {
   buildRiverPath,
   projectOnPath,
   resolveRiverBasePath,
-  slicePathByAlong,
 } from './river-corridor.js';
 
 const ACTIVE_TRIP_STATUSES = new Set([
@@ -71,6 +70,8 @@ export function createTripAutorun(ctx) {
   let dueAuthLastWarnAt = 0;
   /** RescueDispatched tới trước khi GPS đã có trip local → áp khi startTripMission. */
   const pendingTripTakeovers = new Map();
+  /** Mỗi giai đoạn no-trip chỉ publish vị trí bến một lần. */
+  const noTripStationSynced = new Set();
 
   function tripAutorunEnabled() {
     return parseBool(env.TRIP_AUTORUN ?? 'true');
@@ -443,12 +444,6 @@ export function createTripAutorun(ctx) {
     mission.currentStationCode = null;
   }
 
-  function tripSnapToRiverEnabled() {
-    // Mặc định ON để mọi trip bám hành lang sông. Chỉ tắt khi cấu hình rõ ràng.
-    const configured = String(env.TRIP_SNAP_TO_RIVER ?? '').trim().toLowerCase();
-    return !['false', '0', 'off', 'no'].includes(configured);
-  }
-
   function resolveCoordinatesForTrip(row) {
     let fromPayload = parseTripCoordinates(
       row.routeGeometry || row.RouteGeometry || row.geometry || row.coordinates,
@@ -457,7 +452,7 @@ export function createTripAutorun(ctx) {
     if (fromPayload.length >= 2) {
       const len = routeLengthFn(fromPayload);
       if (len > 0 && len <= 80_000) {
-        return maybeSnapTripPath(fromPayload, normalizeStops(row.stops || row.Stops || []));
+        return fromPayload;
       }
       console.warn(`[trip-gps] routeGeometry bất thường ${Math.round(len)}m — fallback Neon`);
       fromPayload = [];
@@ -472,87 +467,10 @@ export function createTripAutorun(ctx) {
         .map((p) => sanitizeLatLng(p.lat, p.lng))
         .filter(Boolean);
       if (cleaned.length >= 2) {
-        return maybeSnapTripPath(cleaned, normalizeStops(row.stops || row.Stops || []));
+        return cleaned;
       }
     }
     return fromPayload;
-  }
-
-  function maybeSnapTripPath(coordinates, stops = []) {
-    if (!tripSnapToRiverEnabled()) return coordinates;
-    return snapTripPathToRiver(coordinates, stops);
-  }
-
-  /** Ép tuyến trip lên vạch sông; có thể tắt bằng TRIP_SNAP_TO_RIVER=false. */
-  function snapTripPathToRiver(coordinates, stops = []) {
-    const base = resolveRiverBasePath({
-      stations: state.stations || [],
-      routes: [...state.routes.values()],
-      osmCorridor: state.osmWaterbusCorridor || [],
-    });
-    if (base.length < 2) return coordinates;
-
-    const stopPts = (stops || [])
-      .filter((s) => Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng)))
-      .map((s) => ({ lat: Number(s.lat), lng: Number(s.lng) }));
-
-    const anchors = stopPts.length >= 2
-      ? stopPts
-      : [
-        coordinates[0],
-        coordinates[coordinates.length - 1],
-      ].filter((p) => p && Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)));
-
-    if (anchors.length < 2) return coordinates;
-
-    const projs = anchors.map((a) => projectOnPath(base, a)).filter(Boolean);
-    if (projs.length < 2) return coordinates;
-
-    const out = [];
-    for (let i = 0; i < projs.length - 1; i += 1) {
-      const slice = slicePathByAlong(
-        base,
-        projs[i].alongMeters,
-        projs[i + 1].alongMeters,
-        40,
-      );
-      for (const p of slice) {
-        const last = out[out.length - 1];
-        if (!last || distanceMetersFn(last, p) > 5) out.push({ lat: p.lat, lng: p.lng });
-      }
-    }
-    if (out.length < 2) return coordinates;
-    const snappedLen = routeLengthFn(out);
-    if (!(snappedLen > 50) || snappedLen > 80_000) return coordinates;
-    return out;
-  }
-
-  /** Mission đang chạy cũng được đưa về corridor khi chế độ bám sông bật. */
-  function ensureMissionCorridorPath(mission) {
-    if (!mission || mission.corridorSnapped) return;
-    if (!tripSnapToRiverEnabled()) {
-      mission.corridorSnapped = true;
-      return;
-    }
-    const snapped = snapTripPathToRiver(mission.coordinates || [], mission.stops || []);
-    if (snapped.length < 2) {
-      mission.corridorSnapped = true;
-      return;
-    }
-    const prevProgress = Number(mission.progressMeters) || 0;
-    const prevLen = Number(mission.lengthMeters) || routeLengthFn(mission.coordinates || []);
-    const ratio = prevLen > 10 ? Math.min(1, prevProgress / prevLen) : 0;
-    mission.coordinates = snapped;
-    mission.lengthMeters = routeLengthFn(snapped);
-    mission.progressMeters = Math.min(mission.lengthMeters, ratio * mission.lengthMeters);
-    const point = pointAtDistance(snapped, mission.progressMeters);
-    mission.currentLat = point.lat;
-    mission.currentLng = point.lng;
-    mission.lastHeading = point.heading || mission.lastHeading || 0;
-    mission.corridorSnapped = true;
-    console.log(
-      `[trip-gps] ${mission.boatCode} path bo sông (TRIP_SNAP_TO_RIVER): ${snapped.length} pts · ${Math.round(mission.lengthMeters)}m`,
-    );
   }
 
   function resolveLengthMeters(row, coordinates) {
@@ -922,7 +840,7 @@ export function createTripAutorun(ctx) {
       });
       const built = buildRiverPath(from, target, base, {
         joinMeters: 90,
-        corridorOnly: tripSnapToRiverEnabled(),
+        corridorOnly: true,
       });
       mission.approachPath = built.coordinates;
       mission.approachProgress = 0;
@@ -1377,6 +1295,7 @@ export function createTripAutorun(ctx) {
     const tripId = cleanOptionalText(row.tripId || row.TripId);
     const boatCode = cleanOptionalText(row.boatCode || row.BoatCode);
     if (!tripId || !boatCode) return null;
+    noTripStationSynced.delete(boatCode);
     if (isCancelledTripRow(row)) {
       console.warn(`[trip-gps] skip ${tripId}: BE status Cancelled — không start`);
       return null;
@@ -2185,6 +2104,57 @@ export function createTripAutorun(ctx) {
     return nearest;
   }
 
+  async function syncNoTripBoatToNearestStation(boatCode) {
+    const code = cleanOptionalText(boatCode);
+    if (!code || noTripStationSynced.has(code)) {
+      return { ok: true, skipped: true, reason: 'no-trip position already synced' };
+    }
+    if (isBoatInActiveTripMission(code) || isBoatInActiveRescueMission(code)) {
+      noTripStationSynced.delete(code);
+      return { ok: true, skipped: true, reason: 'boat is owned by trip/rescue' };
+    }
+    if (boatIsFrozenForIncident(code)) {
+      return { ok: true, skipped: true, reason: 'incident freeze' };
+    }
+
+    const hub = state.hubBoats?.get(code);
+    const boat = [...(state.boats?.values?.() || [])].find((row) => (
+      String(row?.boatCode || '').trim() === code
+    ));
+    const origin = sanitizeLatLng(
+      hub?.lat ?? boat?.lat,
+      hub?.lng ?? boat?.lng,
+    );
+    if (!origin) return { ok: false, error: 'GPS chưa có vị trí tàu' };
+
+    const station = findNearestCatalogStation(origin);
+    if (!station) return { ok: false, error: 'Không tìm thấy bến gần nhất' };
+
+    const result = await publishLiveGpsPosition({
+      boatCode: code,
+      lat: station.lat,
+      lng: station.lng,
+      heading: Number(hub?.heading ?? boat?.heading ?? 0),
+      speedKmh: 0,
+      status: 'idle',
+      movementStatus: 'AtStation',
+      currentStationCode: station.stationCode || station.stationId || null,
+      tripId: null,
+      routeCode: null,
+      sendToTarget: true,
+      fromTrip: false,
+      holdAuthority: true,
+    });
+    if (result.ok || result.skipped || result.soft) {
+      noTripStationSynced.add(code);
+      console.log(
+        `[trip-gps] NO TRIP ${code} → ${station.stationCode || station.stationName || '?'}`
+          + ' · publish Azure',
+      );
+    }
+    return result;
+  }
+
   function passengerCountForReset(row, mission) {
     const values = [
       row?.onboardPassengerCount,
@@ -2312,24 +2282,17 @@ export function createTripAutorun(ctx) {
       routes: [...state.routes.values()],
       osmCorridor: state.osmWaterbusCorridor || [],
     });
-    const keepOnRiver = tripSnapToRiverEnabled();
     const built = buildRiverPath(from, station, base, {
       joinMeters: 90,
-      corridorOnly: keepOnRiver,
+      corridorOnly: true,
     });
     if (!Array.isArray(built.coordinates) || built.coordinates.length < 2) {
       return { ok: false, tripId: mission.tripId, boatCode: mission.boatCode, error: 'Không dựng được đường về bến' };
     }
     const returnPath = [...built.coordinates];
-    const pathEnd = returnPath[returnPath.length - 1];
-    if (!keepOnRiver && distanceMetersFn(pathEnd, station) > 3) {
-      returnPath.push({ lat: station.lat, lng: station.lng });
-    }
     const returnTarget = returnPath[returnPath.length - 1];
-    if (keepOnRiver) {
-      mission.currentLat = returnPath[0].lat;
-      mission.currentLng = returnPath[0].lng;
-    }
+    mission.currentLat = returnPath[0].lat;
+    mission.currentLng = returnPath[0].lng;
 
     mission.resetTripId = mission.tripId;
     mission.resetAt = new Date().toISOString();
@@ -2477,9 +2440,6 @@ export function createTripAutorun(ctx) {
       await tickReturnToBase(mission, nowMs);
       return;
     }
-
-    // Path cũ đâm V vào cầu tàu → ép lại đúng vạch sông.
-    ensureMissionCorridorPath(mission);
 
     // Mission geometry/ETA lỗi từ BE (vd 11832 km / -95000p) → huỷ để poll lại.
     if (Number(mission.lengthMeters) > 80_000) {
@@ -2763,6 +2723,14 @@ export function createTripAutorun(ctx) {
           // Delay active + chưa có giờ adjusted hợp lệ: vẫn start để đứng chờ (GPS vẫn push).
           startTripMission({ ...row, boatCode: tripBoat });
           if (isBoatInActiveTripMission(boatCode)) break;
+        }
+        if (isBoatInActiveTripMission(boatCode)) {
+          noTripStationSynced.delete(boatCode);
+        } else {
+          const synced = await syncNoTripBoatToNearestStation(boatCode);
+          if (!(synced.ok || synced.skipped || synced.soft)) {
+            console.warn(`[trip-gps] no-trip ${boatCode}: ${synced.error || 'publish failed'}`);
+          }
         }
       }
     } finally {

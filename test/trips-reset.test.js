@@ -32,6 +32,20 @@ function createFixture({ status = 'Boarding', progressMeters = 0 } = {}) {
   };
   const state = {
     tripMissions: new Map([[mission.tripId, mission]]),
+    boats: new Map([['boat-1', {
+      boatId: 'boat-1',
+      boatCode: 'WB_01',
+      dbStatus: 'Active',
+      lat: mission.currentLat,
+      lng: mission.currentLng,
+      heading: mission.lastHeading,
+    }]]),
+    hubBoats: new Map([['WB_01', {
+      boatCode: 'WB_01',
+      lat: mission.currentLat,
+      lng: mission.currentLng,
+      heading: mission.lastHeading,
+    }]]),
     stations: [
       { stationId: 'st-bd', stationCode: 'ST-BD', stationName: 'Bach Dang', lat: 10.7752, lng: 106.7073 },
       { stationId: 'st-tt', stationCode: 'ST-TT', stationName: 'Thu Thiem', lat: 10.7768, lng: 106.7096 },
@@ -42,6 +56,8 @@ function createFixture({ status = 'Boarding', progressMeters = 0 } = {}) {
       { lat: 10.7768, lng: 106.7096 },
       { lat: 10.776, lng: 106.710 },
     ],
+    collector: null,
+    liveHookSecret: 'test-hook-secret',
   };
   const autorun = createTripAutorun({
     state,
@@ -213,7 +229,6 @@ test('WaitingAtStop snaps the boat from the river path to the exact station', as
   mission.arrivalTime = new Date(Date.now() + 60 * 60_000).toISOString();
   station.plannedDepartureTime = new Date(Date.now() + 60 * 60_000).toISOString();
   mission.stopIndex = 0;
-  mission.corridorSnapped = true;
   mission.lastTickAt = Date.now() - 1000;
 
   assert.ok(distanceMeters(riverPoint, station) > 28);
@@ -251,4 +266,64 @@ test('completed trip publishes a final idle position without tripId', async () =
   assert.equal(published.at(-1).routeCode, null);
   assert.equal(published.at(-1).fromTrip, false);
   assert.equal(published.at(-1).status, 'idle');
+});
+
+test('due poll sends a no-trip boat to the nearest station once', async () => {
+  const { autorun, published, state } = createFixture();
+  state.tripMissions.clear();
+
+  await autorun.pollDueTrips();
+
+  assert.equal(published.length, 1);
+  assert.equal(published[0].boatCode, 'WB_01');
+  assert.equal(published[0].tripId, null);
+  assert.equal(published[0].movementStatus, 'AtStation');
+  assert.equal(published[0].currentStationCode, 'ST-TT');
+  assert.equal(published[0].sendToTarget, true);
+  assert.equal(published[0].holdAuthority, true);
+  assert.equal(published[0].lat, state.stations[1].lat);
+  assert.equal(published[0].lng, state.stations[1].lng);
+
+  await autorun.pollDueTrips();
+  assert.equal(published.length, 1);
+});
+
+test('due poll does not move a boat that still has an active trip', async () => {
+  const { autorun, published } = createFixture();
+
+  await autorun.pollDueTrips();
+
+  assert.equal(published.length, 0);
+});
+
+test('active trip keeps GPS on its received route geometry', async () => {
+  const { autorun, mission, published, state } = createFixture({ status: 'Running' });
+  const receivedRoute = [
+    { lat: 10.7700, lng: 106.7000 },
+    { lat: 10.7700, lng: 106.7020 },
+  ];
+  mission.coordinates = receivedRoute.map((point) => ({ ...point }));
+  mission.lengthMeters = routeLength(mission.coordinates);
+  mission.progressMeters = mission.lengthMeters / 2;
+  const current = pointAtDistance(mission.coordinates, mission.progressMeters);
+  mission.currentLat = current.lat;
+  mission.currentLng = current.lng;
+  mission.stops = [];
+  mission.stopIndex = 0;
+  mission.departureTime = new Date(Date.now() - 60_000).toISOString();
+  mission.arrivalTime = new Date(Date.now() + 60 * 60_000).toISOString();
+  mission.lastTickAt = Date.now() - 1000;
+  state.osmWaterbusCorridor = [
+    { lat: 10.7800, lng: 106.7100 },
+    { lat: 10.7810, lng: 106.7120 },
+  ];
+
+  await autorun.tickTripMissions();
+
+  const gps = published.at(-1);
+  assert.ok(gps);
+  assert.ok(Math.abs(gps.lat - 10.7700) < 1e-9);
+  assert.deepEqual(mission.coordinates, receivedRoute);
+  assert.equal(gps.tripId, mission.tripId);
+  assert.equal(gps.fromTrip, true);
 });
