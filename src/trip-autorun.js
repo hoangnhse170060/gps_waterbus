@@ -417,12 +417,22 @@ export function createTripAutorun(ctx) {
   }
 
   /** Đứng chờ tại bến tới đúng plannedDepartureTime — lưu mốc giờ để FE đếm ngược. */
+  function snapMissionToStation(mission, stop) {
+    const point = sanitizeLatLng(stop?.lat, stop?.lng);
+    if (!mission || !point) return false;
+    mission.currentLat = point.lat;
+    mission.currentLng = point.lng;
+    mission.currentStationCode = cleanOptionalText(stop?.stationCode || stop?.stationId);
+    return true;
+  }
+
   function markWaitingAtStop(mission, stop, planDepMs) {
     mission.status = 'WaitingAtStop';
-    mission.movementStatus = 'Waiting';
+    mission.movementStatus = 'AtStation';
     mission.waitingUntil = Number.isFinite(planDepMs) ? new Date(planDepMs).toISOString() : null;
     mission.waitingStationName = stop?.stationName || stop?.stationCode || null;
     mission.waitingStationCode = stop?.stationCode || null;
+    snapMissionToStation(mission, stop);
   }
 
   /** Rời khỏi trạng thái chờ (chạy tiếp / kết thúc trip) — xoá mốc đếm ngược. */
@@ -430,6 +440,7 @@ export function createTripAutorun(ctx) {
     mission.waitingUntil = null;
     mission.waitingStationName = null;
     mission.waitingStationCode = null;
+    mission.currentStationCode = null;
   }
 
   function tripSnapToRiverEnabled() {
@@ -792,19 +803,6 @@ export function createTripAutorun(ctx) {
       Number.isFinite(Number(s.lat)) && Number.isFinite(Number(s.lng))
     ));
     if (firstStop) {
-      const projected = Array.isArray(coordinates) && coordinates.length >= 2
-        ? projectOnPath(coordinates, { lat: Number(firstStop.lat), lng: Number(firstStop.lng) })
-        : null;
-      if (projected && Number.isFinite(Number(projected.alongMeters))) {
-        const point = pointAtDistance(coordinates, projected.alongMeters);
-        return {
-          lat: point.lat,
-          lng: point.lng,
-          heading: point.heading || 0,
-          stop: firstStop,
-          source: 'stop-projected-on-path',
-        };
-      }
       return {
         lat: Number(firstStop.lat),
         lng: Number(firstStop.lng),
@@ -898,6 +896,9 @@ export function createTripAutorun(ctx) {
       mission.approachProgress = 0;
       mission.status = (Number.isFinite(depMs) && nowMs < depMs) ? 'Boarding' : 'Running';
       mission.movementStatus = mission.status === 'Boarding' ? 'Boarding' : 'Moving';
+      mission.currentStationCode = mission.status === 'Boarding'
+        ? cleanOptionalText(mission.departureStop?.stationCode || mission.departureStop?.stationId)
+        : null;
       console.log(
         `[trip-gps] đã tới bến xuất phát ${mission.nextStopName || ''} · ${mission.boatCode} → ${mission.status}`,
       );
@@ -1455,6 +1456,7 @@ export function createTripAutorun(ctx) {
       nextStopDistanceKm: null,
       nextStopEtaMin: null,
       movementStatus: 'Scheduled',
+      currentStationCode: null,
       departureLat: null,
       departureLng: null,
       departureStop: null,
@@ -1495,6 +1497,9 @@ export function createTripAutorun(ctx) {
     const depMs0 = parseTimeMs(departureTime);
     mission.status = (Number.isFinite(depMs0) && Date.now() < depMs0) ? 'Boarding' : 'Running';
     mission.movementStatus = mission.status === 'Boarding' ? 'Boarding' : 'Moving';
+    mission.currentStationCode = mission.status === 'Boarding'
+      ? cleanOptionalText(mission.departureStop?.stationCode || mission.departureStop?.stationId)
+      : null;
     mission.nextStationId = mission.departureStop?.stationId || mission.departureStop?.stationCode || null;
     mission.nextStopCode = mission.departureStop?.stationCode || mission.nextStationId;
     mission.nextStopName = mission.departureStop?.stationName
@@ -1962,6 +1967,8 @@ export function createTripAutorun(ctx) {
       nextStationName: mission.nextStopName || null,
       remainingDistanceKmToNextStation: remKm,
       remainingMinutesToNextStation: remMin,
+      movementStatus: movementStatusFor(mission),
+      currentStationCode: mission.currentStationCode || null,
       sendToTarget: true,
       fromTrip: true,
     });
@@ -2564,10 +2571,12 @@ export function createTripAutorun(ctx) {
     ) {
       mission.status = 'Boarding';
       mission.progressMeters = 0;
-      if (Number.isFinite(Number(mission.departureLat))) {
+      const snappedToDeparture = mission.departureStop
+        && snapMissionToStation(mission, mission.departureStop);
+      if (!snappedToDeparture && Number.isFinite(Number(mission.departureLat))) {
         mission.currentLat = Number(mission.departureLat);
         mission.currentLng = Number(mission.departureLng);
-      } else {
+      } else if (!snappedToDeparture) {
         const start = pointAtDistance(coords, 0);
         mission.currentLat = start.lat;
         mission.currentLng = start.lng;
@@ -2597,13 +2606,15 @@ export function createTripAutorun(ctx) {
       }
       // Chỉ neo về bến XP khi thật sự chưa xuất phát.
       if (Number(mission.progressMeters || 0) < 5) {
-        if (Number.isFinite(Number(mission.departureLat))) {
+        const stop0 = mission.stops?.[0];
+        const snappedToDeparture = stop0 && snapMissionToStation(mission, stop0);
+        if (!snappedToDeparture && Number.isFinite(Number(mission.departureLat))) {
           mission.currentLat = Number(mission.departureLat);
           mission.currentLng = Number(mission.departureLng);
         }
         mission.progressMeters = 0;
         mission.status = 'WaitingAtStop';
-        const stop0 = mission.stops?.[0];
+        mission.movementStatus = 'AtStation';
         mission.waitingStationName = stop0?.stationName || stop0?.stationCode || null;
         mission.waitingStationCode = stop0?.stationCode || null;
         mission.waitingUntil = Number.isFinite(depMs) && depMs > nowMs
@@ -2618,9 +2629,10 @@ export function createTripAutorun(ctx) {
           : null;
         mission.waitingStationName = stop?.stationName || stop?.stationCode || mission.waitingStationName;
         mission.waitingStationCode = stop?.stationCode || mission.waitingStationCode;
+        if (mission.status === 'WaitingAtStop') snapMissionToStation(mission, stop);
       }
-      // Bám đúng toạ độ path tại progress hiện tại (tránh lệch marker).
-      if (Number(mission.progressMeters || 0) >= 5) {
+      // Delay giữa sông giữ đúng path; nếu đã ở bến thì snapMissionToStation ở trên sở hữu vị trí.
+      if (Number(mission.progressMeters || 0) >= 5 && mission.status !== 'WaitingAtStop') {
         const hold = pointAtDistance(coords, Number(mission.progressMeters) || 0);
         mission.currentLat = hold.lat;
         mission.currentLng = hold.lng;

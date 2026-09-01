@@ -197,6 +197,38 @@ test('tripsReset never removes a trip listed in keptActiveTrips', async () => {
   assert.equal(published.length, 0);
 });
 
+test('WaitingAtStop snaps the boat from the river path to the exact station', async () => {
+  const { autorun, mission, published } = createFixture({ status: 'Running' });
+  const station = mission.stops[0];
+  const riverPoint = { lat: station.lat - 0.0008, lng: station.lng };
+  mission.coordinates = [
+    { lat: riverPoint.lat, lng: riverPoint.lng - 0.001 },
+    { lat: riverPoint.lat, lng: riverPoint.lng + 0.001 },
+  ];
+  mission.lengthMeters = routeLength(mission.coordinates);
+  mission.progressMeters = mission.lengthMeters / 2;
+  mission.currentLat = riverPoint.lat;
+  mission.currentLng = riverPoint.lng;
+  mission.departureTime = new Date(Date.now() - 60_000).toISOString();
+  mission.arrivalTime = new Date(Date.now() + 60 * 60_000).toISOString();
+  station.plannedDepartureTime = new Date(Date.now() + 60 * 60_000).toISOString();
+  mission.stopIndex = 0;
+  mission.corridorSnapped = true;
+  mission.lastTickAt = Date.now() - 1000;
+
+  assert.ok(distanceMeters(riverPoint, station) > 28);
+  await autorun.tickTripMissions();
+
+  assert.equal(mission.status, 'WaitingAtStop');
+  assert.equal(mission.movementStatus, 'AtStation');
+  assert.equal(mission.currentLat, station.lat);
+  assert.equal(mission.currentLng, station.lng);
+  assert.equal(mission.currentStationCode, station.stationCode);
+  assert.equal(published.at(-1).speedKmh, 0);
+  assert.equal(published.at(-1).movementStatus, 'AtStation');
+  assert.equal(published.at(-1).currentStationCode, station.stationCode);
+});
+
 test('completed trip publishes a final idle position without tripId', async () => {
   const { autorun, mission, published } = createFixture({ status: 'Running' });
   mission.coordinates = [
