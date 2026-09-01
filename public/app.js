@@ -3118,7 +3118,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       }
       notifyOk('CB đã đủ tuyến — đã bỏ khỏi danh sách');
       // Cập nhật match cache trước khi clear.
-      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      activeCharterRequest._savedMatch = buildUnassignedCharterPath(activeCharterRequest.stops);
       updateStopChainPreview();
       // Clear form ngay.
       const requestToRemove = activeCharterRequest;
@@ -3129,7 +3129,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
       exitCharterKeepRoutes(ids);
     } else if (activeCharterRequest?.requestId) {
       // Vừa lưu chặng xong (còn chặng khác) → rebuild match + preview.
-      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      activeCharterRequest._savedMatch = buildUnassignedCharterPath(activeCharterRequest.stops);
       updateStopChainPreview();
       updateCharterActiveBanner();
     }
@@ -3146,7 +3146,7 @@ async function saveRouteGeometry({ silentClear = false } = {}) {
     // KHÔNG auto-advance: user bấm nút "Chặng kế →" để chuyển sang chặng tiếp theo.
     // Sau save mà còn chặng → chỉ rebuild match + preview + show nút.
     if (hasMoreCharterLegs) {
-      activeCharterRequest._savedMatch = buildCharterPathFromSavedRoutes(activeCharterRequest.stops);
+      activeCharterRequest._savedMatch = buildUnassignedCharterPath(activeCharterRequest.stops);
       updateStopChainPreview();
       updateCharterActiveBanner();
     }
@@ -4746,6 +4746,32 @@ function buildCharterPathFromSavedRoutes(stops) {
   };
 }
 
+/**
+ * Request chưa được BE gắn candidate/result thì toàn bộ chặng vẫn là việc cần vẽ.
+ * Không lấy route chung trùng cặp bến để suy ra booking này đã có tuyến.
+ */
+function buildUnassignedCharterPath(stops) {
+  const ordered = charterStopsAsOrdered(stops);
+  const missingLegs = [];
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    const from = ordered[i];
+    const to = ordered[i + 1];
+    missingLegs.push({
+      from,
+      to,
+      label: `${from.stationCode || from.stationName} → ${to.stationCode || to.stationName}`,
+      index: i,
+    });
+  }
+  return {
+    ordered,
+    stitched: [],
+    matchedLegs: [],
+    missingLegs,
+    laterMatched: [],
+  };
+}
+
 function loadCandidateIntoCapture(coords, stops, { markAttached = false } = {}) {
   if (!coords || coords.length < 2) return false;
   clearCapturePoints();
@@ -4805,7 +4831,7 @@ function updateCharterActiveBanner() {
   charterActiveBannerEl.classList.remove('is-empty');
   const code = activeCharterRequest.bookingCode || activeCharterRequest.bookingId || activeCharterRequest.requestId;
   const match = activeCharterRequest._savedMatch;
-  const fullyCovered = Boolean(match?.matchedLegs?.length && !match?.missingLegs?.length);
+  const fullyCovered = isCharterFullyCovered(activeCharterRequest);
   if (charterActiveTitleEl) {
     charterActiveTitleEl.textContent = fullyCovered ? `Đang xem · ${code}` : `Đang vẽ · ${code}`;
   }
@@ -4902,17 +4928,23 @@ function clearActiveCharterRequest({ refresh = false } = {}) {
  * Lấy routeId để hiện khi chọn CB: tìm theo từng cặp 2 mã bến của chặng.
  * Ví dụ BD→TNC, TNC→BS → chỉ hiện route đúng 2 bến đó.
  */
-function collectCharterOwnedRouteIds(detail, savedMatch = null) {
+function collectCharterOwnedRouteIds(
+  detail,
+  savedMatch = null,
+  { includeStationPairMatches = true } = {},
+) {
   const ids = new Set();
   const add = (value) => {
     const id = String(value || '').trim();
     if (id) ids.add(id);
   };
 
-  const ordered = charterStopsAsOrdered(detail?.stops);
-  for (let i = 0; i < ordered.length - 1; i += 1) {
-    const exact = findExactRouteForStationPair(ordered[i], ordered[i + 1]);
-    if (exact?.routeId) add(exact.routeId);
+  if (includeStationPairMatches) {
+    const ordered = charterStopsAsOrdered(detail?.stops);
+    for (let i = 0; i < ordered.length - 1; i += 1) {
+      const exact = findExactRouteForStationPair(ordered[i], ordered[i + 1]);
+      if (exact?.routeId) add(exact.routeId);
+    }
   }
 
   // Matched legs đã gắn exactPair từ findSavedSegmentBetween.
@@ -4935,8 +4967,16 @@ function collectCharterOwnedRouteIds(detail, savedMatch = null) {
 }
 
 /** Hiện map theo CB: chỉ route khớp 2 mã bến từng chặng. */
-function highlightCharterMatchedRoutes(savedMatch, detail = activeCharterRequest) {
-  const ownedIds = collectCharterOwnedRouteIds(detail, savedMatch);
+function highlightCharterMatchedRoutes(
+  savedMatch,
+  detail = activeCharterRequest,
+  { includeStationPairMatches = true } = {},
+) {
+  const ownedIds = collectCharterOwnedRouteIds(
+    detail,
+    savedMatch,
+    { includeStationPairMatches },
+  );
   setCharterRouteFilter(ownedIds);
   if (showSavedRoutesBeforeCharter == null) {
     showSavedRoutesBeforeCharter = showSavedRoutes;
@@ -5050,10 +5090,12 @@ async function openCharterRequest(requestId) {
       return;
     }
 
-    savedMatch = buildCharterPathFromSavedRoutes(detail.stops || []);
+    // candidate/result đều rỗng: đây là request cần vẽ. Route chung trong DB dù trùng
+    // cặp bến cũng không phải kết quả của booking này.
+    savedMatch = buildUnassignedCharterPath(detail.stops || []);
     detail._savedMatch = savedMatch;
     activeCharterRequest._savedMatch = savedMatch;
-    highlightCharterMatchedRoutes(savedMatch);
+    highlightCharterMatchedRoutes(savedMatch, detail, { includeStationPairMatches: false });
     (savedMatch.matchedLegs || []).forEach((leg) => {
       if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
     });
@@ -5061,17 +5103,7 @@ async function openCharterRequest(requestId) {
       if (leg.coords?.length >= 2) renderCharterCandidatePreview(leg.coords);
     });
 
-    if (savedMatch.matchedLegs?.length && !savedMatch.missingLegs?.length) {
-      // Đủ tuyến → thoát chế độ charter, chỉ để lại tuyến trên map.
-      const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
-      const code = detail.bookingCode || detail.bookingId || requestId;
-      const ids = collectCharterOwnedRouteIds(detail, savedMatch);
-      setDrawTool('pan');
-      exitCharterKeepRoutes(ids);
-      captureStatusEl.textContent = `Charter ${code}: đã đủ tuyến (${ok}) — không còn việc vẽ.`;
-      notifyOk(`${code} đã đủ tuyến — đã bỏ khỏi danh sách`);
-      return;
-    } else if (savedMatch.missingLegs?.length) {
+    if (savedMatch.missingLegs?.length) {
       const miss = savedMatch.missingLegs.map((l) => l.label).join(', ');
       const ok = savedMatch.matchedLegs.map((l) => `${l.label} (${l.routeCode})`).join(', ');
       // Vẽ & gửi từng chặng: mỗi route chỉ 2 bến, hết chặng này mới sang chặng sau.
@@ -5104,14 +5136,10 @@ async function openCharterRequest(requestId) {
   }
 }
 
-/** Đủ tuyến = BE đã gắn resultRoute, hoặc mọi chặng 2 bến đều có route trong DB. */
+/** Chỉ BE được xác nhận request đã có kết quả; không suy ra từ route chung trong DB. */
 function isCharterFullyCovered(item) {
   const has = (v) => v != null && v !== '' && v !== false;
-  if (has(item?.resultRouteId) || has(item?.resultRoute)) return true;
-  const ordered = charterStopsAsOrdered(item?.stops);
-  if (ordered.length < 2) return false;
-  const match = buildCharterPathFromSavedRoutes(item.stops);
-  return Boolean(match.matchedLegs?.length) && !match.missingLegs?.length;
+  return has(item?.resultRouteId) || has(item?.resultRoute);
 }
 
 /** Trạng thái tuyến của 1 yêu cầu charter (dựa field list/detail của BE). */
