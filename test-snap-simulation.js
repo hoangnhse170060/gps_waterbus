@@ -1,35 +1,9 @@
 /**
- * 🧪 Test Simulation: Snap tàu về bến khi không có trip
+ * 🧪 Test Simulation: Marker bám GPS mới nhất
  * 
  * Script này mô phỏng việc thay đổi tọa độ hub và kiểm tra
- * xem tàu có tự động snap về bến gần nhất không.
+ * xem marker có giữ đúng tọa độ hub, trừ khi trip xác nhận tàu đang ở bến.
  */
-
-// Mock functions (copy từ live.js)
-function distMeters(a, b) {
-  const toRad = (deg) => (Number(deg) * Math.PI) / 180;
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
-  const dLat = lat2 - lat1;
-  const dLng = toRad(Number(b.lng) - Number(a.lng));
-  const h = Math.sin(dLat / 2) ** 2
-    + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return 2 * 6371008.8 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
-}
-
-function nearestStationAny(latlng, stations) {
-  let best = null;
-  let bestDist = Infinity;
-  for (const station of stations || []) {
-    if (!Number.isFinite(Number(station.lat)) || !Number.isFinite(Number(station.lng))) continue;
-    const d = distMeters(latlng, station);
-    if (d < bestDist) {
-      bestDist = d;
-      best = station;
-    }
-  }
-  return best ? { station: best, dist: bestDist } : null;
-}
 
 // Mock data - BẠN CẦN ĐIỀN DATA THẬT VÀO ĐÂY
 const mockStations = [
@@ -40,33 +14,16 @@ const mockStations = [
   { stationCode: 'T1', stationName: 'Terminal 1', lat: 10.7234, lng: 106.6891 },
 ];
 
-const mockTripMissions = [
-  // Giả sử tàu T1 có trip active
-  { 
-    boatCode: 'T1', 
-    status: 'Running',
-    tripId: 'trip-001'
-  }
-];
-
-const mockRescueMissions = [
-  // Giả sử tàu SOS1 đang rescue
-  {
-    rescueBoatCode: 'SOS1',
-    status: 'InTransit'
-  }
-];
-
 // Test scenarios
 const testScenarios = [
   {
-    name: 'Test 1: Tàu không có trip - hub ở giữa sông',
+    name: 'Test 1: Tàu không có trip - giữ GPS giữa sông',
     boatCode: 'BD',
     hubPosition: { lat: 10.7600, lng: 106.6900 }, // Giữa sông
     hasTrip: false,
     hasRescue: false,
     hasIncident: false,
-    expectedBehavior: 'snap-to-nearest-station'
+    expectedBehavior: 'use-hub-position'
   },
   {
     name: 'Test 2: Tàu có trip - hub ở giữa sông',
@@ -78,13 +35,13 @@ const testScenarios = [
     expectedBehavior: 'use-hub-position'
   },
   {
-    name: 'Test 3: Tàu không có trip - hub gần bến',
+    name: 'Test 3: Tàu không có trip - không tự snap về bến',
     boatCode: 'BS',
     hubPosition: { lat: 10.7720, lng: 106.7050 }, // Gần bến BS
     hasTrip: false,
     hasRescue: false,
     hasIncident: false,
-    expectedBehavior: 'snap-to-nearest-station'
+    expectedBehavior: 'use-hub-position'
   },
   {
     name: 'Test 4: Tàu đang rescue - hub ở giữa sông',
@@ -129,7 +86,7 @@ const testScenarios = [
     expectedBehavior: 'use-hub-position'
   },
   {
-    name: 'Test 8: GPS còn status moving nhưng tốc độ 0 - vẫn về bến',
+    name: 'Test 8: GPS còn status moving nhưng tốc độ 0 - vẫn giữ GPS',
     boatCode: 'STALE-MOVING',
     hubPosition: { lat: 10.7600, lng: 106.6900 },
     speedKmh: 0,
@@ -137,7 +94,7 @@ const testScenarios = [
     hasTrip: false,
     hasRescue: false,
     hasIncident: false,
-    expectedBehavior: 'snap-to-nearest-station'
+    expectedBehavior: 'use-hub-position'
   }
 ];
 
@@ -153,7 +110,6 @@ function simulateBoatPosition(scenario, stations) {
     movementStatus,
     currentStationCode,
     tripPosition,
-    speedKmh,
   } = scenario;
   
   console.log('\n' + '='.repeat(70));
@@ -183,28 +139,11 @@ function simulateBoatPosition(scenario, stations) {
       : { lat: tripPosition.lat, lng: tripPosition.lng };
     source = station ? 'trip-station' : 'trip-station-mission';
     console.log(`\n📍 Kết quả: Trip đang ở bến → dùng đúng tọa độ bến`);
-  } else if (hasTrip || hasRescue || hasIncident || Number(speedKmh) > 0.5) {
-    // Có trip/rescue/incident → dùng hub
+  } else {
+    // Tọa độ GPS là nguồn truth, kể cả khi không có trip hoặc tốc độ đang bằng 0.
     result = { lat: hubPosition.lat, lng: hubPosition.lng };
     source = 'hub';
     console.log(`\n📍 Kết quả: Dùng hub position`);
-  } else {
-    // Không có trip → snap về bến gần nhất
-    const nearest = nearestStationAny(hubPosition, stations);
-    if (nearest) {
-      result = { 
-        lat: nearest.station.lat, 
-        lng: nearest.station.lng 
-      };
-      source = 'nearest-station-no-trip';
-      console.log(`\n📍 Kết quả: Snap về bến gần nhất`);
-      console.log(`   Bến: ${nearest.station.stationCode} (${nearest.station.stationName})`);
-      console.log(`   Khoảng cách từ hub: ${Math.round(nearest.dist)}m`);
-    } else {
-      result = hubPosition;
-      source = 'hub';
-      console.log(`\n⚠️  Không tìm được bến gần nhất → dùng hub`);
-    }
   }
   
   console.log(`\n🎯 Final position: ${result.lat}, ${result.lng}`);
@@ -212,9 +151,9 @@ function simulateBoatPosition(scenario, stations) {
   
   // Verify kết quả
   const expected = scenario.expectedBehavior;
-  const actualBehavior = source === 'nearest-station-no-trip'
-    ? 'snap-to-nearest-station'
-    : (source.startsWith('trip-station') ? 'snap-to-trip-station' : 'use-hub-position');
+  const actualBehavior = source.startsWith('trip-station')
+    ? 'snap-to-trip-station'
+    : 'use-hub-position';
   
   if (expected === actualBehavior) {
     console.log(`\n✅ PASS: Kết quả đúng như mong đợi!`);

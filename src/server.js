@@ -1583,26 +1583,11 @@ function shouldAcceptHubJump(prev, next) {
   return { ok: true, moved };
 }
 
-function idleNoTripStationForHub(boatCode, payload, point) {
-  const code = String(boatCode || '').trim();
-  if (!code || payload?.tripId || payload?.tripCode) return null;
-  if (activeSurveyBoatCode() === code) return null;
-  if (isBoatInActiveRescueMission(code) || boatNeedsIncidentFreeze(code)) return null;
-
-  const speedKmh = Number(payload?.speedKmh);
-  const gpsStatus = String(payload?.status || '').trim().toLowerCase();
-  const moving = Number.isFinite(speedKmh)
-    ? speedKmh > 0.5
-    : ['moving', 'enroute', 'departing'].includes(gpsStatus);
-  if (moving) return null;
-  return nearestStationTo(point);
-}
-
 function upsertHubBoat(payload) {
   if (!payload || typeof payload !== 'object') return;
   const code = String(payload.boatCode || '').trim();
-  let lat = Number(payload.lat);
-  let lng = Number(payload.lng);
+  const lat = Number(payload.lat);
+  const lng = Number(payload.lng);
   if (!code || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
   // Không hiện / giữ hub cho tàu không thuộc Live map (Active / UnderMaintenance / đang sự cố).
   if (!isLiveMapBoatCode(code)) {
@@ -1649,51 +1634,6 @@ function upsertHubBoat(payload) {
   // Vừa nhận GPS Live/trip: bỏ Azure echo cũ trong cửa sổ ngắn.
   const liveAuthUntil = hubLiveAuthorityUntil.get(code) || 0;
   if (!forceAccept && liveAuthUntil > Date.now()) return;
-
-  // Tàu rảnh đã dừng không được neo giữa sông. Chỉ sự cố hoặc mission chuyên biệt
-  // (trip/rescue/survey) được sở hữu vị trí ngoài bến.
-  const idleStation = idleNoTripStationForHub(code, payload, { lat, lng });
-  if (idleStation) {
-    lat = idleStation.lat;
-    lng = idleStation.lng;
-  }
-
-  // Gate no-trip: điểm idle đã được đưa về bến ở trên; các nguồn không có thẩm quyền
-  // còn lại chỉ cập nhật trạng thái, không được kéo marker khỏi vị trí đang giữ.
-  // Vẫn update heading/speed cho FE biết trạng thái (idle), và vẫn gửi Azure nếu BE chấp nhận.
-  const incomingHasTrip = Boolean(payload.tripId || payload.tripCode);
-  const allowMoveBySource = (
-    String(payload.source || '').startsWith('azure')
-    || String(payload.source || '') === 'survey'
-    || payload._fromRescue === true
-    || payload._skipNoTripFreeze === true
-    || Boolean(idleStation)
-  );
-  if (!forceAccept && !incomingHasTrip && !allowMoveBySource) {
-    const prevForFreeze = state.hubBoats.get(code);
-    if (prevForFreeze) {
-      state.hubBoats.set(code, {
-        ...prevForFreeze,
-        speedKmh: Number.isFinite(Number(payload.speedKmh)) ? Number(payload.speedKmh) : 0,
-        heading: Number.isFinite(Number(payload.heading)) ? Number(payload.heading) : prevForFreeze.heading ?? null,
-        status: 'idle',
-        boatStatus: 'NoTrip',
-        tripId: null,
-        tripCode: null,
-        routeId: null,
-        routeCode: null,
-        isOnline: payload.isOnline !== false,
-        updatedAt: new Date().toISOString(),
-      });
-    }
-    // Đồng bộ snapshot/FE: giữ lat/lng cũ, không cho boat.lat/lng trôi.
-    const boatForFreeze = [...state.boats.values()].find((b) => String(b.boatCode || '').trim() === code);
-    if (boatForFreeze) {
-      boatForFreeze.speedKmh = Number.isFinite(Number(payload.speedKmh)) ? Number(payload.speedKmh) : 0;
-      boatForFreeze.updatedAt = new Date().toISOString();
-    }
-    return null;
-  }
 
   const prev = state.hubBoats.get(code);
   const incoming = {
@@ -1746,10 +1686,8 @@ function upsertHubBoat(payload) {
     routeCode: payload.routeCode || null,
     tripId: payload.tripId || null,
     tripCode: payload.tripCode || null,
-    currentStationCode: idleStation?.station?.stationCode
-      || payload.currentStationCode
-      || null,
-    movementStatus: idleStation ? 'AtStation' : (payload.movementStatus || null),
+    currentStationCode: payload.currentStationCode || null,
+    movementStatus: payload.movementStatus || null,
     lat,
     lng,
     speedKmh: incoming.speedKmh,
@@ -1758,9 +1696,7 @@ function upsertHubBoat(payload) {
     receivedAt: incoming.receivedAt || new Date().toISOString(),
     sequence: incoming.sequence,
     isOnline: payload.isOnline !== false,
-    source: idleStation
-      ? 'nearest-station-no-trip'
-      : (payload.source || (payload.fromAzure ? 'azure' : (prev?.source || null))),
+    source: payload.source || (payload.fromAzure ? 'azure' : (prev?.source || null)),
     updatedAt: new Date().toISOString(),
   });
   // Chỉ giữ quyền Live khi user kéo / trip / rescue / heartbeat giữ pin kéo.
@@ -2729,9 +2665,6 @@ async function publishLiveGpsPosition(body = {}) {
       forceAccept: true,
       holdAuthority,
       source: holdAuthority ? 'live' : 'live-heartbeat',
-      // Trip / rescue / survey vẫn phải cho tàu chạy khi không có tripId trong payload —
-      // Ví dụ: kéo tay user khởi đầu, beacon rescue khởi động, vẽ survey…
-      _skipNoTripFreeze: userOrMissionWrite || holdAuthority,
     });
     broadcast();
   }
